@@ -16,8 +16,7 @@ Not implemented: `shell`, PTY, port forwarding, SFTP, rekeying.
 |---|---|
 | `src/PwsshEngine.cs` | The entire SSH implementation. Transport agnostic, and deliberately free of any `System.Management.Automation` reference so the same source compiles for both hosts. |
 | `src/PwsshCommon.ps1` | Shared helpers: engine compilation, host key keystore, current-user lookup. Sent to the remote as text. |
-| `src/Initialize-PwsshServer.ps1` | Remote pipeline 1: compiles and starts the engine into `$global:PwsshEngine`. |
-| `src/PwsshPumpLoop.ps1` | Remote pipeline 2: shuttles bytes. No `param()` block — see below. |
+| `src/Start-PwsshServer.ps1` | Runs on the remote: compiles the engine, starts it, shuttles bytes. Must stay a *simple* script — see the parameter-binding trap below. |
 | `pwssh-connect.ps1` | Client `ProxyCommand` entry point. |
 | `tools/Start-PwsshTcpHost.ps1`, `tools/PwsshTcpHost.cs` | Dev-only loopback host. |
 | `tests/Invoke-PwsshTests.ps1` | End-to-end tests through the real `ssh` client, against either transport. |
@@ -53,7 +52,18 @@ The engine also has an inactivity watchdog (`PwsshConfig.InactivityTimeoutSecond
 
 Each of these cost a debugging cycle and none are obvious from the docs.
 
-- **`param()` and streamed pipeline input cannot coexist.** A script with a `param()` block makes PowerShell bind the input objects to parameters; raw `byte[]` fails with *"The input object cannot be bound to any parameters for the command"* and `$input` stays empty. Hence the two-pipeline split: `Initialize-PwsshServer.ps1` takes parameters and no input, `PwsshPumpLoop.ps1` takes input and no parameters, and runspace state carries between them.
+- **An *advanced* script cannot receive streamed pipeline input.** Adding `[Parameter()]` attributes — even just `[Parameter(Mandatory=$true)]` — makes a script advanced, exactly as `[CmdletBinding()]` does, and advanced scripts route pipeline input through *parameter binding*. With no `ValueFromPipeline` parameter, every input object is rejected with *"The input object cannot be bound to any parameters for the command"* and `$input` stays empty. Measured, sending three `byte[]` through `BeginInvoke(input, output)`:
+
+  | Script form | Result |
+  |---|---|
+  | `param([Parameter(Mandatory=$true)][string]$Cfg)` | `items=0`, 3 binding errors |
+  | `param([string]$Cfg)` (simple) | `items=3` ✓ |
+  | advanced + `[Parameter(ValueFromPipeline=$true)]$In` | `items=3` ✓ |
+  | `[CmdletBinding()]` + `param([string]$Cfg)` | `items=0`, 3 binding errors |
+
+  Named parameters bound correctly in all four cases; only the input was lost. So parameters and streamed input *do* coexist — in a simple script, or with an explicit `ValueFromPipeline` parameter. `src/Start-PwsshServer.ps1` relies on this and **must stay a simple script**: adding `[Parameter()]` to any of its parameters, or `[CmdletBinding()]`, will silently break the byte stream.
+
+  An earlier version split this across two pipelines (init with parameters, pump with input) in the belief the two were incompatible. They are not, and the split bought nothing measurable: an interleaved A/B of connection time gave **8,741 ms for one pipeline vs 8,710 ms for two** — a 31 ms difference, with individual runs ranging 7.7–21 s. A predicted "saves one round trip" gain did not materialise.
 - **`Write-Warning` goes to STDOUT under `pwsh -File`.** Verified directly: stdout received `WARNING: ...`. In a ProxyCommand that corrupts the SSH stream. The same applies to warnings raised on the *remote* — they are surfaced to the client's host and land on the client's stdout. All diagnostics therefore go to `[Console]::Error`, and the client silences the warning/verbose/information/progress preferences outright. Remote logging is opt-in and documented as debug-only.
 - **`Add-Type -ReferencedAssemblies` replaces the default reference set on PowerShell 7** rather than adding to it, so a partial list breaks types as basic as `Thread`. Referencing `System.Management.Automation` also drags in reference-vs-implementation assembly conflicts (`Thread` "forwarded to System.Private.CoreLib"). The engine avoids the whole problem by never referencing SMA; `PwsshPump` unwraps `PSObject` reflectively instead.
 - **`Add-Type -Path` with multiple files** is how the dev host references engine types: an in-memory `Add-Type` assembly has no `Location`, so it cannot be referenced from a second compilation.
@@ -260,6 +270,7 @@ This only affects interactive `shell` responsiveness — bulk transfer already p
   
   The most likely remaining cause is **channel-window stalls**: `ExecChannel.SendData` blocks when the client's window is exhausted, and every `SSH_MSG_CHANNEL_WINDOW_ADJUST` costs a full ~600–900 ms WinRM turnaround. That would be invisible on loopback (where the same code reaches ~1 MiB/s) and dominant over WinRM, which fits the evidence. Instrumenting adjust arrivals against send stalls is the next step. Note the loopback number is itself unexplained and includes `powershell.exe` start-up on the far side, so it is not a clean ceiling.
 - **Upstream remains ~10× slower than downstream** as a property of the transport, so uploads will be slow whatever we do here.
+- **Connection setup costs ~8–9 s** for `ssh host "echo x"`, and is dominated by round trips: an SSH handshake plus exec is roughly ten sequential exchanges at ~600–900 ms each, on top of ~2 s to establish the PSSession. Variance is large (7.7–21 s observed). Reducing the exchange count is the only lever that would matter, and most of the sequence is fixed by the protocol.
 
 ## Prior art
 

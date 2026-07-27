@@ -104,32 +104,20 @@ try {
     Write-Diag ("session established in {0:N0} ms" -f $sw.Elapsed.TotalMilliseconds)
 
     # --- start the remote server ---------------------------------------------
-    # Two pipelines on the same runspace. Parameters and streamed pipeline input cannot
-    # coexist on one invocation: a param() block makes PowerShell bind the input objects to
-    # parameters, which fails for raw byte[] and leaves $input empty. So initialisation
-    # takes parameters with no input, and the pump takes input with no parameters.
+    # One pipeline. Failures still reach us: the remote error stream is transported
+    # independently of the output stream, so it is drained in the loop below. An earlier
+    # split into an init pipeline plus a pump pipeline bought nothing and cost an extra
+    # ~600-900 ms round trip on every connection.
     $commonSource = [System.IO.File]::ReadAllText("$PSScriptRoot\src\PwsshCommon.ps1")
-    $initScript = [System.IO.File]::ReadAllText("$PSScriptRoot\src\Initialize-PwsshServer.ps1")
-    $pumpScript = [System.IO.File]::ReadAllText("$PSScriptRoot\src\PwsshPumpLoop.ps1")
-
-    $init = [PowerShell]::Create()
-    try {
-        $init.Runspace = $session.Runspace
-        $null = $init.AddScript($initScript)
-        $null = $init.AddParameter('CsSource', $engineSource)
-        $null = $init.AddParameter('HostKey', $hostKey)
-        $null = $init.AddParameter('CommonSource', $commonSource)
-        if ($EmitRemoteLog) { $null = $init.AddParameter('EmitLog', $true) }
-        $ready = $init.Invoke()
-        foreach ($e in $init.Streams.Error) { Write-Diag "remote init error: $($e.Exception.Message)" }
-        if ($init.Streams.Error.Count -gt 0) { throw 'remote initialisation failed' }
-        Write-Diag "remote: $($ready -join ' ')"
-    }
-    finally { try { $init.Dispose() } catch { } }
+    $serverScript = [System.IO.File]::ReadAllText("$PSScriptRoot\src\Start-PwsshServer.ps1")
 
     $ps = [PowerShell]::Create()
     $ps.Runspace = $session.Runspace
-    $null = $ps.AddScript($pumpScript)
+    $null = $ps.AddScript($serverScript)
+    $null = $ps.AddParameter('CsSource', $engineSource)
+    $null = $ps.AddParameter('HostKey', $hostKey)
+    $null = $ps.AddParameter('CommonSource', $commonSource)
+    if ($EmitRemoteLog) { $null = $ps.AddParameter('EmitLog', $true) }
 
     $inColl = New-Object 'System.Management.Automation.PSDataCollection[psobject]'
     $outColl = New-Object 'System.Management.Automation.PSDataCollection[psobject]'
@@ -170,7 +158,11 @@ try {
         }
 
         # Drained inline rather than via Register-ObjectEvent: an -Action handler only
-        # runs when the pipeline is idle, and this loop never is.
+        # runs when the pipeline is idle, and this loop never is. Errors are always
+        # reported -- they are the only clue ssh gives us beyond "connection closed".
+        if ($ps.Streams.Error.Count -gt 0) {
+            foreach ($e in $ps.Streams.Error.ReadAll()) { Write-Fatal "remote error: $($e.Exception.Message)" }
+        }
         if ($ps.Streams.Warning.Count -gt 0) {
             foreach ($w in $ps.Streams.Warning.ReadAll()) { Write-Diag "remote: $w" }
         }
@@ -180,6 +172,12 @@ try {
     }
 
     Write-Diag 'remote pipeline completed'
+
+    # A terminating error on the remote lands here rather than in the error stream.
+    foreach ($e in $ps.Streams.Error) { Write-Fatal "remote error: $($e.Exception.Message)" }
+    if ($ps.InvocationStateInfo.Reason) {
+        Write-Fatal "remote pipeline failed: $($ps.InvocationStateInfo.Reason.Message)"
+    }
 }
 catch {
     Write-Fatal "fatal: $($_.Exception.Message)"
