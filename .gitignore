@@ -1,0 +1,6 @@
+# Development host key (regenerated on demand; never used for the WinRM path)
+tools/.devhostkey
+
+# Test scratch: generated payloads, per-test known_hosts
+tmp/
+*.log
