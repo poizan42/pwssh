@@ -18,8 +18,10 @@ using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.IO.Pipes;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using Microsoft.Win32.SafeHandles;
 
 namespace Pwssh
 {
@@ -46,6 +48,10 @@ namespace Pwssh
         public const byte EOF = 0x03;     // no payload: close child stdin
         public const byte CLOSE = 0x04;   // no payload: tear the channel down
         public const byte WINDOW = 0x05;  // payload: uint32 credit
+        public const byte SHELL = 0x06;   // no payload: start the login shell
+        public const byte PTY = 0x07;     // payload: uint32 cols, uint32 rows, UTF-8 term
+        public const byte RESIZE = 0x08;  // payload: uint32 cols, uint32 rows
+        public const byte SIGNAL = 0x09;  // payload: UTF-8 signal name
 
         // agent -> client
         public const byte OUT = 0x81;     // payload: stdout bytes
@@ -190,6 +196,54 @@ namespace Pwssh
             if (f.Length < HEADER + 4) return 0;
             return ((uint)f[HEADER] << 24) | ((uint)f[HEADER + 1] << 16)
                  | ((uint)f[HEADER + 2] << 8) | f[HEADER + 3];
+        }
+    }
+
+    // Minimal reader/writer for structured frame payloads (pty, resize). Same big-endian
+    // uint32 and length-prefixed string conventions as SSH, kept here so the agent stays
+    // self-contained rather than depending on the engine's SshWriter/SshReader.
+    internal sealed class SshLikeWriter
+    {
+        private readonly MemoryStream ms = new MemoryStream();
+
+        public void UInt32(uint v)
+        {
+            ms.WriteByte((byte)(v >> 24)); ms.WriteByte((byte)(v >> 16));
+            ms.WriteByte((byte)(v >> 8)); ms.WriteByte((byte)v);
+        }
+
+        public void Text(string s)
+        {
+            byte[] b = Encoding.UTF8.GetBytes(s == null ? "" : s);
+            UInt32((uint)b.Length);
+            ms.Write(b, 0, b.Length);
+        }
+
+        public byte[] ToArray() { return ms.ToArray(); }
+    }
+
+    internal sealed class SshLikeReader
+    {
+        private readonly byte[] b;
+        private int p;
+
+        public SshLikeReader(byte[] data, int offset) { b = data; p = offset; }
+
+        public uint UInt32()
+        {
+            if (p + 4 > b.Length) return 0;
+            uint v = ((uint)b[p] << 24) | ((uint)b[p + 1] << 16) | ((uint)b[p + 2] << 8) | b[p + 3];
+            p += 4;
+            return v;
+        }
+
+        public string Text()
+        {
+            int n = (int)UInt32();
+            if (n < 0 || p + n > b.Length) return "";
+            string s = Encoding.UTF8.GetString(b, p, n);
+            p += n;
+            return s;
         }
     }
 
@@ -511,10 +565,17 @@ namespace Pwssh
     {
         void Attach(IPwsshChannelSink sink);
         void Exec(uint channel, string command);
+        void Shell(uint channel);
+        void RequestPty(uint channel, uint cols, uint rows, string term);
+        void Resize(uint channel, uint cols, uint rows);
+        void Signal(uint channel, string name);
         void SendStdin(uint channel, byte[] data);
         void CloseStdin(uint channel);
         void CloseChannel(uint channel);
         void GrantWindow(uint channel, uint bytes);
+        // Whether the remote can provide a real terminal. Reported in HELLO, so pty-req can
+        // be answered without an extra round trip.
+        bool RemoteSupportsPty { get; }
         // Blocks for the agent's HELLO. The local SSH handshake is instant now, so userauth
         // can arrive before HELLO has made the round trip; blocking here lets session setup
         // and the handshake overlap instead of serialising.
@@ -539,7 +600,10 @@ namespace Pwssh
         private readonly object helloGate = new object();
         private IPwsshChannelSink sink;
         private string remoteUser;
+        private volatile bool remotePty;
         private volatile bool inboundClosed;
+
+        public bool RemoteSupportsPty { get { return remotePty; } }
 
         public void Attach(IPwsshChannelSink s) { sink = s; }
 
@@ -584,7 +648,17 @@ namespace Pwssh
                 case FrameType.HELLO:
                     lock (helloGate)
                     {
-                        remoteUser = Frame.PayloadText(frame);
+                        // "user=kb;conpty=1"
+                        string[] parts = Frame.PayloadText(frame).Split(';');
+                        for (int i = 0; i < parts.Length; i++)
+                        {
+                            int eq = parts[i].IndexOf('=');
+                            if (eq <= 0) continue;
+                            string k = parts[i].Substring(0, eq);
+                            string v = parts[i].Substring(eq + 1);
+                            if (k == "user") remoteUser = v;
+                            else if (k == "conpty") remotePty = (v == "1");
+                        }
                         Monitor.PulseAll(helloGate);
                     }
                     break;
@@ -619,6 +693,30 @@ namespace Pwssh
         public void Exec(uint channel, string command)
         {
             outbound.Enqueue(Frame.MakeText(FrameType.EXEC, channel, command));
+        }
+
+        public void Shell(uint channel)
+        {
+            outbound.Enqueue(Frame.Make(FrameType.SHELL, channel, null));
+        }
+
+        public void RequestPty(uint channel, uint cols, uint rows, string term)
+        {
+            SshLikeWriter w = new SshLikeWriter();
+            w.UInt32(cols); w.UInt32(rows); w.Text(term);
+            outbound.Enqueue(Frame.Make(FrameType.PTY, channel, w.ToArray()));
+        }
+
+        public void Resize(uint channel, uint cols, uint rows)
+        {
+            SshLikeWriter w = new SshLikeWriter();
+            w.UInt32(cols); w.UInt32(rows);
+            outbound.Enqueue(Frame.Make(FrameType.RESIZE, channel, w.ToArray()));
+        }
+
+        public void Signal(uint channel, string name)
+        {
+            outbound.Enqueue(Frame.MakeText(FrameType.SIGNAL, channel, name));
         }
 
         public void SendStdin(uint channel, byte[] data)
@@ -664,6 +762,21 @@ namespace Pwssh
         // block forever and hold a WinRM shell until WinRM's own 2-hour timeout. 0 disables.
         public int InactivityTimeoutSeconds = 300;
 
+        // Testing hook: forces the no-ConPTY path on a remote that does have it, so the
+        // graceful-degradation behaviour can be exercised rather than assumed.
+        public static bool DisableConPty;
+
+        // The shell, matching what Windows OpenSSH runs by default.
+        public static string ShellPath()
+        {
+            string s = Environment.GetEnvironmentVariable("ComSpec");
+            if (string.IsNullOrEmpty(s)) s = "cmd.exe";
+            return s;
+        }
+
+        // pty-req arrives before shell/exec, so the parameters wait here for the channel.
+        private readonly Dictionary<uint, PtyRequest> pendingPty = new Dictionary<uint, PtyRequest>();
+
         public bool Finished { get { return finished; } }
 
         public void Start()
@@ -671,10 +784,17 @@ namespace Pwssh
             string user;
             try { user = CurrentAccountName(); }
             catch (Exception ex) { user = ""; Log("cannot resolve current user: " + ex.Message); }
+
+            // Capabilities travel with HELLO so the client can answer pty-req immediately.
+            // Asking later would cost a round trip on every interactive connection, and the
+            // answer has to be known before the reply is sent.
+            bool conpty = !DisableConPty && ConPtySession.IsAvailable();
+            string hello = "user=" + user + ";conpty=" + (conpty ? "1" : "0");
+
             // Must go through Send: every frame needs a sequence number, or it collides with
             // the first sequenced frame and the client's resequencer drops one as a duplicate.
-            Send(Frame.MakeText(FrameType.HELLO, 0, user));
-            Log("agent ready as '" + user + "'");
+            Send(Frame.MakeText(FrameType.HELLO, 0, hello));
+            Log("agent ready as '" + user + "', conpty=" + conpty);
 
             if (InactivityTimeoutSeconds > 0)
             {
@@ -780,7 +900,41 @@ namespace Pwssh
                 switch (type)
                 {
                     case FrameType.EXEC:
-                        StartChannel(ch, Frame.PayloadText(frame));
+                        StartChannel(ch, ShellPath() + " /c " + Frame.PayloadText(frame));
+                        break;
+
+                    case FrameType.SHELL:
+                        StartChannel(ch, ShellPath());
+                        break;
+
+                    case FrameType.PTY:
+                        {
+                            SshLikeReader r = new SshLikeReader(frame, Frame.HEADER);
+                            PtyRequest req = new PtyRequest();
+                            req.Cols = r.UInt32();
+                            req.Rows = r.UInt32();
+                            req.Term = r.Text();
+                            lock (chanGate) { pendingPty[ch] = req; }
+                            Log("pty requested on channel " + ch + ": " + req.Cols + "x" + req.Rows + " " + req.Term);
+                        }
+                        break;
+
+                    case FrameType.RESIZE:
+                        {
+                            SshLikeReader r = new SshLikeReader(frame, Frame.HEADER);
+                            uint cols = r.UInt32();
+                            uint rows = r.UInt32();
+                            AgentChannel c = Find(ch);
+                            if (c != null) c.Resize(cols, rows);
+                        }
+                        break;
+
+                    case FrameType.SIGNAL:
+                        {
+                            AgentChannel c = Find(ch);
+                            Log("signal " + Frame.PayloadText(frame) + " on channel " + ch);
+                            if (c != null) c.Kill();
+                        }
                         break;
 
                     case FrameType.DATA:
@@ -862,8 +1016,14 @@ namespace Pwssh
                 }
                 channels[ch] = c;
             }
-            Log("exec on channel " + ch + ": " + command);
-            if (!c.StartExec(command))
+            PtyRequest req = null;
+            lock (chanGate)
+            {
+                if (pendingPty.TryGetValue(ch, out req)) pendingPty.Remove(ch);
+            }
+
+            Log("start on channel " + ch + (req != null ? " (pty): " : ": ") + command);
+            if (!c.Start(command, req))
             {
                 Send(Frame.MakeText(FrameType.FAIL, ch, "could not start command"));
                 Forget(ch);
@@ -876,7 +1036,287 @@ namespace Pwssh
         }
     }
 
+    // ------------------------------------------------------------------- ConPTY
+    //
+    // A pty-backed channel cannot use System.Diagnostics.Process: the pseudoconsole is
+    // attached through a PROC_THREAD_ATTRIBUTE on STARTUPINFOEX, which Process does not
+    // expose. Hence raw CreateProcess.
+    //
+    // CreatePseudoConsole exists from Windows 10 1809 / Server 2019 only, so availability is
+    // probed at startup and reported to the client, which then knows whether it may accept
+    // pty-req. Verified working inside wsmprovhost in session 0, which has no console.
+
+    internal sealed class PtyRequest
+    {
+        public uint Cols;
+        public uint Rows;
+        public string Term;
+    }
+
+    // Kills the whole process tree when closed. A shell spawns children, and
+    // Process.Kill(true) does not exist on .NET Framework 4.8, so without this a terminated
+    // shell would leave its children running on the remote.
+    internal sealed class JobObject : IDisposable
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct IO_COUNTERS
+        {
+            public ulong ReadOperationCount, WriteOperationCount, OtherOperationCount;
+            public ulong ReadTransferCount, WriteTransferCount, OtherTransferCount;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JOBOBJECT_BASIC_LIMIT_INFORMATION
+        {
+            public long PerProcessUserTimeLimit, PerJobUserTimeLimit;
+            public uint LimitFlags;
+            public IntPtr MinimumWorkingSetSize, MaximumWorkingSetSize;
+            public uint ActiveProcessLimit;
+            public IntPtr Affinity;
+            public uint PriorityClass, SchedulingClass;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+        {
+            public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+            public IO_COUNTERS IoInfo;
+            public IntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
+        }
+
+        private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000;
+        private const int JobObjectExtendedLimitInformation = 9;
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern IntPtr CreateJobObject(IntPtr sa, string name);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint len);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr h);
+
+        private IntPtr handle;
+
+        public JobObject()
+        {
+            handle = CreateJobObject(IntPtr.Zero, null);
+            if (handle == IntPtr.Zero) return;
+
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            int len = Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+            IntPtr p = Marshal.AllocHGlobal(len);
+            try
+            {
+                Marshal.StructureToPtr(info, p, false);
+                SetInformationJobObject(handle, JobObjectExtendedLimitInformation, p, (uint)len);
+            }
+            finally { Marshal.FreeHGlobal(p); }
+        }
+
+        public bool Assign(IntPtr process)
+        {
+            if (handle == IntPtr.Zero) return false;
+            return AssignProcessToJobObject(handle, process);
+        }
+
+        public void Dispose()
+        {
+            if (handle != IntPtr.Zero) { CloseHandle(handle); handle = IntPtr.Zero; }
+        }
+    }
+
+    internal sealed class ConPtySession : IDisposable
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct COORD { public short X; public short Y; }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct STARTUPINFO
+        {
+            public int cb; public string lpReserved; public string lpDesktop; public string lpTitle;
+            public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+            public short wShowWindow; public short cbReserved2; public IntPtr lpReserved2;
+            public IntPtr hStdInput, hStdOutput, hStdError;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct STARTUPINFOEX { public STARTUPINFO StartupInfo; public IntPtr lpAttributeList; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct PROCESS_INFORMATION { public IntPtr hProcess, hThread; public int dwProcessId, dwThreadId; }
+
+        private const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+        private static readonly IntPtr PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = (IntPtr)0x00020016;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern int CreatePseudoConsole(COORD size, IntPtr hIn, IntPtr hOut, uint flags, out IntPtr phPC);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern int ResizePseudoConsole(IntPtr hPC, COORD size);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern void ClosePseudoConsole(IntPtr hPC);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CreatePipe(out IntPtr hRead, out IntPtr hWrite, IntPtr sa, int size);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr h);
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool CreateProcess(string app, string cmd, IntPtr pa, IntPtr ta, bool inherit,
+            uint flags, IntPtr env, string cwd, ref STARTUPINFOEX si, out PROCESS_INFORMATION pi);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool InitializeProcThreadAttributeList(IntPtr list, int count, int flags, ref IntPtr size);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool UpdateProcThreadAttribute(IntPtr list, uint flags, IntPtr attr, IntPtr value,
+            IntPtr size, IntPtr prev, IntPtr ret);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern void DeleteProcThreadAttributeList(IntPtr list);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint WaitForSingleObject(IntPtr h, uint ms);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetExitCodeProcess(IntPtr h, out uint code);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateProcess(IntPtr h, uint code);
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Ansi)]
+        private static extern IntPtr GetProcAddress(IntPtr mod, string name);
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern IntPtr GetModuleHandle(string name);
+
+        private static int available = -1;   // -1 unknown, 0 no, 1 yes
+
+        // Probes once: the export must exist AND a pseudoconsole must actually be creatable.
+        // The second half matters because this runs inside a service-session host with no
+        // console of its own.
+        public static bool IsAvailable()
+        {
+            if (available >= 0) return available == 1;
+            available = 0;
+            try
+            {
+                IntPtr k = GetModuleHandle("kernel32.dll");
+                if (k == IntPtr.Zero || GetProcAddress(k, "CreatePseudoConsole") == IntPtr.Zero) return false;
+
+                IntPtr inR, inW, outR, outW, hPC;
+                if (!CreatePipe(out inR, out inW, IntPtr.Zero, 0)) return false;
+                if (!CreatePipe(out outR, out outW, IntPtr.Zero, 0))
+                {
+                    CloseHandle(inR); CloseHandle(inW); return false;
+                }
+                COORD sz; sz.X = 1; sz.Y = 1;
+                int hr = CreatePseudoConsole(sz, inR, outW, 0, out hPC);
+                CloseHandle(inR); CloseHandle(outW);
+                if (hr == 0) { ClosePseudoConsole(hPC); available = 1; }
+                CloseHandle(inW); CloseHandle(outR);
+            }
+            catch (Exception) { available = 0; }
+            return available == 1;
+        }
+
+        private IntPtr hPC = IntPtr.Zero;
+        private IntPtr hProcess = IntPtr.Zero;
+        private IntPtr hThread = IntPtr.Zero;
+        private IntPtr inWrite = IntPtr.Zero;
+        private readonly JobObject job = new JobObject();
+
+        public Stream Output;    // read: everything the terminal emits
+        public Stream Input;     // write: keystrokes
+
+        public bool Start(string commandLine, uint cols, uint rows)
+        {
+            IntPtr inR, inW, outR, outW;
+            if (!CreatePipe(out inR, out inW, IntPtr.Zero, 0)) return false;
+            if (!CreatePipe(out outR, out outW, IntPtr.Zero, 0))
+            {
+                CloseHandle(inR); CloseHandle(inW); return false;
+            }
+
+            COORD sz;
+            sz.X = (short)(cols == 0 ? 80 : cols);
+            sz.Y = (short)(rows == 0 ? 25 : rows);
+            int hr = CreatePseudoConsole(sz, inR, outW, 0, out hPC);
+            CloseHandle(inR); CloseHandle(outW);      // the pseudoconsole duplicated them
+            if (hr != 0)
+            {
+                CloseHandle(inW); CloseHandle(outR);
+                return false;
+            }
+
+            IntPtr attrList = IntPtr.Zero;
+            PROCESS_INFORMATION pi;
+            try
+            {
+                IntPtr size = IntPtr.Zero;
+                InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
+                attrList = Marshal.AllocHGlobal(size);
+                if (!InitializeProcThreadAttributeList(attrList, 1, 0, ref size)) return false;
+                if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, hPC,
+                        (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero)) return false;
+
+                STARTUPINFOEX si = new STARTUPINFOEX();
+                si.StartupInfo.cb = Marshal.SizeOf(typeof(STARTUPINFOEX));
+                si.lpAttributeList = attrList;
+
+                if (!CreateProcess(null, commandLine, IntPtr.Zero, IntPtr.Zero, false,
+                        EXTENDED_STARTUPINFO_PRESENT, IntPtr.Zero, null, ref si, out pi))
+                    return false;
+            }
+            finally
+            {
+                if (attrList != IntPtr.Zero) { DeleteProcThreadAttributeList(attrList); Marshal.FreeHGlobal(attrList); }
+            }
+
+            hProcess = pi.hProcess;
+            hThread = pi.hThread;
+            inWrite = inW;
+            job.Assign(hProcess);
+
+            Output = new FileStream(new SafeFileHandle(outR, true), FileAccess.Read, 4096, false);
+            Input = new FileStream(new SafeFileHandle(inW, false), FileAccess.Write, 4096, false);
+            return true;
+        }
+
+        public void Resize(uint cols, uint rows)
+        {
+            if (hPC == IntPtr.Zero) return;
+            COORD sz;
+            sz.X = (short)(cols == 0 ? 80 : cols);
+            sz.Y = (short)(rows == 0 ? 25 : rows);
+            ResizePseudoConsole(hPC, sz);
+        }
+
+        public void WaitForExit() { if (hProcess != IntPtr.Zero) WaitForSingleObject(hProcess, 0xFFFFFFFF); }
+
+        public uint ExitCode
+        {
+            get
+            {
+                uint code = 0;
+                if (hProcess != IntPtr.Zero) GetExitCodeProcess(hProcess, out code);
+                return code;
+            }
+        }
+
+        public void Kill()
+        {
+            try { if (hProcess != IntPtr.Zero) TerminateProcess(hProcess, 1); } catch { }
+            job.Dispose();      // takes the rest of the tree with it
+        }
+
+        public void Dispose()
+        {
+            // Closing the pseudoconsole is what makes the output reader see EOF.
+            try { if (hPC != IntPtr.Zero) { ClosePseudoConsole(hPC); hPC = IntPtr.Zero; } } catch { }
+            try { if (Input != null) Input.Dispose(); } catch { }
+            try { if (hThread != IntPtr.Zero) { CloseHandle(hThread); hThread = IntPtr.Zero; } } catch { }
+            try { if (hProcess != IntPtr.Zero) { CloseHandle(hProcess); hProcess = IntPtr.Zero; } } catch { }
+            try { job.Dispose(); } catch { }
+        }
+    }
+
     // ------------------------------------------------------------------ agent channel
+    //
+    // Two modes that converge on the same shape: an output pump, a stdin writer, and a waiter
+    // that emits EXIT then DONE. Only process creation differs -- and the fact that a pty has
+    // a single merged output stream, because a terminal has no separate stderr.
 
     internal sealed class AgentChannel
     {
@@ -887,26 +1327,76 @@ namespace Pwssh
         private readonly object creditGate = new object();
         private long credit = PwsshAgentHost.InitialCredit;
 
-        private Process proc;
+        private Process proc;              // pipe mode
+        private ConPtySession pty;         // pty mode
+        private JobObject job;             // pipe mode; the pty session owns its own
         private int pumpsDone;
+        private int expectedPumps;
         private volatile bool killed;
 
         public AgentChannel(PwsshAgentHost h, uint ch) { host = h; channel = ch; }
+
+        public bool HasPty { get { return pty != null; } }
 
         public void AddCredit(uint add)
         {
             lock (creditGate) { credit += add; Monitor.PulseAll(creditGate); }
         }
 
-        public bool StartExec(string command)
+        // commandLine is a full command line: "cmd.exe" for a shell, "cmd.exe /c ..." for exec.
+        // ptyReq is null when the client did not ask for a terminal, or when the remote cannot
+        // provide one -- the client has already been told which, via the HELLO capabilities.
+        public bool Start(string commandLine, PtyRequest ptyReq)
         {
-            if (proc != null) return false;
+            if (proc != null || pty != null) return false;
+
+            if (ptyReq != null && ConPtySession.IsAvailable())
+            {
+                return StartPty(commandLine, ptyReq);
+            }
+            return StartPiped(commandLine);
+        }
+
+        private bool StartPty(string commandLine, PtyRequest req)
+        {
+            try
+            {
+                ConPtySession s = new ConPtySession();
+                if (!s.Start(commandLine, req.Cols, req.Rows))
+                {
+                    host.Log("ConPTY start failed; falling back to pipes");
+                    s.Dispose();
+                    return StartPiped(commandLine);
+                }
+                pty = s;
+                expectedPumps = 1;                      // one merged stream
+                StartPump(pty.Output, false);
+                Thread wait = new Thread(new ThreadStart(WaitForPtyExit));
+                wait.IsBackground = true;
+                wait.Start();
+                host.Log("pty channel " + channel + " started " + req.Cols + "x" + req.Rows);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                host.Log("pty start failed: " + ex.Message);
+                return StartPiped(commandLine);
+            }
+        }
+
+        private bool StartPiped(string commandLine)
+        {
             try
             {
                 ProcessStartInfo psi = new ProcessStartInfo();
-                psi.FileName = Environment.GetEnvironmentVariable("ComSpec");
-                if (string.IsNullOrEmpty(psi.FileName)) psi.FileName = "cmd.exe";
-                psi.Arguments = "/c " + command;
+                psi.FileName = PwsshAgentHost.ShellPath();
+                // The shell itself takes no arguments; exec passes "/c <command>".
+                string shell = psi.FileName;
+                if (commandLine.Length > shell.Length + 1 &&
+                    commandLine.StartsWith(shell, StringComparison.OrdinalIgnoreCase))
+                {
+                    psi.Arguments = commandLine.Substring(shell.Length).TrimStart();
+                }
                 psi.UseShellExecute = false;
                 psi.CreateNoWindow = true;
                 psi.RedirectStandardInput = true;
@@ -915,19 +1405,28 @@ namespace Pwssh
 
                 proc = Process.Start(psi);
 
+                job = new JobObject();
+                try { job.Assign(proc.Handle); } catch (Exception ex) { host.Log("job assign failed: " + ex.Message); }
+
+                expectedPumps = 2;
                 StartPump(proc.StandardOutput.BaseStream, false);
                 StartPump(proc.StandardError.BaseStream, true);
 
-                Thread wait = new Thread(new ThreadStart(WaitForExit));
+                Thread wait = new Thread(new ThreadStart(WaitForProcExit));
                 wait.IsBackground = true;
                 wait.Start();
                 return true;
             }
             catch (Exception ex)
             {
-                host.Log("exec failed: " + ex.Message);
+                host.Log("start failed: " + ex.Message);
                 return false;
             }
+        }
+
+        public void Resize(uint cols, uint rows)
+        {
+            if (pty != null) pty.Resize(cols, rows);
         }
 
         private void StartPump(Stream src, bool isStderr)
@@ -937,7 +1436,7 @@ namespace Pwssh
             t.Start();
         }
 
-        // Raw BaseStream only. PowerShell's native-command bridge decodes as text and splits
+        // Raw streams only. PowerShell's native-command bridge decodes as text and splits
         // lines, which destroys binary: measured 128 of 256 byte values lost.
         private void Pump(Stream src, bool isStderr)
         {
@@ -978,9 +1477,8 @@ namespace Pwssh
 
                 byte kind = isStderr ? FrameType.ERR : FrameType.OUT;
 
-                // Adaptive: only send compressed when it actually pays, so incompressible
-                // output (already-compressed files, encrypted data) is not penalised. Credit
-                // accounting stays in uncompressed bytes, matching the SSH window.
+                // Adaptive: only send compressed when it pays, so already-compressed output is
+                // not penalised. Credit stays in uncompressed bytes, matching the SSH window.
                 byte[] packed = null;
                 try { packed = Zip.Deflate(buf, off, allowed); }
                 catch (Exception ex) { host.Log("deflate failed: " + ex.Message); }
@@ -999,9 +1497,15 @@ namespace Pwssh
 
         public void WriteStdin(byte[] frame, int offset, int count)
         {
+            if (count <= 0) return;
             try
             {
-                if (proc != null && !proc.HasExited && count > 0)
+                if (pty != null)
+                {
+                    pty.Input.Write(frame, offset, count);
+                    pty.Input.Flush();
+                }
+                else if (proc != null && !proc.HasExited)
                 {
                     proc.StandardInput.BaseStream.Write(frame, offset, count);
                     proc.StandardInput.BaseStream.Flush();
@@ -1012,38 +1516,70 @@ namespace Pwssh
 
         public void CloseStdin()
         {
-            try { if (proc != null) proc.StandardInput.BaseStream.Close(); } catch { }
+            try
+            {
+                if (pty != null) { pty.Input.Dispose(); }
+                else if (proc != null) { proc.StandardInput.BaseStream.Close(); }
+            }
+            catch { }
         }
 
-        private void WaitForExit()
+        private void WaitForProcExit()
         {
             try
             {
                 proc.WaitForExit();
-                // Drain both pumps so no output is lost before the exit status.
-                for (int i = 0; i < 200 && pumpsDone < 2; i++) Thread.Sleep(10);
-
-                uint code = (uint)proc.ExitCode;
-                host.Log("channel " + channel + " exited " + code);
-                host.Send(Frame.MakeUInt32(FrameType.EXIT, channel, code));
-                host.Send(Frame.Make(FrameType.DONE, channel, null));
+                DrainPumps();
+                Finish((uint)proc.ExitCode);
             }
             catch (Exception ex)
             {
                 host.Log("wait failed: " + ex.Message);
                 host.Send(Frame.MakeText(FrameType.FAIL, channel, ex.Message));
-            }
-            finally
-            {
                 host.Forget(channel);
             }
+        }
+
+        private void WaitForPtyExit()
+        {
+            try
+            {
+                pty.WaitForExit();
+                uint code = pty.ExitCode;
+                // Closing the pseudoconsole is what makes the output pump see EOF, so it has
+                // to happen before waiting for that pump to finish.
+                pty.Dispose();
+                DrainPumps();
+                Finish(code);
+            }
+            catch (Exception ex)
+            {
+                host.Log("pty wait failed: " + ex.Message);
+                host.Send(Frame.MakeText(FrameType.FAIL, channel, ex.Message));
+                host.Forget(channel);
+            }
+        }
+
+        private void DrainPumps()
+        {
+            for (int i = 0; i < 300 && pumpsDone < expectedPumps; i++) Thread.Sleep(10);
+        }
+
+        private void Finish(uint code)
+        {
+            host.Log("channel " + channel + " exited " + code);
+            host.Send(Frame.MakeUInt32(FrameType.EXIT, channel, code));
+            host.Send(Frame.Make(FrameType.DONE, channel, null));
+            host.Forget(channel);
         }
 
         public void Kill()
         {
             killed = true;
             lock (creditGate) { Monitor.PulseAll(creditGate); }
+            try { if (pty != null) pty.Kill(); } catch { }
             try { if (proc != null && !proc.HasExited) proc.Kill(); } catch { }
+            try { if (job != null) job.Dispose(); } catch { }   // takes the child's children too
         }
     }
 

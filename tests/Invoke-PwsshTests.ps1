@@ -14,6 +14,10 @@ param(
     [int]$Port = 2222,
     [string]$KnownHostsFile = 'tmp/known_hosts',
     [string]$ConfigFile,
+    # Optional second target whose agent runs with -DisableConPty, so the graceful-degradation
+    # path can be exercised on a remote that does support ConPTY.
+    [string]$DegradedTarget,
+    [string]$DegradedConfigFile,
     [switch]$SkipLarge
 )
 
@@ -25,27 +29,31 @@ New-Item -ItemType Directory -Path (Split-Path -Parent (Join-Path $repo $KnownHo
 $script:pass = 0
 $script:fail = 0
 
-function Get-SshArgs([string]$Command) {
+function Get-SshArgs([string]$Command, [string[]]$Extra, [string]$UseTarget, [string]$UseConfig) {
     $a = New-Object System.Collections.Generic.List[string]
-    if ($ConfigFile) { $a.Add('-F'); $a.Add($ConfigFile) }
+    $cfg = if ($UseConfig) { $UseConfig } else { $ConfigFile }
+    $tgt = if ($UseTarget) { $UseTarget } else { $Target }
+    if ($cfg) { $a.Add('-F'); $a.Add($cfg) }
     if ($Port -gt 0) { $a.Add('-p'); $a.Add("$Port") }
     $a.Add('-o'); $a.Add("UserKnownHostsFile=$KnownHostsFile")
     $a.Add('-o'); $a.Add('StrictHostKeyChecking=accept-new')
     $a.Add('-o'); $a.Add('BatchMode=yes')
     $a.Add('-o'); $a.Add('ConnectTimeout=20')
-    $a.Add($Target)
-    $a.Add($Command)
+    if ($Extra) { foreach ($e in $Extra) { $a.Add($e) } }
+    $a.Add($tgt)
+    # Empty command means a shell session rather than exec.
+    if ($Command) { $a.Add($Command) }
     return $a
 }
 
 # ssh is driven via Process so stdout can be read as raw bytes; PowerShell's own
 # redirection would decode it as text and destroy binary payloads.
 function Invoke-Ssh {
-    param([string]$Command, [byte[]]$StdinBytes)
+    param([string]$Command, [byte[]]$StdinBytes, [string[]]$Extra, [string]$UseTarget, [string]$UseConfig)
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'ssh'
-    foreach ($a in (Get-SshArgs $Command)) { $psi.ArgumentList.Add($a) }
+    foreach ($a in (Get-SshArgs $Command $Extra $UseTarget $UseConfig)) { $psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true
@@ -208,7 +216,42 @@ for (`$k = 0; `$k -lt $($big / 65536); `$k++) {
     Write-Host ("        throughput (incompressible): {0:N2} MiB/s" -f (8 / $sw.Elapsed.TotalSeconds)) -ForegroundColor DarkGray
 }
 
-# --------------------------------------------------------- 7. username rejected
+# ------------------------------------------------------------------ 7. shell
+# No command means a shell channel. stdin is not a terminal, so ssh does not request a pty
+# and the shell runs over pipes -- the path tooling uses.
+$r = Invoke-Ssh -Command '' -StdinBytes ([System.Text.Encoding]::ASCII.GetBytes("echo hello-from-shell`r`nexit`r`n"))
+$so = [System.Text.Encoding]::ASCII.GetString($r.Stdout)
+Assert-That 'shell channel runs piped commands' ($so -match 'hello-from-shell') `
+    "stdout='$($so -replace '\s+', ' ')' stderr='$($r.Stderr)'"
+
+$r = Invoke-Ssh -Command '' -StdinBytes ([System.Text.Encoding]::ASCII.GetBytes("exit 3`r`n"))
+Assert-That 'shell exit status propagates' ($r.ExitCode -eq 3) "exit=$($r.ExitCode)"
+
+# -tt forces pty allocation, so this proves pty-req was accepted and ConPTY drove a real
+# console. The output carries VT sequences, hence a substring match.
+$r = Invoke-Ssh -Command 'echo hello-from-pty' -Extra @('-tt')
+$so = [System.Text.Encoding]::ASCII.GetString($r.Stdout)
+Assert-That 'pty session produces output' ($so -match 'hello-from-pty') `
+    "stdout='$(($so -replace '\x1b','<ESC>') -replace '\s+', ' ')' stderr='$($r.Stderr)'"
+Assert-That 'pty session emits VT sequences' ($so.Contains([char]27)) 'no escape sequences seen'
+
+# ----------------------------------------- 7b. graceful degradation without ConPTY
+if ($DegradedTarget) {
+    # -tt *forces* a pty, so a refusal is fatal by design -- exiting with the diagnostic is
+    # the correct outcome, and what we assert is that we refuse cleanly rather than hang.
+    $r = Invoke-Ssh -Command 'echo nope' -Extra @('-tt') -UseTarget $DegradedTarget -UseConfig $DegradedConfigFile
+    Assert-That 'pty-req refused cleanly when ConPTY is unavailable' `
+        ($r.Stderr -match 'PTY allocation request failed') "stderr='$($r.Stderr)'"
+
+    # And the fallback is actually usable: a shell over pipes still works on that remote.
+    $r = Invoke-Ssh -Command '' -StdinBytes ([System.Text.Encoding]::ASCII.GetBytes("echo hello-degraded`r`nexit`r`n")) `
+        -UseTarget $DegradedTarget -UseConfig $DegradedConfigFile
+    $so = [System.Text.Encoding]::ASCII.GetString($r.Stdout)
+    Assert-That 'shell still works without ConPTY' ($so -match 'hello-degraded') `
+        "stdout='$($so -replace '\s+', ' ')'"
+}
+
+# --------------------------------------------------------- 8. username rejected
 $saved = $Target
 $Target = "definitelynotthisuser@$($Target.Split('@')[-1])"
 if ($saved -notmatch '@') { $Target = $saved }   # WinRM alias: user comes from ssh_config

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-**`exec` works end to end over WinRM.** `ssh pwssh-test whoami` returns `REMOTEDOM\kb`. The suite passes against both transports (13/13 loopback, 12/12 WinRM — the extra loopback case is the wrong-username check, which the WinRM alias takes from `ssh_config`).
+**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns `REMOTEDOM\kb`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite passes against both transports (17/17 loopback, 18/18 WinRM; the WinRM run has the two extra graceful-degradation cases, the loopback run has the wrong-username check that the WinRM alias takes from `ssh_config`).
 
 **SSH terminates in the client.** `pwssh-connect.ps1` runs the whole SSH engine locally and only plaintext agent frames cross the WinRM link. The remote does no cryptography at all. This was a deliberate change from an earlier design that ran the engine on the remote, and it bought:
 
@@ -15,9 +15,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The throughput gain is WinRM's own compression, which an encrypted stream made useless. The same suite reports **0.31 MiB/s for an incompressible 8 MiB payload** — essentially identical to what the old architecture managed on *compressible* data, which is exactly what the mechanism predicts and a good confirmation of it.
 
-Implemented: version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, `none` auth with username matching, session channel, `exec`, exit status, stderr as `CHANNEL_EXTENDED_DATA`, window management, credit-based flow control to the agent.
+Implemented: version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, `none` auth with username matching, session channel, `exec`, `shell`, `pty-req` via ConPTY, `window-change`, `signal`, exit status, stderr as `CHANNEL_EXTENDED_DATA`, window management, credit-based flow control to the agent.
 
-Not implemented: `shell`, PTY, port forwarding, SFTP, rekeying.
+Not implemented: port forwarding, SFTP, rekeying.
 
 **The host key is now purely ceremonial.** It authenticates this proxy, not the remote machine — nothing about it crosses the link. It still has to be stable, because the client pins it in `known_hosts`.
 
@@ -55,13 +55,37 @@ One transport item is exactly one frame; items cross intact and in order, so the
 [1 byte type][4 bytes big-endian channel id][4 bytes big-endian sequence][payload…]
 ```
 
-Client → agent: `0x01 EXEC`, `0x02 DATA` (stdin), `0x03 EOF`, `0x04 CLOSE`, `0x05 WINDOW`. Agent → client: `0x81 DATA`, `0x82 STDERR`, `0x83 EXIT`, `0x84 DONE`, `0x85 HELLO`, `0x86 FAIL`. The high bit marks direction. Channel ids exist so `direct-tcpip` can be added without reworking the protocol.
+Client → agent: `0x01 EXEC`, `0x02 DATA` (stdin), `0x03 EOF`, `0x04 CLOSE`, `0x05 WINDOW`, `0x06 SHELL`, `0x07 PTY`, `0x08 RESIZE`, `0x09 SIGNAL`. Agent → client: `0x81 DATA`, `0x82 STDERR`, `0x83 EXIT`, `0x84 DONE`, `0x85 HELLO`, `0x86 FAIL`. The high bit marks direction. Channel ids exist so `direct-tcpip` can be added without reworking the protocol.
+
+`HELLO` carries `key=value` pairs (`user=kb;conpty=1`), not a bare account name — see the shell section.
 
 Two things about this are load-bearing:
 
 - **`SessionChannel.OnAgentData` must never block.** It runs on the client's frame loop, and blocking there for ssh window credit would stop the same loop that drains the remoting output — an immediate deadlock. A dedicated sender thread owns all window waiting.
-- **Credit is returned to the agent in 1 MiB batches** (`GRANT_THRESHOLD`). Granting per SSH packet produced ~256 tiny `WINDOW` frames for an 8 MiB download, all travelling upstream — the slow direction — and cost ~25% of throughput.
+- **Credit is returned to the agent in batches, on receipt** (`GRANT_THRESHOLD`, 2 MiB). Granting per SSH packet produced ~256 tiny `WINDOW` frames for an 8 MiB download, all travelling upstream — the slow direction. Granting *after* the SSH write was worse still; see the credit round-trip note further down.
 - **Every outbound frame must go through `PwsshAgentHost.Send`**, which is where the sequence number is stamped. Enqueuing straight onto the outbound queue leaves the sequence at 0, which collides with the first sequenced frame and makes the client's resequencer silently drop one as a duplicate. This bit the `HELLO` frame and produced a connection that succeeded with empty output.
+
+### Shell channels and ConPTY
+
+`ssh myremote` opens a shell channel running `%ComSpec%`, matching what Windows OpenSSH does by default and what `exec` already uses. Two modes:
+
+- **pty requested** → ConPTY. Real terminal semantics: colour, `Ctrl+C`, resize, and programs that check for a console behave normally. A pty has one merged output stream, so nothing is sent as `CHANNEL_EXTENDED_DATA` in this mode — a terminal has no separate stderr.
+- **no pty** (e.g. `echo cmd | ssh myremote`) → pipes, exactly like `exec`.
+
+**Availability is negotiated in `HELLO`, not asked for.** `CreatePseudoConsole` exists only from Windows 10 1809 / Server 2019, and the client must answer `pty-req` immediately — asking the remote at that moment would cost a round trip on every interactive connection. The agent therefore probes at startup (resolve the export, *then* actually create and close a 1×1 pseudoconsole, because the export existing is not proof it works here) and reports `conpty=0|1`. Where it is 0, `pty-req` gets `CHANNEL_FAILURE`; ssh prints "PTY allocation request failed" and continues over pipes.
+
+**ConPTY does work inside `wsmprovhost`**, which was the main risk — verified in session 0 on build 26200, a service session with no console of its own.
+
+Implementation notes that are easy to get wrong:
+
+- `System.Diagnostics.Process` **cannot** drive a ConPTY: the pseudoconsole attaches through a `PROC_THREAD_ATTRIBUTE` on `STARTUPINFOEX`, which `Process` does not expose. Hence raw `CreateProcess` in `ConPtySession`.
+- **`ClosePseudoConsole` is what makes the output reader see EOF**, so it must happen after the child exits but *before* waiting for the output pump to drain — otherwise that wait hangs for its full timeout.
+- Child processes are put in a **Job Object with `KILL_ON_JOB_CLOSE`**. A shell spawns children and `Process.Kill(true)` does not exist on .NET Framework 4.8, so without it a killed shell orphans its tree. Verified: killing the ssh client mid-`ping` takes the remote `ping` with it.
+- `-DisableConPty` on the client forces the no-ConPTY path, so the degradation behaviour is tested rather than assumed.
+
+**`-tt` failing against a remote without ConPTY is correct, not a bug.** `-tt` *forces* pty allocation, so a refusal is fatal by design; the test asserts we refuse cleanly rather than that the command still runs.
+
+**Interactive latency is unchanged by any of this.** Each keystroke is a WinRM round trip, so echo takes roughly 250–900 ms. ConPTY buys correctness, not responsiveness.
 
 ### Striping across sessions (`-Streams N`, default 1)
 
@@ -322,7 +346,8 @@ This only affects interactive `shell` responsiveness — bulk transfer already p
 ## Known limits and open items
 
 - **No rekeying.** OpenSSH rekeys after ~1 GiB or 1 hour; on a post-established `KEXINIT` the server sends `SSH_MSG_DISCONNECT` rather than corrupt cipher state. Long or very large sessions will drop.
-- **`pty-req` is refused**, so interactive use is out of scope until `shell`/ConPTY lands. `exec` is unaffected.
+- **Not manually verified**, because they cannot be asserted from a script: colour rendering, `Ctrl+C` interrupting a running command, and `window-change` actually reflowing output. The code paths exist (`ResizePseudoConsole` is wired to `window-change`) and the automated tests confirm a pty session runs and emits VT sequences, but a human should sit at an interactive session once.
+- **`signal` is implemented but effectively untested.** OpenSSH rarely sends `SSH_MSG_CHANNEL_REQUEST "signal"` — with a pty, `Ctrl+C` arrives as data and the console handles it — so there is no practical way to exercise it through the stock client. It maps to killing the child tree.
 - **Throughput is well below the channel's capability and not yet explained.** Measured on an 8 MiB `exec` payload: **0.25 MiB/s over WinRM**, against ~3.5–4 MiB/s for the raw transport — roughly 14× down. Two hypotheses have been tested and largely ruled out:
   - *AES-CTR cost.* The keystream is now generated 4 KiB at a time instead of per 16-byte block (`TransformBlock` per block costs a CNG transition). This did not move the WinRM figure (0.18 → 0.18) and slightly *reduced* loopback (1.35 → 1.04 MiB/s), so the cipher is not the constraint. The batching is kept because it is strictly less work.
   - *Idle poll latency.* Shortening the remote pump's `TakeOutbound` timeout from 200 ms to 25 ms gained 39% (0.18 → 0.25 MiB/s), so idle wait was a real but partial factor.

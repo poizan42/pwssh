@@ -1053,11 +1053,42 @@ namespace Pwssh
                     Log("exec: " + cmd);
                     ok = channel.StartExec(cmd);
                 }
+                else if (req == "shell")
+                {
+                    Log("shell");
+                    ok = channel.StartShell();
+                }
+                else if (req == "pty-req")
+                {
+                    // term, cols, rows, pixel width, pixel height, encoded modes
+                    string term = r.StrUtf8();
+                    uint cols = r.UInt32();
+                    uint rows = r.UInt32();
+                    ok = channel.RequestPty(cols, rows, term);
+                    // Refusing is a supported outcome, not an error: ssh reports "PTY
+                    // allocation request failed" and carries on with a pipe-backed shell.
+                    Log(ok ? ("pty-req " + cols + "x" + rows + " " + term)
+                           : "pty-req refused: remote has no ConPTY");
+                }
+                else if (req == "window-change")
+                {
+                    uint cols = r.UInt32();
+                    uint rows = r.UInt32();
+                    channel.Resize(cols, rows);
+                    ok = true;              // never carries want_reply
+                }
+                else if (req == "signal")
+                {
+                    string sig = r.StrUtf8();
+                    Log("signal: " + sig);
+                    channel.Signal(sig);
+                    ok = true;
+                }
                 else if (req == "env")
                 {
                     ok = true;              // accepted and ignored
                 }
-                // pty-req, shell, subsystem: not supported in this version -> failure
+                // subsystem: still unsupported -> failure
             }
 
             if (wantReply)
@@ -1259,6 +1290,20 @@ namespace Pwssh
 
         public bool StartExec(string command)
         {
+            if (!BeginSending()) return false;
+            agent.Exec(peerChannel, command);
+            return true;
+        }
+
+        public bool StartShell()
+        {
+            if (!BeginSending()) return false;
+            agent.Shell(peerChannel);
+            return true;
+        }
+
+        private bool BeginSending()
+        {
             if (execStarted) return false;
             execStarted = true;
 
@@ -1266,10 +1311,21 @@ namespace Pwssh
             sender.IsBackground = true;
             sender.Name = "pwssh-channel-sender";
             sender.Start();
-
-            agent.Exec(peerChannel, command);
             return true;
         }
+
+        // pty-req precedes shell/exec, matching SSH's own ordering; the agent holds the
+        // parameters until the channel actually starts.
+        public bool RequestPty(uint cols, uint rows, string term)
+        {
+            if (!agent.RemoteSupportsPty) return false;
+            agent.RequestPty(peerChannel, cols, rows, term);
+            return true;
+        }
+
+        public void Resize(uint cols, uint rows) { agent.Resize(peerChannel, cols, rows); }
+
+        public void Signal(string name) { agent.Signal(peerChannel, name); }
 
         // ---- called from the agent side (must not block) ----
 

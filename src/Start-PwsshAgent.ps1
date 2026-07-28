@@ -26,7 +26,10 @@ param(
     [int]$Stripes = 0,
     # Bulk-transfer window, in MiB. Also bounds how much the agent can push into the
     # client's memory before it must wait for credit.
-    [int]$CreditMiB = 32
+    [int]$CreditMiB = 32,
+    # Testing hook: forces the no-ConPTY path so the graceful-degradation behaviour can be
+    # exercised on a remote that does have ConPTY.
+    [bool]$DisableConPty = $false
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,6 +45,7 @@ try {
     Import-PwsshSource -CsSource $CsSource
 
     if ($CreditMiB -gt 0) { [Pwssh.PwsshAgentHost]::InitialCredit = [uint32]($CreditMiB * 1MB) }
+    [Pwssh.PwsshAgentHost]::DisableConPty = $DisableConPty
 
     $agent = New-Object Pwssh.PwsshAgentHost
     # Pipes must exist before Start(), so the mules have something to connect to while the
