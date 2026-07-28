@@ -32,6 +32,11 @@ param(
     [switch]$UseSSL,
     [string]$ConfigurationName,
     [string]$HostKeyDirectory,
+    # Extra PSSessions used only to carry downstream frames. Each session gets its own WSMan
+    # receive thread on this side, and that thread is the throughput ceiling; measured
+    # downstream on incompressible data, 2 sessions ~2.7x and 4 sessions ~3.3x. Costs one
+    # extra wsmprovhost per stream on the remote and ~1-2 s of setup each.
+    [int]$Streams = 1,
     [string]$LogFile,
     # Progress messages on stderr. Off by default: ssh shows the ProxyCommand's stderr
     # directly in the user's terminal, so it would be noise on every connection.
@@ -73,6 +78,7 @@ $session = $null
 $ps = $null
 $inColl = $null
 $engine = $null
+$mules = @()
 
 try {
     . "$PSScriptRoot\src\PwsshCommon.ps1"
@@ -119,16 +125,50 @@ try {
     $agentSource = [System.IO.File]::ReadAllText("$PSScriptRoot\src\PwsshAgent.cs")
     $agentScript = [System.IO.File]::ReadAllText("$PSScriptRoot\src\Start-PwsshAgent.ps1")
 
+    $stripes = [Math]::Max(0, $Streams - 1)
+    $pipePrefix = "pwssh-$([guid]::NewGuid().ToString('N'))"
+
     $ps = [PowerShell]::Create()
     $ps.Runspace = $session.Runspace
     $null = $ps.AddScript($agentScript)
     $null = $ps.AddParameter('CsSource', $agentSource)
     $null = $ps.AddParameter('CommonSource', $commonSource)
     if ($EmitRemoteLog) { $null = $ps.AddParameter('EmitLog', $true) }
+    if ($stripes -gt 0) {
+        $null = $ps.AddParameter('PipePrefix', $pipePrefix)
+        $null = $ps.AddParameter('Stripes', $stripes)
+    }
 
     $inColl = New-Object 'System.Management.Automation.PSDataCollection[psobject]'
     $outColl = New-Object 'System.Management.Automation.PSDataCollection[psobject]'
     $handle = $ps.BeginInvoke($inColl, $outColl)
+
+    # --- mule sessions --------------------------------------------------------
+    # Receive-only: they relay frames the agent pushes down a named pipe. Everything the
+    # client sends still goes to the primary session, so only one ordering problem exists
+    # and the resequencer below solves it.
+    $muleScript = [System.IO.File]::ReadAllText("$PSScriptRoot\src\Start-PwsshMule.ps1")
+    $mules = @()
+    for ($i = 0; $i -lt $stripes; $i++) {
+        try {
+            $ms = New-PSSession @sp
+            $mps = [PowerShell]::Create()
+            $mps.Runspace = $ms.Runspace
+            $null = $mps.AddScript($muleScript)
+            $null = $mps.AddParameter('PipeName', "$pipePrefix-$i")
+            $mOut = New-Object 'System.Management.Automation.PSDataCollection[psobject]'
+            $mHandle = $mps.BeginInvoke((New-Object 'System.Management.Automation.PSDataCollection[psobject]'), $mOut)
+            $mules += [pscustomobject]@{ Session = $ms; PS = $mps; Out = $mOut; Handle = $mHandle }
+        }
+        catch {
+            # A mule is an optimisation, never a requirement: the agent falls back to the
+            # primary session for any stripe that never connects.
+            Write-Diag "mule $i unavailable: $($_.Exception.Message)"
+        }
+    }
+    if ($stripes -gt 0) { Write-Diag "streams: 1 primary + $($mules.Count) mule(s)" }
+
+    $reseq = New-Object Pwssh.FrameResequencer
 
     # --- shuttle agent frames -------------------------------------------------
     # ssh <-> engine is handled by PwsshStdioBridge on its own threads, so this loop only
@@ -146,11 +186,19 @@ try {
             }
         }
 
+        # Frames arrive from the primary and from every mule. Each path is FIFO but they
+        # interleave, so delivery order comes from the sequence numbers, not arrival order.
         $items = $outColl.ReadAll()
+        foreach ($m in $mules) {
+            $mi = $m.Out.ReadAll()
+            if ($mi.Count -gt 0) { $items = @($items) + @($mi) }
+        }
         if ($items.Count -gt 0) {
             foreach ($it in $items) {
                 $bytes = $it.psobject.BaseObject -as [byte[]]
-                if ($bytes) { $proxy.PushInbound($bytes) }
+                if ($bytes) {
+                    foreach ($f in $reseq.Accept($bytes)) { $proxy.PushInbound($f) }
+                }
             }
             $did = $true
         }
@@ -193,6 +241,11 @@ finally {
     if ($ps) {
         try { if ($handle -and -not $handle.IsCompleted) { $ps.Stop() } } catch { }
         try { $ps.Dispose() } catch { }
+    }
+    foreach ($m in $mules) {
+        try { if ($m.Handle -and -not $m.Handle.IsCompleted) { $m.PS.Stop() } } catch { }
+        try { $m.PS.Dispose() } catch { }
+        try { Remove-PSSession $m.Session } catch { }
     }
     if ($session) { try { Remove-PSSession $session } catch { } }
 }

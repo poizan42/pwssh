@@ -38,7 +38,7 @@ Not implemented: `shell`, PTY, port forwarding, SFTP, rekeying.
 One transport item is exactly one frame; items cross intact and in order, so there is no length prefixing between frames — only a header:
 
 ```
-[1 byte type][4 bytes big-endian channel id][payload…]
+[1 byte type][4 bytes big-endian channel id][4 bytes big-endian sequence][payload…]
 ```
 
 Client → agent: `0x01 EXEC`, `0x02 DATA` (stdin), `0x03 EOF`, `0x04 CLOSE`, `0x05 WINDOW`. Agent → client: `0x81 DATA`, `0x82 STDERR`, `0x83 EXIT`, `0x84 DONE`, `0x85 HELLO`, `0x86 FAIL`. The high bit marks direction. Channel ids exist so `direct-tcpip` can be added without reworking the protocol.
@@ -47,6 +47,22 @@ Two things about this are load-bearing:
 
 - **`SessionChannel.OnAgentData` must never block.** It runs on the client's frame loop, and blocking there for ssh window credit would stop the same loop that drains the remoting output — an immediate deadlock. A dedicated sender thread owns all window waiting.
 - **Credit is returned to the agent in 1 MiB batches** (`GRANT_THRESHOLD`). Granting per SSH packet produced ~256 tiny `WINDOW` frames for an 8 MiB download, all travelling upstream — the slow direction — and cost ~25% of throughput.
+- **Every outbound frame must go through `PwsshAgentHost.Send`**, which is where the sequence number is stamped. Enqueuing straight onto the outbound queue leaves the sequence at 0, which collides with the first sequenced frame and makes the client's resequencer silently drop one as a duplicate. This bit the `HELLO` frame and produced a connection that succeeded with empty output.
+
+### Striping across sessions (`-Streams N`, default 1)
+
+Each PSSession gets its own WSMan receive thread on the client, and that thread is the ceiling, so extra sessions multiply receive capacity. Sessions beyond the first are receive-only "mules": they run `src/Start-PwsshMule.ps1`, which connects to a local named pipe published by the agent and relays whatever arrives to its own pipeline output. Mules need no compilation — they never inspect a frame. Everything the client *sends* still goes to the primary session, so there is only one ordering problem, solved by `FrameResequencer`.
+
+A mule lives in a different `wsmprovhost` process from the agent that owns the child, which is why the hand-off is a named pipe rather than a method call.
+
+**It is opt-in because it is not a general win.** Measured over 24 MiB, interleaved:
+
+| | 1 stream | 4 streams | |
+|---|---|---|---|
+| incompressible | 0.35 MiB/s | **1.00 MiB/s** | 2.83× |
+| compressible | 2.98 MiB/s | 2.46 MiB/s | **0.83× — worse** |
+
+Frame compression and striping relieve the *same* bottleneck. Once compression has done so, three extra sessions are just ~2 s of setup on an 8 s transfer. Use `-Streams 4` for bulk incompressible traffic (already-compressed archives, media, encrypted blobs); leave it at 1 for ordinary command output.
 
 ## Running and testing
 
@@ -323,7 +339,9 @@ This only affects interactive `shell` responsiveness — bulk transfer already p
   | compressible | 2.70 MiB/s | **4.58 MiB/s** (1.7×) |
   | incompressible | 0.38 MiB/s | 0.38 MiB/s (falls back to raw, by design) |
 
-  Remaining ideas, in order of expected value: **striping frames across several PSSessions**, since each has its own receive thread and this bottleneck is per-thread (measured ~1.7× at four sessions in an earlier experiment, at the cost of reassembly ordering); raising the remote's `MaxEnvelopeSizekb` from 500 to reduce fragment count (needs admin); and only then the allocation churn — a payload byte is still copied roughly eight times between the agent's read and ssh's stdout (`Frame.Make`, `Frame.Payload`, the `SendData` slice, `SshWriter` plus `ToArray`, packet assembly, `ByteChannel.Write`'s defensive copy, `TakeAll`'s concatenation), which is worth fixing for memory pressure even though it will not move throughput.
+  **Striping across sessions was then implemented** (see above): 2.83× on incompressible data, but 0.83× on compressible, because it relieves the same bottleneck compression already does. It is opt-in via `-Streams`.
+
+  Remaining ideas: raising the remote's `MaxEnvelopeSizekb` from 500 to reduce fragment count (needs admin); and the allocation churn — a payload byte is still copied roughly eight times between the agent's read and ssh's stdout (`Frame.Make`, `Frame.Payload`, the `SendData` slice, `SshWriter` plus `ToArray`, packet assembly, `ByteChannel.Write`'s defensive copy, `TakeAll`'s concatenation), which is worth fixing for memory pressure even though it will not move throughput.
 
   **Tooling note:** `dotnet-trace` from NuGet is 9.0 and produces an empty trace against pwsh 7.6, which runs on .NET 10 — 0 samples and a "potentially broken trace" warning. Version 10.0.731102 is not on NuGet (broken publish pipeline); get the signed binary from the [dotnet/diagnostics release](https://github.com/dotnet/diagnostics/releases/tag/v10.0.731102). Also make sure the traced process **outlives the trace duration**: if it exits mid-session the rundown never happens and stacks cannot be resolved. The speedscope output is *evented*, and hangs `CPU_TIME`/`UNMANAGED_CODE_TIME` pseudo-leaves under each real frame, so self time must be credited to the nearest real ancestor — and `UNMANAGED_CODE_TIME` is mostly blocked threads, not CPU.
 - **Encrypting before WinRM costs ~29× of throughput.** WinRM compression is enabled by default, and an SSH-encrypted payload is incompressible, so that compression is wasted. Measured downstream over 8 MiB, interleaved across 3 rounds: incompressible **0.36–0.39 MiB/s** versus compressible plaintext **6.3–11.3 MiB/s**. (The ratio is the reliable figure; absolute numbers vary between sessions — earlier runs on smaller payloads reached 3.5–4 MiB/s incompressible.) This is the strongest argument for terminating SSH in the client-side ProxyCommand rather than on the remote: it makes the WinRM payload plaintext, which also removes all crypto from the remote and turns the ~10 SSH handshake round trips into local ones.

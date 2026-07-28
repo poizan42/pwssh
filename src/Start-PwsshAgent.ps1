@@ -19,7 +19,11 @@
 param(
     [string]$CsSource,
     [string]$CommonSource,
-    [bool]$EmitLog = $false
+    [bool]$EmitLog = $false,
+    # Downstream striping: one named pipe per mule session, which the client starts
+    # separately. Zero means everything goes through this session.
+    [string]$PipePrefix,
+    [int]$Stripes = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -35,6 +39,11 @@ try {
     Import-PwsshSource -CsSource $CsSource
 
     $agent = New-Object Pwssh.PwsshAgentHost
+    # Pipes must exist before Start(), so the mules have something to connect to while the
+    # first frames (HELLO) are already being produced.
+    if ($Stripes -gt 0 -and -not [string]::IsNullOrEmpty($PipePrefix)) {
+        $agent.SetStripes($PipePrefix, $Stripes)
+    }
     $agent.Start()
     $null = [Pwssh.PwsshPump]::StartInbound($input, $agent)
 

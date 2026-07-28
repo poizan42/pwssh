@@ -17,6 +17,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
+using System.IO.Pipes;
 using System.Text;
 using System.Threading;
 
@@ -97,15 +98,24 @@ namespace Pwssh
 
     public static class Frame
     {
-        public const int HEADER = 5;
+        // [type:1][channel:4][seq:4]. The sequence number exists so downstream frames can be
+        // striped across several PSSessions and reassembled: each session has its own WSMan
+        // receive thread, and that thread is the throughput ceiling.
+        public const int HEADER = 9;
+
+        private static void PutHeader(byte[] f, byte type, uint channel)
+        {
+            f[0] = type;
+            f[1] = (byte)(channel >> 24); f[2] = (byte)(channel >> 16);
+            f[3] = (byte)(channel >> 8); f[4] = (byte)channel;
+            // seq is stamped later, by whoever routes the frame
+        }
 
         public static byte[] Make(byte type, uint channel, byte[] payload)
         {
             int n = (payload == null) ? 0 : payload.Length;
             byte[] f = new byte[HEADER + n];
-            f[0] = type;
-            f[1] = (byte)(channel >> 24); f[2] = (byte)(channel >> 16);
-            f[3] = (byte)(channel >> 8); f[4] = (byte)channel;
+            PutHeader(f, type, channel);
             if (n > 0) Array.Copy(payload, 0, f, HEADER, n);
             return f;
         }
@@ -113,11 +123,20 @@ namespace Pwssh
         public static byte[] Make(byte type, uint channel, byte[] payload, int offset, int count)
         {
             byte[] f = new byte[HEADER + count];
-            f[0] = type;
-            f[1] = (byte)(channel >> 24); f[2] = (byte)(channel >> 16);
-            f[3] = (byte)(channel >> 8); f[4] = (byte)channel;
+            PutHeader(f, type, channel);
             if (count > 0) Array.Copy(payload, offset, f, HEADER, count);
             return f;
+        }
+
+        public static void SetSeq(byte[] f, uint seq)
+        {
+            f[5] = (byte)(seq >> 24); f[6] = (byte)(seq >> 16);
+            f[7] = (byte)(seq >> 8); f[8] = (byte)seq;
+        }
+
+        public static uint Seq(byte[] f)
+        {
+            return ((uint)f[5] << 24) | ((uint)f[6] << 16) | ((uint)f[7] << 8) | f[8];
         }
 
         public static byte[] MakeText(byte type, uint channel, string text)
@@ -349,6 +368,111 @@ namespace Pwssh
         }
     }
 
+    // -------------------------------------------------------------------- stripes
+    //
+    // Extra PSSessions ("mules") exist only to carry downstream frames. Each session has its
+    // own WSMan receive thread on the client, and that thread -- not bandwidth, and not our
+    // code -- is the throughput ceiling. Measured downstream on incompressible data:
+    // 1 session 0.43 MiB/s, 2 sessions 1.18, 4 sessions 1.40.
+    //
+    // A mule runs in a different wsmprovhost process from the agent that owns the child, so
+    // frames reach it over a local named pipe. Mules are receive-only: everything the client
+    // sends still goes to the primary session, which keeps ordering simple.
+
+    internal sealed class PipeSink
+    {
+        private readonly FrameQueue q = new FrameQueue();
+        private readonly PwsshAgentHost host;
+        private readonly string pipeName;
+        private volatile bool connected;
+
+        public PipeSink(PwsshAgentHost h, string name) { host = h; pipeName = name; }
+        public bool Connected { get { return connected; } }
+        public void Enqueue(byte[] frame) { q.Enqueue(frame); }
+        public void Close() { q.Close(); }
+
+        public void Start()
+        {
+            Thread t = new Thread(new ThreadStart(delegate
+            {
+                try
+                {
+                    using (NamedPipeServerStream srv = new NamedPipeServerStream(
+                        pipeName, PipeDirection.Out, 1, PipeTransmissionMode.Byte,
+                        PipeOptions.None, 1 << 16, 1 << 16))
+                    {
+                        srv.WaitForConnection();
+                        connected = true;
+                        host.Log("stripe connected: " + pipeName);
+
+                        byte[] len = new byte[4];
+                        while (true)
+                        {
+                            byte[] f = q.Take(200);
+                            if (f == null)
+                            {
+                                if (host.Finished || q.IsClosed) break;
+                                continue;
+                            }
+                            len[0] = (byte)(f.Length >> 24); len[1] = (byte)(f.Length >> 16);
+                            len[2] = (byte)(f.Length >> 8); len[3] = (byte)f.Length;
+                            srv.Write(len, 0, 4);
+                            srv.Write(f, 0, f.Length);
+                        }
+                        srv.Flush();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    host.Log("stripe " + pipeName + " ended: " + ex.Message);
+                }
+                finally { connected = false; }
+            }));
+            t.IsBackground = true;
+            t.Name = "pwssh-stripe";
+            t.Start();
+        }
+    }
+
+    // Frames arrive from several sessions, each FIFO but interleaved. Delivery must follow
+    // the sequence numbers, or SSH channel data would be reordered.
+    public sealed class FrameResequencer
+    {
+        private readonly Dictionary<uint, byte[]> pending = new Dictionary<uint, byte[]>();
+        private readonly object gate = new object();
+        private uint next;
+
+        public int Pending { get { lock (gate) { return pending.Count; } } }
+
+        // Returns the frames that are now deliverable, in order. Usually one; occasionally
+        // several, when a gap fills in.
+        public List<byte[]> Accept(byte[] frame)
+        {
+            List<byte[]> ready = new List<byte[]>();
+            lock (gate)
+            {
+                uint s = Frame.Seq(frame);
+                if (s == next)
+                {
+                    ready.Add(frame);
+                    next++;
+                    while (pending.ContainsKey(next))
+                    {
+                        ready.Add(pending[next]);
+                        pending.Remove(next);
+                        next++;
+                    }
+                }
+                else if (s > next)
+                {
+                    pending[s] = frame;
+                }
+                // s < next would be a duplicate; drop it.
+            }
+            return ready;
+        }
+    }
+
     // -------------------------------------------------------------- client contracts
 
     public interface IPwsshAgent
@@ -507,7 +631,9 @@ namespace Pwssh
             string user;
             try { user = CurrentAccountName(); }
             catch (Exception ex) { user = ""; Log("cannot resolve current user: " + ex.Message); }
-            outbound.Enqueue(Frame.MakeText(FrameType.HELLO, 0, user));
+            // Must go through Send: every frame needs a sequence number, or it collides with
+            // the first sequenced frame and the client's resequencer drops one as a duplicate.
+            Send(Frame.MakeText(FrameType.HELLO, 0, user));
             Log("agent ready as '" + user + "'");
 
             if (InactivityTimeoutSeconds > 0)
@@ -545,7 +671,38 @@ namespace Pwssh
 
         public byte[] TakeOutboundFrame(int timeoutMs) { return outbound.Take(timeoutMs); }
 
-        internal void Send(byte[] frame) { outbound.Enqueue(frame); }
+        private readonly List<PipeSink> stripes = new List<PipeSink>();
+        private int seqCounter = -1;
+        private int roundRobin = -1;
+
+        // Called before Start(). Creates one named pipe per mule session; the client starts
+        // the mules, which connect and forward whatever arrives to their own pipeline output.
+        public void SetStripes(string pipePrefix, int count)
+        {
+            for (int i = 0; i < count; i++)
+            {
+                PipeSink p = new PipeSink(this, pipePrefix + "-" + i);
+                stripes.Add(p);
+                p.Start();
+            }
+            if (count > 0) Log("striping downstream across " + (count + 1) + " sessions");
+        }
+
+        internal void Send(byte[] frame)
+        {
+            // Stamp the order here, where it is serialised across all producing threads.
+            Frame.SetSeq(frame, (uint)Interlocked.Increment(ref seqCounter));
+
+            if (stripes.Count == 0) { outbound.Enqueue(frame); return; }
+
+            int slot = Interlocked.Increment(ref roundRobin) % (stripes.Count + 1);
+            if (slot == 0) { outbound.Enqueue(frame); return; }
+
+            PipeSink sink = stripes[slot - 1];
+            // Not connected yet (or gone): fall back to the primary session. Sequence numbers
+            // mean the client reassembles correctly either way.
+            if (sink.Connected) sink.Enqueue(frame); else outbound.Enqueue(frame);
+        }
 
         public string[] DrainLog()
         {
@@ -622,7 +779,7 @@ namespace Pwssh
             catch (Exception ex)
             {
                 Log("frame 0x" + type.ToString("X2") + " failed: " + ex.Message);
-                outbound.Enqueue(Frame.MakeText(FrameType.FAIL, ch, ex.Message));
+                Send(Frame.MakeText(FrameType.FAIL, ch, ex.Message));
             }
         }
 
@@ -639,6 +796,7 @@ namespace Pwssh
             {
                 foreach (AgentChannel c in channels.Values) { try { c.Kill(); } catch { } }
             }
+            foreach (PipeSink p in stripes) { try { p.Close(); } catch { } }
             outbound.Close();
         }
 
@@ -659,7 +817,7 @@ namespace Pwssh
             {
                 if (channels.ContainsKey(ch))
                 {
-                    outbound.Enqueue(Frame.MakeText(FrameType.FAIL, ch, "channel already in use"));
+                    Send(Frame.MakeText(FrameType.FAIL, ch, "channel already in use"));
                     return;
                 }
                 channels[ch] = c;
@@ -667,7 +825,7 @@ namespace Pwssh
             Log("exec on channel " + ch + ": " + command);
             if (!c.StartExec(command))
             {
-                outbound.Enqueue(Frame.MakeText(FrameType.FAIL, ch, "could not start command"));
+                Send(Frame.MakeText(FrameType.FAIL, ch, "could not start command"));
                 Forget(ch);
             }
         }
