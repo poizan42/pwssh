@@ -11,17 +11,17 @@ namespace Pwssh.Dev
 {
     public static class TcpHost
     {
-        public static void Run(int port, string hostKey, string expectedUser, bool verbose)
+        public static void Run(int port, string hostKey, bool verbose)
         {
             TcpListener l = new TcpListener(IPAddress.Loopback, port);
             l.Start();
-            Console.Error.WriteLine("[pwssh] listening on 127.0.0.1:" + port + " as user '" + expectedUser + "'");
+            Console.Error.WriteLine("[pwssh] listening on 127.0.0.1:" + port);
             while (true)
             {
                 TcpClient c = l.AcceptTcpClient();
                 Thread t = new Thread(new ParameterizedThreadStart(Serve));
                 t.IsBackground = true;
-                t.Start(new object[] { c, hostKey, expectedUser, verbose });
+                t.Start(new object[] { c, hostKey, verbose });
             }
         }
 
@@ -30,8 +30,7 @@ namespace Pwssh.Dev
             object[] a = (object[])state;
             TcpClient c = (TcpClient)a[0];
             string hostKey = (string)a[1];
-            string user = (string)a[2];
-            bool verbose = (bool)a[3];
+            bool verbose = (bool)a[2];
 
             Console.Error.WriteLine("[pwssh] connection from " + c.Client.RemoteEndPoint);
             PwsshEngine eng = null;
@@ -40,7 +39,10 @@ namespace Pwssh.Dev
                 NetworkStream ns = c.GetStream();
                 PwsshConfig cfg = new PwsshConfig();
                 cfg.HostKey = hostKey;
-                cfg.ExpectedUser = user;
+                // In-process agent wired through the real frame protocol, so this harness
+                // exercises everything except the WinRM hop. ExpectedUser is deliberately left
+                // unset so the HELLO round trip is exercised too.
+                cfg.Agent = PwsshLoopback.Start();
                 eng = new PwsshEngine(cfg);
                 eng.Start();
 

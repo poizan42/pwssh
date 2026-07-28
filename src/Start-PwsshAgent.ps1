@@ -1,0 +1,67 @@
+# Runs inside the remote runspace. Sent as script text with the agent source and helper
+# functions as parameters, so nothing is written to the remote's disk.
+#
+# There is no cryptography here and no host key: SSH terminates in the client, so what
+# crosses this link is plaintext frames, which lets WinRM's own compression work.
+#
+# This MUST remain a *simple* script. Adding [Parameter()] attributes to any parameter -- or
+# [CmdletBinding()] -- makes it advanced, and advanced scripts route pipeline input through
+# parameter binding: raw byte[] is then rejected with "The input object cannot be bound to any
+# parameters..." and $input stays empty. Hence plain typed parameters and manual validation.
+#
+# The pipeline thread emits outbound frames; inbound is drained by a background thread
+# (Pwssh.PwsshPump) because enumerating $input blocks and this is the only thread here.
+#
+# Only frames may reach the output stream. The warning stream is not safe either: remote
+# warnings are surfaced to the client's host, which writes them to the client's stdout.
+# Failures go to the error stream, which the client reads separately.
+
+param(
+    [string]$CsSource,
+    [string]$CommonSource,
+    [bool]$EmitLog = $false
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Off
+
+$agent = $null
+try {
+    if ([string]::IsNullOrEmpty($CsSource)) { throw 'pwssh: CsSource parameter is required' }
+    if ([string]::IsNullOrEmpty($CommonSource)) { throw 'pwssh: CommonSource parameter is required' }
+
+    . ([scriptblock]::Create($CommonSource))
+
+    Import-PwsshSource -CsSource $CsSource
+
+    $agent = New-Object Pwssh.PwsshAgentHost
+    $agent.Start()
+    $null = [Pwssh.PwsshPump]::StartInbound($input, $agent)
+
+    while (-not $agent.Finished) {
+        # Short poll, then drain everything queued: frames are discrete, and one item per
+        # frame keeps the header unambiguous on the far side.
+        $frame = $agent.TakeOutboundFrame(25)
+        while ($null -ne $frame) {
+            , $frame
+            $frame = $agent.TakeOutboundFrame(0)
+        }
+        if ($EmitLog) {
+            foreach ($line in $agent.DrainLog()) { Write-Warning $line }
+        }
+    }
+
+    # Flush whatever was queued as the agent stopped.
+    $frame = $agent.TakeOutboundFrame(0)
+    while ($null -ne $frame) {
+        , $frame
+        $frame = $agent.TakeOutboundFrame(0)
+    }
+
+    if ($EmitLog) {
+        foreach ($line in $agent.DrainLog()) { Write-Warning $line }
+    }
+}
+finally {
+    if ($agent) { try { $agent.Stop() } catch { } }
+}

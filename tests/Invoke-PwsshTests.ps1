@@ -77,7 +77,11 @@ function Get-Sha([byte[]]$b) {
 }
 
 function New-FarSideCommand([string]$Script) {
-    $enc = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($Script))
+    # powershell.exe emits a CLIXML progress record ("Preparing modules for first use") on
+    # stderr, which is faithfully relayed as CHANNEL_EXTENDED_DATA and would otherwise be
+    # mixed into anything the far side writes there deliberately.
+    $full = "`$ProgressPreference = 'SilentlyContinue'`n" + $Script
+    $enc = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($full))
     return "powershell -NoProfile -NonInteractive -EncodedCommand $enc"
 }
 
@@ -167,6 +171,41 @@ for (`$k = 0; `$k -lt $($big / 65536); `$k++) { `$o.Write(`$chunk, 0, `$chunk.Le
         "got $($r.Stdout.Length) expected $big stderr=$($r.Stderr)"
     Assert-That '8 MiB content bit-exact' ((Get-Sha $r.Stdout) -eq (Get-Sha $exp.ToArray())) 'sha mismatch'
     Write-Host ("        throughput: {0:N2} MiB/s" -f (8 / $sw.Elapsed.TotalSeconds)) -ForegroundColor DarkGray
+}
+
+# ------------------------------- 6b. incompressible payload (worst-case throughput)
+# The test above uses a repeating pattern, which WinRM compresses well now that the link
+# carries plaintext. This measures the other end of the range.
+if (-not $SkipLarge) {
+    $big = 8 * 1024 * 1024
+    $genRand = @"
+`$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+`$sha = [System.Security.Cryptography.SHA256]::Create()
+`$chunk = New-Object byte[] 65536
+`$o = [Console]::OpenStandardOutput()
+for (`$k = 0; `$k -lt $($big / 65536); `$k++) {
+    `$rng.GetBytes(`$chunk)
+    `$null = `$sha.TransformBlock(`$chunk, 0, `$chunk.Length, `$null, 0)
+    `$o.Write(`$chunk, 0, `$chunk.Length)
+}
+`$o.Flush()
+`$null = `$sha.TransformFinalBlock((New-Object byte[] 0), 0, 0)
+[Console]::Error.Write([Convert]::ToBase64String(`$sha.Hash))
+"@
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $r = Invoke-Ssh -Command (New-FarSideCommand $genRand)
+    $sw.Stop()
+
+    Assert-That 'incompressible 8 MiB arrives complete' ($r.Stdout.Length -eq $big) `
+        "got $($r.Stdout.Length) expected $big"
+    # The far side reports its own hash on stderr, so this also proves the two streams stay
+    # separated while stdout is saturated. Matched by pattern rather than compared whole, so
+    # any incidental host noise on stderr cannot fail an otherwise correct transfer.
+    $remoteHash = ''
+    if ($r.Stderr -match '([A-Za-z0-9+/]{43}=)') { $remoteHash = $Matches[1] }
+    Assert-That 'incompressible 8 MiB bit-exact' ((Get-Sha $r.Stdout) -eq $remoteHash) `
+        "local $(Get-Sha $r.Stdout) vs remote '$remoteHash'"
+    Write-Host ("        throughput (incompressible): {0:N2} MiB/s" -f (8 / $sw.Elapsed.TotalSeconds)) -ForegroundColor DarkGray
 }
 
 # --------------------------------------------------------- 7. username rejected

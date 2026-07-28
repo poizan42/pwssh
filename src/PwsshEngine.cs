@@ -22,8 +22,11 @@ namespace Pwssh
     public sealed class PwsshConfig
     {
         public string HostKey;              // opaque blob from PwsshKey.Generate
+        // Optional: when unset it is resolved from the agent's HELLO frame at userauth time.
         public string ExpectedUser;
         public string ServerIdent = "SSH-2.0-pwssh_0.1";
+        // Where channels actually run. Never null in practice.
+        public IPwsshAgent Agent;
 
         // If the client vanishes without closing the session, the remote pipeline would
         // otherwise block forever and hold a WinRM shell until WinRM's own (2 hour)
@@ -149,94 +152,9 @@ namespace Pwssh
         public bool AtEnd { get { return p >= b.Length; } }
     }
 
-    // ------------------------------------------------- producer/consumer byte stream
-
-    internal sealed class ByteChannel
-    {
-        private readonly Queue<byte[]> q = new Queue<byte[]>();
-        private readonly object gate = new object();
-        private byte[] cur;
-        private int curPos;
-        private bool closed;
-
-        public void Write(byte[] data, int off, int count)
-        {
-            if (count <= 0) return;
-            byte[] copy = new byte[count];
-            Array.Copy(data, off, copy, 0, count);
-            lock (gate)
-            {
-                if (closed) return;
-                q.Enqueue(copy);
-                Monitor.PulseAll(gate);
-            }
-        }
-
-        public void Write(byte[] data) { Write(data, 0, data.Length); }
-
-        public void Close() { lock (gate) { closed = true; Monitor.PulseAll(gate); } }
-        public bool IsClosed { get { lock (gate) { return closed; } } }
-
-        private bool HasBufferedNoLock()
-        {
-            return (cur != null && curPos < cur.Length) || q.Count > 0;
-        }
-
-        public void ReadExact(byte[] dst, int off, int n)
-        {
-            int got = 0;
-            lock (gate)
-            {
-                while (got < n)
-                {
-                    if (cur == null || curPos >= cur.Length)
-                    {
-                        while (q.Count == 0 && !closed) Monitor.Wait(gate);
-                        if (q.Count == 0 && closed) throw new EndOfStreamException("transport closed");
-                        cur = q.Dequeue();
-                        curPos = 0;
-                    }
-                    int take = Math.Min(n - got, cur.Length - curPos);
-                    Array.Copy(cur, curPos, dst, off + got, take);
-                    curPos += take;
-                    got += take;
-                }
-            }
-        }
-
-        public byte ReadByte1()
-        {
-            byte[] one = new byte[1];
-            ReadExact(one, 0, 1);
-            return one[0];
-        }
-
-        // All currently buffered bytes. null if nothing arrived within the timeout.
-        public byte[] TakeAll(int timeoutMs)
-        {
-            lock (gate)
-            {
-                if (!HasBufferedNoLock())
-                {
-                    if (closed) return null;
-                    Monitor.Wait(gate, timeoutMs);
-                    if (!HasBufferedNoLock()) return null;
-                }
-                MemoryStream ms = new MemoryStream();
-                if (cur != null && curPos < cur.Length)
-                {
-                    ms.Write(cur, curPos, cur.Length - curPos);
-                    cur = null; curPos = 0;
-                }
-                while (q.Count > 0)
-                {
-                    byte[] x = q.Dequeue();
-                    ms.Write(x, 0, x.Length);
-                }
-                return ms.ToArray();
-            }
-        }
-    }
+    // ByteChannel and PwsshPump now live in PwsshAgent.cs, which has to be self-contained
+    // because the remote can only compile a single source string. This file is always
+    // compiled together with it (Add-Type -Path on the client).
 
     // ------------------------------------------------------------------ AES-256-CTR
 
@@ -451,7 +369,7 @@ namespace Pwssh
 
     // ----------------------------------------------------------------------- engine
 
-    public sealed class PwsshEngine
+    public sealed class PwsshEngine : IByteReceiver, IPwsshChannelSink
     {
         private const string KEX_ALG = "diffie-hellman-group14-sha256";
         private const string HOSTKEY_ALG = "rsa-sha2-256";
@@ -488,7 +406,7 @@ namespace Pwssh
         private bool authenticated;
         private int authFailures;
 
-        private ExecChannel channel;
+        private SessionChannel channel;
 
         public PwsshEngine(PwsshConfig config)
         {
@@ -580,6 +498,8 @@ namespace Pwssh
             {
                 hostKey = new RSACryptoServiceProvider();
                 hostKey.ImportParameters(PwsshKey.Import(cfg.HostKey));
+
+                if (cfg.Agent != null) cfg.Agent.Attach(this);
 
                 ExchangeIdent();
                 SendKexInit();
@@ -880,7 +800,7 @@ namespace Pwssh
                         break;
 
                     case Msg.CHANNEL_EOF:
-                        if (channel != null) channel.CloseChildStdin();
+                        if (channel != null) channel.ClientEof();
                         break;
 
                     case Msg.CHANNEL_CLOSE:
@@ -968,6 +888,21 @@ namespace Pwssh
             string service = r.StrUtf8();
             string method = r.StrUtf8();
 
+            // The handshake is local now, so userauth can arrive before the agent's HELLO has
+            // made the round trip. Blocking here lets session setup overlap the handshake
+            // instead of serialising it.
+            if (string.IsNullOrEmpty(cfg.ExpectedUser) && cfg.Agent != null)
+            {
+                string remote = cfg.Agent.WaitForRemoteUser(30000);
+                if (string.IsNullOrEmpty(remote))
+                {
+                    Disconnect(11, "could not determine the remote account");
+                    return;
+                }
+                cfg.ExpectedUser = remote;
+                Log("remote account: " + remote);
+            }
+
             if (UserMatches(user))
             {
                 authenticated = true;
@@ -1033,7 +968,7 @@ namespace Pwssh
                 return;
             }
 
-            channel = new ExecChannel(this, pkt, peerChannel, peerWindow, peerMaxPacket);
+            channel = new SessionChannel(this, pkt, cfg.Agent, peerChannel, peerWindow, peerMaxPacket);
 
             SshWriter w = new SshWriter();
             w.Byte(Msg.CHANNEL_OPEN_CONFIRMATION);
@@ -1084,32 +1019,58 @@ namespace Pwssh
             r.Byte();
             r.UInt32();
             byte[] data = r.Str();
-            if (channel != null) channel.WriteToChild(data);
+            if (channel != null) channel.WriteFromClient(data);
         }
 
         internal void NotifyChannelFinished() { finished = true; }
         internal uint InitialWindow { get { return INITIAL_WINDOW; } }
         internal void LogInternal(string m) { Log(m); }
+
+        // ---- IPwsshChannelSink: called from the agent side, must not block ----
+
+        public void OnData(uint ch, byte[] data, bool stderr)
+        {
+            SessionChannel c = channel;
+            if (c != null && c.PeerChannel == ch) c.OnAgentData(data, stderr);
+        }
+
+        public void OnExit(uint ch, uint status)
+        {
+            SessionChannel c = channel;
+            if (c != null && c.PeerChannel == ch) c.OnAgentExit(status);
+        }
+
+        public void OnClose(uint ch)
+        {
+            SessionChannel c = channel;
+            if (c != null && c.PeerChannel == ch) c.OnAgentClose();
+        }
+
+        public void OnAgentError(string message)
+        {
+            Log("agent error: " + message);
+            lastError = "agent: " + message;
+        }
     }
 
-    // ------------------------------------------------------------ client stdin reader
+    // --------------------------------------------------------------- stdio bridge
     //
-    // ssh hands the ProxyCommand raw binary on stdin. Reading it needs a dedicated thread
-    // (a blocking read would stop the client servicing remoting output), but the queue is
-    // drained non-blockingly from PowerShell, so no System.Management.Automation
-    // reference is needed here and this source stays portable to the remote.
-    public static class PwsshStdin
+    // ssh hands the ProxyCommand raw binary on stdin and reads the reply from stdout. Both
+    // directions run on dedicated threads here rather than from the PowerShell loop, which
+    // matters for more than tidiness: it lets the whole SSH handshake complete locally while
+    // New-PSSession is still connecting, instead of waiting for it. Only userauth then has to
+    // wait for the agent, and only for its HELLO frame.
+    //
+    // No System.Management.Automation reference is needed, so this stays plain C#.
+    public static class PwsshStdioBridge
     {
-        private static readonly ByteChannel ch = new ByteChannel();
-        private static volatile bool eof;
         private static int started;
 
-        public static bool Eof { get { return eof; } }
-
-        public static void Start(int maxChunk)
+        public static void Start(PwsshEngine engine, int maxChunk)
         {
             if (Interlocked.CompareExchange(ref started, 1, 0) != 0) return;
-            Thread t = new Thread(new ThreadStart(delegate
+
+            Thread inbound = new Thread(new ThreadStart(delegate
             {
                 try
                 {
@@ -1119,7 +1080,9 @@ namespace Pwssh
                     {
                         int n = si.Read(buf, 0, buf.Length);
                         if (n <= 0) break;
-                        ch.Write(buf, 0, n);
+                        byte[] c = new byte[n];
+                        Array.Copy(buf, 0, c, 0, n);
+                        engine.PushInbound(c);
                     }
                 }
                 catch (Exception)
@@ -1128,93 +1091,96 @@ namespace Pwssh
                 }
                 finally
                 {
-                    eof = true;
-                    ch.Close();
+                    engine.CloseInbound();
                 }
             }));
-            t.IsBackground = true;
-            t.Name = "pwssh-stdin";
-            t.Start();
-        }
+            inbound.IsBackground = true;
+            inbound.Name = "pwssh-ssh-in";
+            inbound.Start();
 
-        public static byte[] TakeAll(int timeoutMs) { return ch.TakeAll(timeoutMs); }
-    }
-
-    // ------------------------------------------------------------- inbound pump
-    //
-    // The remote side must read the pipeline input and write pipeline output at the same
-    // time, but PowerShell is single-threaded and enumerating $input blocks. So input is
-    // drained on a background thread here while the pipeline thread emits output.
-    //
-    // Deliberately typed as object/IEnumerator rather than PSObject: keeping System.
-    // Management.Automation out of the engine's references means the identical source
-    // compiles for the TCP dev host too. Items are unwrapped reflectively.
-    public static class PwsshPump
-    {
-        private static System.Reflection.PropertyInfo baseObjectProp;
-
-        public static Thread StartInbound(object enumerator, PwsshEngine engine)
-        {
-            System.Collections.IEnumerator e = (System.Collections.IEnumerator)enumerator;
-            Thread t = new Thread(new ThreadStart(delegate
+            Thread outbound = new Thread(new ThreadStart(delegate
             {
                 try
                 {
-                    while (e.MoveNext())
+                    Stream so = Console.OpenStandardOutput();
+                    while (true)
                     {
-                        byte[] b = Unwrap(e.Current);
-                        if (b != null && b.Length > 0) engine.PushInbound(b);
+                        byte[] b = engine.TakeOutbound(100);
+                        if (b != null && b.Length > 0)
+                        {
+                            so.Write(b, 0, b.Length);
+                            so.Flush();
+                            continue;
+                        }
+                        if (engine.Finished)
+                        {
+                            // Drain anything queued as the engine stopped, then stop.
+                            byte[] last = engine.TakeOutbound(0);
+                            while (last != null && last.Length > 0)
+                            {
+                                so.Write(last, 0, last.Length);
+                                so.Flush();
+                                last = engine.TakeOutbound(0);
+                            }
+                            break;
+                        }
                     }
                 }
                 catch (Exception)
                 {
-                    // Transport went away; treated as EOF below.
-                }
-                finally
-                {
-                    engine.CloseInbound();
+                    // ssh went away
                 }
             }));
-            t.IsBackground = true;
-            t.Name = "pwssh-inbound";
-            t.Start();
-            return t;
-        }
-
-        private static byte[] Unwrap(object o)
-        {
-            if (o == null) return null;
-            byte[] direct = o as byte[];
-            if (direct != null) return direct;
-            if (baseObjectProp == null || baseObjectProp.DeclaringType != o.GetType())
-            {
-                baseObjectProp = o.GetType().GetProperty("BaseObject");
-            }
-            if (baseObjectProp == null) return null;
-            return baseObjectProp.GetValue(o, null) as byte[];
+            outbound.IsBackground = true;
+            outbound.Name = "pwssh-ssh-out";
+            outbound.Start();
         }
     }
 
-    // -------------------------------------------------------------- exec channel
+    // -------------------------------------------------------------- session channel
 
-    internal sealed class ExecChannel
+    internal sealed class SessionChannel
     {
+        // Queued rather than emitted inline: OnAgentData runs on the client's pump loop, and
+        // blocking there for ssh window credit would stop the same loop that drains ssh stdin
+        // and the remoting output -- an immediate deadlock. A dedicated sender thread owns all
+        // window waiting, and the queue also keeps data/exit/close strictly ordered.
+        private sealed class Chunk
+        {
+            public const int DATA = 0, EXIT = 1, DONE = 2;
+            public int Kind;
+            public byte[] Data;
+            public bool Stderr;
+            public uint Status;
+        }
+
         private readonly PwsshEngine engine;
         private readonly PacketLayer pkt;
+        private readonly IPwsshAgent agent;
         private readonly uint peerChannel;
         private readonly uint peerMaxPacket;
+
         private readonly object windowGate = new object();
-        private long remoteWindow;
-        private uint localWindowUsed;
+        private long remoteWindow;                 // credit the ssh client has granted us
 
-        private Process proc;
-        private Thread stdoutThread, stderrThread, waitThread;
-        private int pumpsDone;
-        private bool killed;
+        private readonly Queue<Chunk> outQ = new Queue<Chunk>();
+        private readonly object outGate = new object();
 
-        public ExecChannel(PwsshEngine e, PacketLayer p, uint peer, uint window, uint maxPacket)
+        // Credit is returned to the agent in batches. Granting per SSH packet meant ~256 tiny
+        // WINDOW frames for an 8 MiB download, all travelling upstream -- the slow direction --
+        // and competing with the download on the same link. The threshold must stay well below
+        // PwsshAgentHost.INITIAL_CREDIT so the agent never actually runs dry.
+        private const int GRANT_THRESHOLD = 1024 * 1024;
+        private long pendingGrant;
+
+        private Thread sender;
+        private volatile bool killed;
+        private bool execStarted;
+
+        public SessionChannel(PwsshEngine e, PacketLayer p, IPwsshAgent a,
+                              uint peer, uint window, uint maxPacket)
         {
-            engine = e; pkt = p; peerChannel = peer;
+            engine = e; pkt = p; agent = a; peerChannel = peer;
             remoteWindow = window;
             peerMaxPacket = maxPacket == 0 ? 32768 : maxPacket;
         }
@@ -1228,73 +1194,104 @@ namespace Pwssh
 
         public bool StartExec(string command)
         {
-            if (proc != null) return false;
-            try
-            {
-                ProcessStartInfo psi = new ProcessStartInfo();
-                psi.FileName = Environment.GetEnvironmentVariable("ComSpec");
-                if (string.IsNullOrEmpty(psi.FileName)) psi.FileName = "cmd.exe";
-                psi.Arguments = "/c " + command;
-                psi.UseShellExecute = false;
-                psi.CreateNoWindow = true;
-                psi.RedirectStandardInput = true;
-                psi.RedirectStandardOutput = true;
-                psi.RedirectStandardError = true;
+            if (execStarted) return false;
+            execStarted = true;
 
-                proc = Process.Start(psi);
+            sender = new Thread(new ThreadStart(SenderLoop));
+            sender.IsBackground = true;
+            sender.Name = "pwssh-channel-sender";
+            sender.Start();
 
-                stdoutThread = StartPump(proc.StandardOutput.BaseStream, false);
-                stderrThread = StartPump(proc.StandardError.BaseStream, true);
-
-                waitThread = new Thread(new ThreadStart(WaitForExit));
-                waitThread.IsBackground = true;
-                waitThread.Start();
-                return true;
-            }
-            catch (Exception ex)
-            {
-                engine.LogInternal("exec failed: " + ex.Message);
-                return false;
-            }
+            agent.Exec(peerChannel, command);
+            return true;
         }
 
-        private Thread StartPump(Stream src, bool isStderr)
+        // ---- called from the agent side (must not block) ----
+
+        public void OnAgentData(byte[] data, bool stderr)
         {
-            Thread t = new Thread(new ThreadStart(delegate { Pump(src, isStderr); }));
-            t.IsBackground = true;
-            t.Start();
-            return t;
+            Chunk c = new Chunk();
+            c.Kind = Chunk.DATA; c.Data = data; c.Stderr = stderr;
+            Enqueue(c);
         }
 
-        // Raw BaseStream only: PowerShell's native-command bridge would destroy binary.
-        private void Pump(Stream src, bool isStderr)
+        public void OnAgentExit(uint status)
         {
-            byte[] buf = new byte[16384];
+            Chunk c = new Chunk();
+            c.Kind = Chunk.EXIT; c.Status = status;
+            Enqueue(c);
+        }
+
+        public void OnAgentClose()
+        {
+            Chunk c = new Chunk();
+            c.Kind = Chunk.DONE;
+            Enqueue(c);
+        }
+
+        private void Enqueue(Chunk c)
+        {
+            lock (outGate) { outQ.Enqueue(c); Monitor.PulseAll(outGate); }
+        }
+
+        // ---- called from the ssh side ----
+
+        public void WriteFromClient(byte[] data)
+        {
+            agent.SendStdin(peerChannel, data);
+
+            // Eager window adjust: a lazy threshold would cost a full round trip, and on this
+            // transport a round trip is ~600-900 ms.
+            SshWriter w = new SshWriter();
+            w.Byte(Msg.CHANNEL_WINDOW_ADJUST);
+            w.UInt32(peerChannel);
+            w.UInt32((uint)data.Length);
+            pkt.WritePacket(w.ToArray());
+        }
+
+        public void ClientEof() { agent.CloseStdin(peerChannel); }
+
+        public void Kill()
+        {
+            killed = true;
+            lock (windowGate) { Monitor.PulseAll(windowGate); }
+            lock (outGate) { Monitor.PulseAll(outGate); }
+            try { agent.CloseChannel(peerChannel); } catch { }
+        }
+
+        // ---- sender ----
+
+        private void SenderLoop()
+        {
             try
             {
-                while (true)
+                while (!killed)
                 {
-                    int n = src.Read(buf, 0, buf.Length);
-                    if (n <= 0) break;
-                    SendData(buf, n, isStderr);
+                    Chunk c = null;
+                    lock (outGate)
+                    {
+                        while (outQ.Count == 0 && !killed) Monitor.Wait(outGate, 250);
+                        if (killed) return;
+                        c = outQ.Dequeue();
+                    }
+
+                    if (c.Kind == Chunk.DATA) { SendData(c.Data, c.Stderr); }
+                    else if (c.Kind == Chunk.EXIT) { SendExitStatus(c.Status); }
+                    else { SendEofAndClose(); return; }
                 }
             }
             catch (Exception ex)
             {
-                engine.LogInternal("pump ended: " + ex.Message);
-            }
-            finally
-            {
-                Interlocked.Increment(ref pumpsDone);
+                engine.LogInternal("channel sender ended: " + ex.Message);
             }
         }
 
-        private void SendData(byte[] buf, int count, bool isStderr)
+        private void SendData(byte[] data, bool stderr)
         {
             int off = 0;
-            while (off < count)
+            while (off < data.Length && !killed)
             {
-                int want = Math.Min(count - off, (int)peerMaxPacket);
+                int want = Math.Min(data.Length - off, (int)peerMaxPacket);
                 int allowed;
                 lock (windowGate)
                 {
@@ -1306,14 +1303,14 @@ namespace Pwssh
                 if (allowed <= 0) continue;
 
                 byte[] slice = new byte[allowed];
-                Array.Copy(buf, off, slice, 0, allowed);
+                Array.Copy(data, off, slice, 0, allowed);
 
                 SshWriter w = new SshWriter();
-                if (isStderr)
+                if (stderr)
                 {
                     w.Byte(Msg.CHANNEL_EXTENDED_DATA);
                     w.UInt32(peerChannel);
-                    w.UInt32(1);            // SSH_EXTENDED_DATA_STDERR
+                    w.UInt32(1);                    // SSH_EXTENDED_DATA_STDERR
                 }
                 else
                 {
@@ -1323,75 +1320,41 @@ namespace Pwssh
                 w.Str(slice);
                 pkt.WritePacket(w.ToArray());
                 off += allowed;
-            }
-        }
 
-        public void WriteToChild(byte[] data)
-        {
-            try
-            {
-                if (proc != null && !proc.HasExited)
+                // Return credit in batches, so the agent's in-flight output stays bounded by
+                // the initial grant without flooding the upstream direction with tiny frames.
+                pendingGrant += allowed;
+                if (pendingGrant >= GRANT_THRESHOLD)
                 {
-                    proc.StandardInput.BaseStream.Write(data, 0, data.Length);
-                    proc.StandardInput.BaseStream.Flush();
+                    agent.GrantWindow(peerChannel, (uint)pendingGrant);
+                    pendingGrant = 0;
                 }
             }
-            catch (Exception ex) { engine.LogInternal("stdin write failed: " + ex.Message); }
-
-            // Eager window adjust: a lazy threshold would cost a full round trip.
-            localWindowUsed += (uint)data.Length;
-            SshWriter w = new SshWriter();
-            w.Byte(Msg.CHANNEL_WINDOW_ADJUST);
-            w.UInt32(peerChannel);
-            w.UInt32((uint)data.Length);
-            pkt.WritePacket(w.ToArray());
         }
 
-        public void CloseChildStdin()
+        private void SendExitStatus(uint code)
         {
-            try { if (proc != null) proc.StandardInput.BaseStream.Close(); } catch { }
+            engine.LogInternal("child exited " + code);
+            SshWriter req = new SshWriter();
+            req.Byte(Msg.CHANNEL_REQUEST);
+            req.UInt32(peerChannel);
+            req.Str("exit-status");
+            req.Bool(false);
+            req.UInt32(code);
+            pkt.WritePacket(req.ToArray());
         }
 
-        private void WaitForExit()
+        private void SendEofAndClose()
         {
-            try
-            {
-                proc.WaitForExit();
-                // Drain both pumps so no output is lost before exit-status.
-                for (int i = 0; i < 200 && pumpsDone < 2; i++) Thread.Sleep(10);
+            SshWriter eof = new SshWriter();
+            eof.Byte(Msg.CHANNEL_EOF);
+            eof.UInt32(peerChannel);
+            pkt.WritePacket(eof.ToArray());
 
-                uint code = (uint)proc.ExitCode;
-                engine.LogInternal("child exited " + code);
-
-                SshWriter req = new SshWriter();
-                req.Byte(Msg.CHANNEL_REQUEST);
-                req.UInt32(peerChannel);
-                req.Str("exit-status");
-                req.Bool(false);
-                req.UInt32(code);
-                pkt.WritePacket(req.ToArray());
-
-                SshWriter eof = new SshWriter();
-                eof.Byte(Msg.CHANNEL_EOF);
-                eof.UInt32(peerChannel);
-                pkt.WritePacket(eof.ToArray());
-
-                SshWriter cl = new SshWriter();
-                cl.Byte(Msg.CHANNEL_CLOSE);
-                cl.UInt32(peerChannel);
-                pkt.WritePacket(cl.ToArray());
-            }
-            catch (Exception ex)
-            {
-                engine.LogInternal("wait failed: " + ex.Message);
-            }
-        }
-
-        public void Kill()
-        {
-            killed = true;
-            lock (windowGate) { Monitor.PulseAll(windowGate); }
-            try { if (proc != null && !proc.HasExited) proc.Kill(); } catch { }
+            SshWriter cl = new SshWriter();
+            cl.Byte(Msg.CHANNEL_CLOSE);
+            cl.UInt32(peerChannel);
+            pkt.WritePacket(cl.ToArray());
         }
     }
 }

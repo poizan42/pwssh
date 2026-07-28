@@ -4,22 +4,49 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-**`exec` works end to end over WinRM.** `ssh pwssh-test whoami` returns `REMOTEDOM\kb`. The full test suite passes against both transports (11/11 loopback, 10/10 WinRM — the extra loopback case is the wrong-username check, which the WinRM alias takes from `ssh_config`).
+**`exec` works end to end over WinRM.** `ssh pwssh-test whoami` returns `REMOTEDOM\kb`. The suite passes against both transports (13/13 loopback, 12/12 WinRM — the extra loopback case is the wrong-username check, which the WinRM alias takes from `ssh_config`).
 
-Implemented: version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, `none` auth with username matching, session channel, `exec`, exit status, stderr as `CHANNEL_EXTENDED_DATA`, window management.
+**SSH terminates in the client.** `pwssh-connect.ps1` runs the whole SSH engine locally and only plaintext agent frames cross the WinRM link. The remote does no cryptography at all. This was a deliberate change from an earlier design that ran the engine on the remote, and it bought:
+
+| | remote termination | client termination |
+|---|---|---|
+| connect, `ssh host "echo x"` | 9,176 ms | **5,701 ms** (1.61×, interleaved over 5 rounds) |
+| 8 MiB `exec`, compressible | 0.30 MiB/s | **1.13 MiB/s** (3.8×) |
+
+The throughput gain is WinRM's own compression, which an encrypted stream made useless. The same suite reports **0.31 MiB/s for an incompressible 8 MiB payload** — essentially identical to what the old architecture managed on *compressible* data, which is exactly what the mechanism predicts and a good confirmation of it.
+
+Implemented: version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, `none` auth with username matching, session channel, `exec`, exit status, stderr as `CHANNEL_EXTENDED_DATA`, window management, credit-based flow control to the agent.
 
 Not implemented: `shell`, PTY, port forwarding, SFTP, rekeying.
+
+**The host key is now purely ceremonial.** It authenticates this proxy, not the remote machine — nothing about it crosses the link. It still has to be stable, because the client pins it in `known_hosts`.
 
 ## Repository layout
 
 | Path | Role |
 |---|---|
-| `src/PwsshEngine.cs` | The entire SSH implementation. Transport agnostic, and deliberately free of any `System.Management.Automation` reference so the same source compiles for both hosts. |
-| `src/PwsshCommon.ps1` | Shared helpers: engine compilation, host key keystore, current-user lookup. Sent to the remote as text. |
-| `src/Start-PwsshServer.ps1` | Runs on the remote: compiles the engine, starts it, shuttles bytes. Must stay a *simple* script — see the parameter-binding trap below. |
-| `pwssh-connect.ps1` | Client `ProxyCommand` entry point. |
-| `tools/Start-PwsshTcpHost.ps1`, `tools/PwsshTcpHost.cs` | Dev-only loopback host. |
+| `src/PwsshEngine.cs` | The SSH implementation — packet layer, KEX, cipher, MAC, auth, `SessionChannel`, plus `PwsshStdioBridge`. Runs on the **client** only. |
+| `src/PwsshAgent.cs` | Everything the remote needs, plus the plumbing shared with the engine (`ByteChannel`, `FrameQueue`, `PwsshPump`, `Frame`). **Must stay self-contained**: the remote can only compile one source string, because an in-memory `Add-Type` assembly has no `Location` for a second compilation to reference. The client compiles it *together with* the engine via `Add-Type -Path`. |
+| `src/PwsshCommon.ps1` | Shared helpers: compilation (with an on-disk assembly cache), host key keystore. Sent to the remote as text. |
+| `src/Start-PwsshAgent.ps1` | Runs on the remote: compiles the agent and shuttles frames. No crypto, no host key. Must stay a *simple* script — see the parameter-binding trap below. |
+| `pwssh-connect.ps1` | Client `ProxyCommand` entry point; runs the SSH engine. |
+| `tools/Start-PwsshTcpHost.ps1`, `tools/PwsshTcpHost.cs` | Dev-only loopback host, using an in-process agent wired through the real frame protocol. |
 | `tests/Invoke-PwsshTests.ps1` | End-to-end tests through the real `ssh` client, against either transport. |
+
+### Client ↔ agent frames
+
+One transport item is exactly one frame; items cross intact and in order, so there is no length prefixing between frames — only a header:
+
+```
+[1 byte type][4 bytes big-endian channel id][payload…]
+```
+
+Client → agent: `0x01 EXEC`, `0x02 DATA` (stdin), `0x03 EOF`, `0x04 CLOSE`, `0x05 WINDOW`. Agent → client: `0x81 DATA`, `0x82 STDERR`, `0x83 EXIT`, `0x84 DONE`, `0x85 HELLO`, `0x86 FAIL`. The high bit marks direction. Channel ids exist so `direct-tcpip` can be added without reworking the protocol.
+
+Two things about this are load-bearing:
+
+- **`SessionChannel.OnAgentData` must never block.** It runs on the client's frame loop, and blocking there for ssh window credit would stop the same loop that drains the remoting output — an immediate deadlock. A dedicated sender thread owns all window waiting.
+- **Credit is returned to the agent in 1 MiB batches** (`GRANT_THRESHOLD`). Granting per SSH packet produced ~256 tiny `WINDOW` frames for an 8 MiB download, all travelling upstream — the slow direction — and cost ~25% of throughput.
 
 ## Running and testing
 
@@ -71,6 +98,8 @@ Each of these cost a debugging cycle and none are obvious from the docs.
 - **`FileSystemAccessRule`'s 5-argument overload takes the access type LAST.** Passing `'Allow'` third silently binds it to `InheritanceFlags` and throws.
 - Windows PowerShell needs `System.Numerics` and `System.Core` named explicitly for `BigInteger` and `Aes`; PowerShell 7 resolves them from its default set. `Import-PwsshEngine` branches on `$PSVersionTable.PSEdition`.
 - **PowerShell variables are case-insensitive**, so `$k` and `$K` are the same variable — an inner loop counter silently destroyed an outer bound.
+- **Compiling the C# costs ~1.1–1.7 s on every connection**, so `Import-PwsshFiles` caches the result as a DLL under `%LOCALAPPDATA%\pwssh\cache`, keyed on the sources' size and mtime: ~200 ms to load instead. `Add-Type -OutputAssembly` does work on PowerShell 7 despite having been unsupported in earlier PS Core versions. The build goes to a private temp name and is moved into place, so concurrent connections cannot load a half-written assembly.
+- **`powershell.exe` writes a CLIXML progress record to stderr** ("Preparing modules for first use"), which is faithfully relayed as `CHANNEL_EXTENDED_DATA` and will be interleaved with anything the far side writes there deliberately. `New-FarSideCommand` in the tests sets `$ProgressPreference = 'SilentlyContinue'` for this reason. Worth remembering when interpreting stderr from any remote command.
 
 ## Goal
 
@@ -270,6 +299,8 @@ This only affects interactive `shell` responsiveness — bulk transfer already p
   
   The most likely remaining cause is **channel-window stalls**: `ExecChannel.SendData` blocks when the client's window is exhausted, and every `SSH_MSG_CHANNEL_WINDOW_ADJUST` costs a full ~600–900 ms WinRM turnaround. That would be invisible on loopback (where the same code reaches ~1 MiB/s) and dominant over WinRM, which fits the evidence. Instrumenting adjust arrivals against send stalls is the next step. Note the loopback number is itself unexplained and includes `powershell.exe` start-up on the far side, so it is not a clean ceiling.
 - **Upstream remains ~10× slower than downstream** as a property of the transport, so uploads will be slow whatever we do here.
+- **Throughput still has roughly 5× of headroom, unexplained.** Over WinRM the suite reports 1.13 MiB/s on a compressible 8 MiB payload, while the raw channel reached 6.3–11.3 MiB/s on comparable data. The same engine over the in-process loopback agent does 6.0–8.2 MiB/s, so the engine itself is not the constraint — the loss is somewhere in the frame shuttle, the per-item overhead, or the client's PowerShell loop. Two contributors were found and fixed (per-packet credit grants, ~25%; the 200 ms idle poll, ~39% in the previous architecture); the rest is not yet isolated. Instrumenting frame counts and timings against wall clock is the next step.
+- **Encrypting before WinRM costs ~29× of throughput.** WinRM compression is enabled by default, and an SSH-encrypted payload is incompressible, so that compression is wasted. Measured downstream over 8 MiB, interleaved across 3 rounds: incompressible **0.36–0.39 MiB/s** versus compressible plaintext **6.3–11.3 MiB/s**. (The ratio is the reliable figure; absolute numbers vary between sessions — earlier runs on smaller payloads reached 3.5–4 MiB/s incompressible.) This is the strongest argument for terminating SSH in the client-side ProxyCommand rather than on the remote: it makes the WinRM payload plaintext, which also removes all crypto from the remote and turns the ~10 SSH handshake round trips into local ones.
 - **Connection setup costs ~8–9 s** for `ssh host "echo x"`, and is dominated by round trips: an SSH handshake plus exec is roughly ten sequential exchanges at ~600–900 ms each, on top of ~2 s to establish the PSSession. Variance is large (7.7–21 s observed). Reducing the exchange count is the only lever that would matter, and most of the sequence is fixed by the protocol.
 
 ## Prior art
