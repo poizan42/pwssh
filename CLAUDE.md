@@ -299,7 +299,24 @@ This only affects interactive `shell` responsiveness — bulk transfer already p
   
   The most likely remaining cause is **channel-window stalls**: `ExecChannel.SendData` blocks when the client's window is exhausted, and every `SSH_MSG_CHANNEL_WINDOW_ADJUST` costs a full ~600–900 ms WinRM turnaround. That would be invisible on loopback (where the same code reaches ~1 MiB/s) and dominant over WinRM, which fits the evidence. Instrumenting adjust arrivals against send stalls is the next step. Note the loopback number is itself unexplained and includes `powershell.exe` start-up on the far side, so it is not a clean ceiling.
 - **Upstream remains ~10× slower than downstream** as a property of the transport, so uploads will be slow whatever we do here.
-- **Throughput still has roughly 5× of headroom, unexplained.** Over WinRM the suite reports 1.13 MiB/s on a compressible 8 MiB payload, while the raw channel reached 6.3–11.3 MiB/s on comparable data. The same engine over the in-process loopback agent does 6.0–8.2 MiB/s, so the engine itself is not the constraint — the loss is somewhere in the frame shuttle, the per-item overhead, or the client's PowerShell loop. Two contributors were found and fixed (per-packet credit grants, ~25%; the 200 ms idle poll, ~39% in the previous architecture); the rest is not yet isolated. Instrumenting frame counts and timings against wall clock is the next step.
+- **Throughput: profiled, and the remaining cost is mostly not ours.** Two things were confounding the earlier numbers:
+
+  1. **The 8 MiB test is dominated by connection setup.** The same transfer at 48 MiB runs at **2.70 MiB/s** versus 1.13 MiB/s at 8 MiB — roughly 3–4 s of fixed cost (PSSession, agent compile, HELLO) being amortised. Quote steady-state figures from a large transfer; the 8 MiB number is a connect-plus-transfer measurement.
+  2. **The client is CPU-bound, not waiting.** During an 8 MiB transfer the ProxyCommand `pwsh` used 4.39 s of CPU against 6.31 s wall (70% of one core); `ssh.exe` used 0.27 s.
+
+  A `dotnet-trace` CPU profile of the proxy (48 MiB transfer, 12 s sample) attributes managed CPU as:
+
+  | | managed CPU | share |
+  |---|---|---|
+  | `WSManClientSessionTransportManager.StartReceivingData` | 4,580 ms | **35.3%** |
+  | `GC.AllocateUninitializedArray` + `PollGC` | 2,220 ms | **17.1%** |
+  | crypto (AES-CTR + HMAC) | 1,849 ms | 14.3% |
+  | Roslyn compile (one-off at startup) | 696 ms | 5.4% |
+  | **all `Pwssh.*` code** | **34 ms** | **0.3%** |
+
+  So the WSMan receive path is the floor and is not ours to optimise. The actionable item is the **17% in allocation/GC**, which is self-inflicted: a payload byte is currently copied roughly eight times between the agent's read and ssh's stdout (`Frame.Make`, `Frame.Payload`, the `SendData` slice, `SshWriter` buffer plus `ToArray`, the packet assembly, `ByteChannel.Write`'s defensive copy, and `TakeAll`'s concatenation). Passing offsets instead of copying, and pooling buffers, is the next optimisation worth doing.
+
+  **Tooling note:** `dotnet-trace` from NuGet is 9.0 and produces an empty trace against pwsh 7.6, which runs on .NET 10 — 0 samples and a "potentially broken trace" warning. Version 10.0.731102 is not on NuGet (broken publish pipeline); get the signed binary from the [dotnet/diagnostics release](https://github.com/dotnet/diagnostics/releases/tag/v10.0.731102). Also make sure the traced process **outlives the trace duration**: if it exits mid-session the rundown never happens and stacks cannot be resolved. The speedscope output is *evented*, and hangs `CPU_TIME`/`UNMANAGED_CODE_TIME` pseudo-leaves under each real frame, so self time must be credited to the nearest real ancestor — and `UNMANAGED_CODE_TIME` is mostly blocked threads, not CPU.
 - **Encrypting before WinRM costs ~29× of throughput.** WinRM compression is enabled by default, and an SSH-encrypted payload is incompressible, so that compression is wasted. Measured downstream over 8 MiB, interleaved across 3 rounds: incompressible **0.36–0.39 MiB/s** versus compressible plaintext **6.3–11.3 MiB/s**. (The ratio is the reliable figure; absolute numbers vary between sessions — earlier runs on smaller payloads reached 3.5–4 MiB/s incompressible.) This is the strongest argument for terminating SSH in the client-side ProxyCommand rather than on the remote: it makes the WinRM payload plaintext, which also removes all crypto from the remote and turns the ~10 SSH handshake round trips into local ones.
 - **Connection setup costs ~8–9 s** for `ssh host "echo x"`, and is dominated by round trips: an SSH handshake plus exec is roughly ten sequential exchanges at ~600–900 ms each, on top of ~2 s to establish the PSSession. Variance is large (7.7–21 s observed). Reducing the exchange count is the only lever that would matter, and most of the sequence is fixed by the protocol.
 
