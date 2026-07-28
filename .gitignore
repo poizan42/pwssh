@@ -4,3 +4,11 @@ tools/.devhostkey
 # Test scratch: generated payloads, per-test known_hosts
 tmp/
 *.log
+
+# Agent build output. Deliberately not committed: a binary nobody can diff has no place in a
+# repo like this one, so the DLL is published with releases and built locally otherwise
+# (tools/Build-Agent.ps1).
+src/agent/bin/
+src/agent/obj/
+PwsshAgent.dll
+PwsshAgent.dll.srchash

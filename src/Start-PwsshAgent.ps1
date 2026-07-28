@@ -1,5 +1,9 @@
-# Runs inside the remote runspace. Sent as script text with the agent source and helper
-# functions as parameters, so nothing is written to the remote's disk.
+# Runs inside the remote runspace. Sent as script text, with the agent assembly as a byte[]
+# parameter, so nothing is written to the remote's disk.
+#
+# The assembly arrives prebuilt and is loaded from memory. That replaces compiling ~156 KB of
+# C# with the remote's CodeDOM on every single connection, which measured ~480 ms against
+# 4-141 ms for the load, and it is ~10 KB less to push in the slow direction.
 #
 # There is no cryptography here and no host key: SSH terminates in the client, so what
 # crosses this link is plaintext frames, which lets WinRM's own compression work.
@@ -17,8 +21,8 @@
 # Failures go to the error stream, which the client reads separately.
 
 param(
-    [string]$CsSource,
-    [string]$CommonSource,
+    # The prebuilt net48 agent assembly. A byte[] crosses PS remoting natively and bit-exact.
+    [byte[]]$AgentDll,
     [bool]$EmitLog = $false,
     # Downstream striping: one named pipe per mule session, which the client starts
     # separately. Zero means everything goes through this session.
@@ -39,12 +43,13 @@ Set-StrictMode -Off
 
 $agent = $null
 try {
-    if ([string]::IsNullOrEmpty($CsSource)) { throw 'pwssh: CsSource parameter is required' }
-    if ([string]::IsNullOrEmpty($CommonSource)) { throw 'pwssh: CommonSource parameter is required' }
+    if ($null -eq $AgentDll -or $AgentDll.Length -eq 0) { throw 'pwssh: AgentDll parameter is required' }
 
-    . ([scriptblock]::Create($CommonSource))
-
-    Import-PwsshSource -CsSource $CsSource
+    # Load(byte[]) keeps the assembly in memory: nothing is written to this machine's disk,
+    # which is the point. The loaded assembly has no Location, which used to be the reason the
+    # agent had to be a single compilation unit -- irrelevant now that nothing on this side
+    # compiles against it.
+    $null = [System.Reflection.Assembly]::Load($AgentDll)
 
     if ($CreditMiB -gt 0) { [Pwssh.PwsshAgentHost]::InitialCredit = [uint32]($CreditMiB * 1MB) }
     [Pwssh.PwsshAgentHost]::DisableConPty = $DisableConPty

@@ -42,12 +42,42 @@ Nothing is written to the remote's disk, no service is reconfigured, no elevatio
 | Path | Role |
 |---|---|
 | `src/PwsshEngine.cs` | The SSH implementation — packet layer, KEX, cipher, MAC, auth, `SessionChannel`, plus `PwsshStdioBridge`. Runs on the **client** only. |
-| `src/PwsshAgent.cs` | Everything the remote needs, plus the plumbing shared with the engine (`ByteChannel`, `FrameQueue`, `PwsshPump`, `Frame`). **Must stay self-contained**: the remote can only compile one source string, because an in-memory `Add-Type` assembly has no `Location` for a second compilation to reference. The client compiles it *together with* the engine via `Add-Type -Path`. |
-| `src/PwsshCommon.ps1` | Shared helpers: compilation (with an on-disk assembly cache), host key keystore. Sent to the remote as text. |
-| `src/Start-PwsshAgent.ps1` | Runs on the remote: compiles the agent and shuttles frames. No crypto, no host key. Must stay a *simple* script — see the parameter-binding trap below. |
+| `src/agent/*.cs` | Everything the remote needs, plus the plumbing shared with the engine (`ByteChannel`, `FrameQueue`, `PwsshPump`, `Frame`). Eleven files: `Frames`, `ByteStream`, `Contracts`, `AgentProxy`, `AgentHost`, `ConPty`, `ProcessChannel`, `TcpChannel`, `Sftp`, `Listener`, `Loopback`. |
+| `src/agent/PwsshAgent.csproj` | Builds those into the net48 DLL that gets pushed to the remote. **This is the only compiler that matters for the agent's language level** — see *The agent is a prebuilt assembly*. |
+| `src/PwsshCommon.ps1` | Client-only helpers: compilation with an on-disk cache, the agent-DLL lookup and staleness check, host key keystore. |
+| `src/Start-PwsshAgent.ps1` | Runs on the remote: loads the pushed assembly and shuttles frames. No crypto, no host key, no compiler. Must stay a *simple* script — see the parameter-binding trap below. |
+| `tools/Build-Agent.ps1` | Builds the agent DLL and stamps it with a hash of the sources it came from. |
 | `pwssh-connect.ps1` | Client `ProxyCommand` entry point; runs the SSH engine. |
 | `tools/Start-PwsshTcpHost.ps1`, `tools/PwsshTcpHost.cs` | Dev-only loopback host, using an in-process agent wired through the real frame protocol. |
 | `tests/Invoke-PwsshTests.ps1` | End-to-end tests through the real `ssh` client, against either transport. |
+
+### The agent is a prebuilt assembly
+
+`src/agent/PwsshAgent.csproj` builds the agent to a **.NET Framework 4.8 DLL**, which the client pushes as a `byte[]` parameter and the remote loads with `[Reflection.Assembly]::Load`. It replaced sending ~156 KB of C# for the remote's CodeDOM to compile on every single connection.
+
+Measured before committing to it:
+
+| | source, compiled remotely | prebuilt DLL |
+|---|---|---|
+| raw size | 156,088 B | 55,808 B |
+| on the wire (deflated) | 36,721 B | **26,671 B** |
+| cost on the remote | **~480 ms** (453–726 across runs) | **4–141 ms** |
+| connection setup, `ssh host "echo x"` | 3,875 ms median | **3,412 ms median** |
+
+Two things about that are worth keeping straight. The DLL is *smaller on the wire despite compressing worse* — text deflates ~4.3× against a DLL's ~2.2×, but it starts three times the size, and upstream is the scarce direction. And connect is now faster than it was **before** SFTP existed (3,663 ms), even though the agent grew 54%.
+
+**`Assembly.Load(byte[])` keeps the no-remote-footprint rule intact**: verified on the real remote, the assembly reports no `Location`, so nothing is written to the remote's disk. It also removes the reason the agent used to be one giant file — that constraint existed because an in-memory assembly has no `Location` for a *second* compilation to reference, and nothing on the remote compiles against it any more.
+
+Consequences, all of them good, and all of them things the old design forbade:
+
+- **The agent is C# 7.3, not C# 5.** `LangVersion` is pinned in the csproj. 7.3 is the ceiling that needs nothing from the runtime beyond net48; C# 8+ wants runtime support or polyfills for its headline features. `src/PwsshEngine.cs` is still compiled by `Add-Type` on the client, so it can go further, but there is no reason for the two to drift.
+- **It is eleven files instead of one 3,627-line one.**
+- **Warnings are errors**, and Roslyn's are much better than CodeDOM's.
+- The remote no longer receives `PwsshCommon.ps1` at all, since it no longer compiles anything.
+
+The costs, stated plainly. There is now a **build step** where there was none: `tools/Build-Agent.ps1`, needing the .NET SDK and the 4.8 targeting pack. The DLL is **not committed** — a binary nobody can diff has no place in a repo like this — so it is published with releases (`.github/workflows/release.yml`) and built locally otherwise. And a prebuilt artifact can go **stale**: the build stamps `PwsshAgent.dll.srchash` with a content hash of the sources, `Get-PwsshAgentDllState` compares it, and the client refuses to run a mismatch rather than silently executing old code on the remote. A DLL with no stamp is accepted, because that is what a release looks like and there is nothing to compare it against.
+
+The hash is content-based and line-ending-normalised on purpose: a fresh clone changes every mtime and possibly every line ending without changing the code, and that must not invalidate a released DLL.
 
 ### Client ↔ agent frames
 
@@ -172,7 +202,7 @@ All bit-exact, including 0, 1, and ±1 around every chunk boundary. Same compres
 
 Upload measured **0.35 MiB/s**, which is the transport's upstream ceiling — uploads are already optimal and no design change would help them.
 
-**The remote recompiles the agent on every connection**, so putting SFTP there is paid for by `ssh host whoami` as well: `Import-PwsshSource` has no cache (only the client caches to a DLL). Measured, because this was the strongest argument against the agent-side design: the agent grew 54% (2,356 → 3,627 lines) and connection setup went from a **3,663 ms** median to **3,875 ms** — about 210 ms, ~6%. Worth knowing the exchange rate before adding another 1,200 lines there, but not a reason to have avoided this one.
+**Putting SFTP in the agent used to be paid for by `ssh host whoami` as well**, because the remote recompiled the agent source on every connection with no cache. Measured at the time, since it was the strongest argument against the agent-side design: the agent grew 54% (2,356 → 3,627 lines) and connection setup went from a **3,663 ms** median to **3,875 ms**, about 210 ms. That whole objection is now gone — the agent is a prebuilt assembly and the remote compiles nothing, which took connect to **3,412 ms**, i.e. faster than before SFTP was written. Kept here because it is the measurement that motivated the build step.
 
 Downloads are **round-trip-bound, not bandwidth-bound**, and the evidence is unambiguous: compressible and incompressible 8 MiB downloads measured 0.49 and 0.43 MiB/s, a 1.14× ratio where `exec` shows 4.5×; and 32 MiB costs only 2.7 s more than 2 MiB, i.e. 16× the data for a quarter more time. The cause is the client's request ramp — **`num_requests` starts at 1 and grows by one per reply**, so moving *C* chunks costs about √(2C) round trips before the window is deep enough to matter, plus a fixed ~4 round trips per file for the client's `LSTAT`, `STAT`, `OPEN` and `CLOSE`. At ~0.85 s per trip that is the ~11 s of fixed cost the table shows.
 
@@ -194,6 +224,15 @@ A mule lives in a different `wsmprovhost` process from the agent that owns the c
 Frame compression and striping relieve the *same* bottleneck. Once compression has done so, three extra sessions are just ~2 s of setup on an 8 s transfer. Use `-Streams 4` for bulk incompressible traffic (already-compressed archives, media, encrypted blobs); leave it at 1 for ordinary command output.
 
 ## Running and testing
+
+**Build the agent first, and rebuild it after touching `src/agent/`** — the client refuses a stale DLL rather than pushing old code:
+
+```powershell
+pwsh -NoProfile -File .\tools\Build-Agent.ps1
+pwsh -NoProfile -File .\tools\Build-Agent.ps1 -CheckOnly   # is the built DLL current?
+```
+
+The dev host is unaffected: it runs the agent in-process from the sources, so it needs no DLL. Only the WinRM path pushes one.
 
 Dev host (loopback only, fast iteration — no WinRM in the loop):
 
@@ -261,7 +300,8 @@ Each of these cost a debugging cycle and none are obvious from the docs.
 - **`FileSystemAccessRule`'s 5-argument overload takes the access type LAST.** Passing `'Allow'` third silently binds it to `InheritanceFlags` and throws.
 - Windows PowerShell needs `System.Numerics` and `System.Core` named explicitly for `BigInteger` and `Aes`; PowerShell 7 resolves them from its default set. `Import-PwsshEngine` branches on `$PSVersionTable.PSEdition`.
 - **PowerShell variables are case-insensitive**, so `$k` and `$K` are the same variable — an inner loop counter silently destroyed an outer bound.
-- **Compiling the C# costs ~1.1–1.7 s on every connection**, so `Import-PwsshFiles` caches the result as a DLL under `%LOCALAPPDATA%\pwssh\cache`, keyed on the sources' size and mtime: ~200 ms to load instead. `Add-Type -OutputAssembly` does work on PowerShell 7 despite having been unsupported in earlier PS Core versions. The build goes to a private temp name and is moved into place, so concurrent connections cannot load a half-written assembly.
+- **Compiling the C# costs ~1.1–1.7 s on every connection**, so `Import-PwsshFiles` caches the result as a DLL under `%LOCALAPPDATA%\pwssh\cache`, keyed on the sources' size and mtime: ~200 ms to load instead. `Add-Type -OutputAssembly` does work on PowerShell 7 despite having been unsupported in earlier PS Core versions. The build goes to a private temp name and is moved into place, so concurrent connections cannot load a half-written assembly. This is the *client's* copy; the remote's is a separate prebuilt DLL, and the two caches are unrelated.
+- **Two compilers, one set of agent sources.** `src/agent/*.cs` is compiled by the csproj for the remote and by `Add-Type -Path` for the client, so a change has to satisfy both. In practice that means net48-compatible APIs and `LangVersion` 7.3 or lower — the client's Roslyn is newer and more permissive, so it is the csproj that will catch you.
 - **`powershell.exe` writes a CLIXML progress record to stderr** ("Preparing modules for first use"), which is faithfully relayed as `CHANNEL_EXTENDED_DATA` and will be interleaved with anything the far side writes there deliberately. `New-FarSideCommand` in the tests sets `$ProgressPreference = 'SilentlyContinue'` for this reason. Worth remembering when interpreting stderr from any remote command.
 
 ## Goal
@@ -305,7 +345,7 @@ These come from the project owner and should not be revisited without asking.
 - **Modern algorithms only.** No legacy ciphers, no CBC, no SHA-1-based MACs.
 - **The host key must be stable across connections.** See *Host key identity* below.
 - **Scope for v1: `session` channels with `exec` and `shell`.** Port forwarding (`direct-tcpip`) and the SFTP subsystem are explicitly deferred to later work.
-- **Assume an old PowerShell on the remote.** Newer, well-maintained environments generally already have an SSH server, so they are not the target. Design for Windows PowerShell 5.1 / .NET Framework 4.x. This rules out `System.Security.Cryptography.AesGcm`, `ChaCha20Poly1305`, and `Span<byte>` (all .NET Core 3.0+), and means any embedded C# must stay 4.x-compatible.
+- **Assume an old PowerShell on the remote.** Newer, well-maintained environments generally already have an SSH server, so they are not the target. Design for Windows PowerShell 5.1 / .NET Framework 4.x. This rules out `System.Security.Cryptography.AesGcm`, `ChaCha20Poly1305`, and `Span<byte>` (all .NET Core 3.0+), and means the agent must stay runnable on 4.x — its csproj targets `net48` for exactly this reason. Note this constrains the *runtime*, not the *language*: since the agent is compiled by Roslyn rather than by the remote's CodeDOM, C# 7.3 is available (see *The agent is a prebuilt assembly*). It was C# 5 until the build step existed.
 
 ## Host key identity
 

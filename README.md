@@ -84,7 +84,23 @@ the tool for that — use a real SSH server.
 ## Setup
 
 Requires PowerShell 7 on the client (the engine compiles C# at startup and caches it) and an
-OpenSSH client. Add a `Host` block:
+OpenSSH client.
+
+**You also need the agent assembly**, which is what runs on the remote. It is not committed —
+a binary nobody can diff does not belong in a repo whose job is touching other people's
+machines — so either take `PwsshAgent.dll` from a
+[release](https://github.com/poizan42/pwssh/releases) and drop it beside `pwssh-connect.ps1`,
+or build it once:
+
+```bash
+pwsh -File ./tools/Build-Agent.ps1
+```
+
+Building needs the .NET SDK and the .NET Framework 4.8 targeting pack; running pwssh does not.
+The client checks the DLL against the sources on disk and refuses to run a stale one, so
+editing the agent and forgetting to rebuild is an error rather than a mystery.
+
+Then add a `Host` block:
 
 ```
 Host myremote
@@ -105,6 +121,7 @@ Useful options on `pwssh-connect.ps1`:
 | | |
 |---|---|
 | `-Authentication` | WinRM auth mode, default `Negotiate` |
+| `-AgentDllPath` | where to find `PwsshAgent.dll`. Defaults to the build output, then to a copy beside the script |
 | `-CreditMiB` | bulk transfer window, default 32. Larger means fewer round trips on big transfers, at the cost of how much the agent may buffer client-side |
 | `-Streams N` | extra receive sessions for bulk **incompressible** transfers (see below), default 1 |
 | `-GatewayPorts` | let `ssh -R` bind a non-loopback address on the remote. Off by default, matching OpenSSH's `GatewayPorts no`; a request for a wider address is refused rather than quietly narrowed |

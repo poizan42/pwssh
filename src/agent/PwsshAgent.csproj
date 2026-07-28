@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The agent, built as a .NET Framework 4.8 library and pushed to the remote as bytes.
+
+    net48 because that is the floor the project designs for: newer, well-maintained Windows
+    boxes generally already have an SSH server and are not the target. The assembly is loaded
+    on the remote with Assembly.Load(byte[]), so it never touches the remote's disk, and the
+    no-remote-footprint rule is intact.
+
+    Building it, rather than pushing source for the remote's CodeDOM to compile, is worth
+    about 480 ms of every connection and ~10 KB of upstream (see CLAUDE.md). The bigger gain
+    is that this compiler is Roslyn, so the agent is no longer stuck on C# 5 and no longer
+    has to live in a single file.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <AssemblyName>PwsshAgent</AssemblyName>
+    <RootNamespace>Pwssh</RootNamespace>
+    <!--
+      7.3 is the highest version needing nothing from the runtime beyond net48: it brings
+      out-var, tuples, pattern matching, string interpolation, null-conditional access and
+      expression-bodied members. C# 8 and later want runtime support or polyfills for their
+      headline features, which is not a trade worth making here.
+    -->
+    <LangVersion>7.3</LangVersion>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <AssemblyTitle>pwssh remote agent</AssemblyTitle>
+    <!-- Byte-identical output for the same input, so a released DLL can be reproduced. -->
+    <Deterministic>true</Deterministic>
+    <!-- No satellite files, no ref assembly, no pdb: exactly one DLL gets pushed. -->
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+    <DebugType>none</DebugType>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Not in the SDK's implicit set for net48. -->
+    <Reference Include="System.IO.Compression" />
+    <Reference Include="System.Numerics" />
+  </ItemGroup>
+
+</Project>

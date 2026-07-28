@@ -1,0 +1,66 @@
+# Builds the remote agent and attaches it to a release.
+#
+# The DLL is deliberately not committed: a binary nobody can diff does not belong in a repo
+# whose whole job is touching other people's machines. So it is published here instead, built
+# from the tagged sources by a run anyone can inspect.
+#
+# windows-latest because the agent targets .NET Framework 4.8, which needs the Windows
+# targeting pack.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  # Handy for checking the build without cutting a tag.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  agent:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build the agent
+        shell: pwsh
+        run: pwsh -NoProfile -File ./tools/Build-Agent.ps1
+
+      - name: Show what was built
+        shell: pwsh
+        run: |
+          $dll = 'src/agent/bin/Release/net48/PwsshAgent.dll'
+          $hash = (Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "PwsshAgent.dll  $((Get-Item $dll).Length) bytes"
+          Write-Host "sha256          $hash"
+          # Recorded in the job log so a downloaded DLL can be checked against a build anyone
+          # can re-run from the same tag; the csproj is deterministic.
+          "PwsshAgent.dll sha256: $hash" | Out-File -FilePath dll-sha256.txt -Encoding ascii
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PwsshAgent-net48
+          path: |
+            src/agent/bin/Release/net48/PwsshAgent.dll
+            dll-sha256.txt
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            src/agent/bin/Release/net48/PwsshAgent.dll
+            dll-sha256.txt
+          body: |
+            Drop `PwsshAgent.dll` beside `pwssh-connect.ps1`, or point `-AgentDllPath` at it.
+
+            It is the remote agent, built from this tag's sources for .NET Framework 4.8. The
+            client pushes it to the remote and loads it there from memory; nothing is written
+            to the remote's disk. Building it yourself instead is one command:
+            `pwsh -File ./tools/Build-Agent.ps1`.

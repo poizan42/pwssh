@@ -23,14 +23,14 @@ $repo = Split-Path -Parent $PSScriptRoot
 
 if (-not $HostKeyPath) { $HostKeyPath = Join-Path $PSScriptRoot '.devhostkey' }
 
-# All three sources compile together: the dev host references engine types, the engine
-# references plumbing in PwsshAgent.cs, and an in-memory Add-Type assembly has no Location
-# for a second compilation to reference.
-Import-PwsshFiles -Path @(
-    "$repo\src\PwsshAgent.cs",
+# Everything compiles together: the dev host references engine types and the engine references
+# plumbing in the agent, and an in-memory Add-Type assembly has no Location for a second
+# compilation to reference. The dev host runs the agent in-process, so it uses the sources
+# rather than the prebuilt net48 DLL the real path pushes to the remote.
+Import-PwsshFiles -Path (@(Get-PwsshAgentFiles -Repo $repo) + @(
     "$repo\src\PwsshEngine.cs",
     "$PSScriptRoot\PwsshTcpHost.cs"
-) -ProbeType 'Pwssh.Dev.TcpHost'
+)) -ProbeType 'Pwssh.Dev.TcpHost'
 
 $key = Get-PwsshHostKey -Path $HostKeyPath
 

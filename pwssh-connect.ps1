@@ -32,6 +32,9 @@ param(
     [switch]$UseSSL,
     [string]$ConfigurationName,
     [string]$HostKeyDirectory,
+    # The prebuilt net48 agent assembly to push. Defaults to the build output, then to a
+    # PwsshAgent.dll dropped beside this script, which is where a release is meant to land.
+    [string]$AgentDllPath,
     # Extra PSSessions used only to carry downstream frames. Each session gets its own WSMan
     # receive thread on this side, and that thread is the throughput ceiling; measured
     # downstream on incompressible data, 2 sessions ~2.7x and 4 sessions ~3.3x. Costs one
@@ -94,8 +97,27 @@ $mules = @()
 try {
     . "$PSScriptRoot\src\PwsshCommon.ps1"
 
-    # PwsshEngine.cs depends on plumbing that lives in PwsshAgent.cs, so both compile together.
-    Import-PwsshFiles -Path @("$PSScriptRoot\src\PwsshAgent.cs", "$PSScriptRoot\src\PwsshEngine.cs")
+    # The prebuilt agent assembly is located before anything else, because a missing or stale
+    # one is a setup problem the user has to fix and there is no point starting a handshake
+    # first. The remote gets this DLL; this process compiles the same sources itself below.
+    $agentDllState = Get-PwsshAgentDllState -Repo $PSScriptRoot -DllPath $AgentDllPath
+    switch ($agentDllState.State) {
+        'missing' {
+            throw ("pwssh: the agent assembly is missing. Build it once with " +
+                   "'pwsh -File $PSScriptRoot\tools\Build-Agent.ps1', or take PwsshAgent.dll " +
+                   "from a release and put it at $($agentDllState.Path).")
+        }
+        'stale' {
+            throw ("pwssh: $($agentDllState.Path) was built from different sources " +
+                   "($($agentDllState.Detail)). Rebuild with " +
+                   "'pwsh -File $PSScriptRoot\tools\Build-Agent.ps1'.")
+        }
+    }
+    $agentDll = [System.IO.File]::ReadAllBytes($agentDllState.Path)
+
+    # The engine depends on plumbing that lives in the agent sources, so they compile together
+    # here. This side is PowerShell 7, i.e. Roslyn, and the result is cached as a DLL.
+    Import-PwsshFiles -Path (@(Get-PwsshAgentFiles -Repo $PSScriptRoot) + "$PSScriptRoot\src\PwsshEngine.cs")
 
     if (-not $HostKeyDirectory) { $HostKeyDirectory = Join-Path $HOME '.pwssh\hostkeys' }
     $safeName = ($ComputerName.ToLowerInvariant() -replace '[^a-z0-9._-]', '_')
@@ -140,8 +162,8 @@ try {
     Write-Diag ("session established in {0:N0} ms" -f $sw.Elapsed.TotalMilliseconds)
 
     # --- start the remote agent ----------------------------------------------
-    $commonSource = [System.IO.File]::ReadAllText("$PSScriptRoot\src\PwsshCommon.ps1")
-    $agentSource = [System.IO.File]::ReadAllText("$PSScriptRoot\src\PwsshAgent.cs")
+    # Only the launcher script and the assembly go over: the remote no longer needs
+    # PwsshCommon.ps1, because it no longer compiles anything.
     $agentScript = [System.IO.File]::ReadAllText("$PSScriptRoot\src\Start-PwsshAgent.ps1")
 
     $stripes = [Math]::Max(0, $Streams - 1)
@@ -150,8 +172,7 @@ try {
     $ps = [PowerShell]::Create()
     $ps.Runspace = $session.Runspace
     $null = $ps.AddScript($agentScript)
-    $null = $ps.AddParameter('CsSource', $agentSource)
-    $null = $ps.AddParameter('CommonSource', $commonSource)
+    $null = $ps.AddParameter('AgentDll', $agentDll)
     if ($EmitRemoteLog) { $null = $ps.AddParameter('EmitLog', $true) }
     $null = $ps.AddParameter('CreditMiB', $CreditMiB)
     $null = $ps.AddParameter('DisableConPty', [bool]$DisableConPty)

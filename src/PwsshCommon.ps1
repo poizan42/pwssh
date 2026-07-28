@@ -1,5 +1,6 @@
-# Shared helpers. Also sent to the remote as script text, so nothing here may depend on
-# anything existing on the remote's disk.
+# Shared helpers, used on the client only. This used to be pushed to the remote so it could
+# compile the agent from source; the remote now loads a prebuilt assembly instead and needs
+# nothing from here.
 
 function Write-PwsshDiag([string]$Message) {
     # Never Write-Warning/Write-Output here. Under `pwsh -File` the warning stream is written
@@ -8,35 +9,95 @@ function Write-PwsshDiag([string]$Message) {
     try { [Console]::Error.WriteLine("[pwssh] $Message") } catch { }
 }
 
-function Import-PwsshSource {
+function Get-PwsshAgentFiles {
     <#
-      Compiles one C# source string. Used by the remote, which can only ever compile a single
-      string: an in-memory Add-Type assembly has no Location for a second compilation to
-      reference. Windows PowerShell needs System.Numerics/System.Core named explicitly;
-      PowerShell 7 resolves them from its default set, and passing -ReferencedAssemblies there
-      would *replace* that set rather than extend it.
+      The agent's C# sources, in a stable order so the hash below is reproducible. The client
+      compiles these together with the engine; the csproj compiles the same set for the remote.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Repo)
+    return Get-ChildItem -LiteralPath (Join-Path $Repo 'src\agent') -Filter '*.cs' -File |
+        Sort-Object Name | ForEach-Object { $_.FullName }
+}
+
+function Get-PwsshAgentSourceHash {
+    <#
+      Identifies the agent sources so a built DLL can be checked against them. Content-based
+      rather than mtime-based on purpose: a fresh clone or checkout changes every timestamp
+      but not the code, and that must not invalidate a released DLL.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Repo)
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $ms = New-Object System.IO.MemoryStream
+    foreach ($f in (Get-PwsshAgentFiles -Repo $Repo)) {
+        # The name is included so that moving code between files is a change, not a no-op.
+        $nameBytes = [System.Text.Encoding]::UTF8.GetBytes((Split-Path -Leaf $f) + "`0")
+        $ms.Write($nameBytes, 0, $nameBytes.Length)
+        # Line endings are normalised: git checkout settings must not change the hash.
+        $text = ([System.IO.File]::ReadAllText($f)) -replace "`r`n", "`n"
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
+        $ms.Write($bytes, 0, $bytes.Length)
+    }
+    $ms.Position = 0
+    # BitConverter rather than Convert::ToHexString, which is .NET 5+: this file is also
+    # dot-sourced on the remote under Windows PowerShell 5.1.
+    return [BitConverter]::ToString($sha.ComputeHash($ms)).Replace('-', '').ToLowerInvariant()
+}
+
+function Get-PwsshAgentDllState {
+    <#
+      Locates the prebuilt agent DLL and reports whether it can be trusted. Returns an object
+      with Path, State ('current' | 'missing' | 'stale' | 'unstamped') and Detail.
+
+      'stale' is the case worth having: editing a .cs file and forgetting to rebuild would
+      otherwise silently run old code on the remote. 'unstamped' is a DLL with no recorded
+      hash -- taken from a release rather than built here -- which is accepted, because there
+      is nothing to compare it against and the release is the authority.
     #>
     param(
-        [Parameter(Mandatory = $true)][string]$CsSource,
-        [string]$ProbeType = 'Pwssh.PwsshAgentHost'
+        [Parameter(Mandatory = $true)][string]$Repo,
+        [string]$DllPath
     )
 
-    if ($ProbeType -as [type]) { return }
+    if (-not $DllPath) {
+        # Where Build-Agent.ps1 leaves it, and where a release is meant to be unpacked.
+        $candidates = @(
+            (Join-Path $Repo 'src\agent\bin\Release\net48\PwsshAgent.dll'),
+            (Join-Path $Repo 'src\agent\bin\Debug\net48\PwsshAgent.dll'),
+            (Join-Path $Repo 'PwsshAgent.dll')
+        )
+        $DllPath = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+        if (-not $DllPath) {
+            return [pscustomobject]@{ Path = $candidates[0]; State = 'missing'; Detail = '' }
+        }
+    }
+    elseif (-not (Test-Path -LiteralPath $DllPath)) {
+        return [pscustomobject]@{ Path = $DllPath; State = 'missing'; Detail = '' }
+    }
 
-    $isDesktop = ($PSVersionTable.PSEdition -eq 'Desktop') -or (-not $PSVersionTable.PSEdition)
-    if ($isDesktop) {
-        Add-Type -TypeDefinition $CsSource -ReferencedAssemblies 'System.Numerics', 'System.Core', 'System', 'System.IO.Compression' -ErrorAction Stop
+    $stampPath = "$DllPath.srchash"
+    if (-not (Test-Path -LiteralPath $stampPath)) {
+        return [pscustomobject]@{ Path = $DllPath; State = 'unstamped'; Detail = 'no .srchash beside the DLL' }
     }
-    else {
-        Add-Type -TypeDefinition $CsSource -ErrorAction Stop
+    $stamped = ([System.IO.File]::ReadAllText($stampPath)).Trim()
+    $actual = Get-PwsshAgentSourceHash -Repo $Repo
+    if ($stamped -ne $actual) {
+        return [pscustomobject]@{
+            Path = $DllPath; State = 'stale'
+            Detail = "built from $($stamped.Substring(0, 12))..., sources are now $($actual.Substring(0, 12))..."
+        }
     }
+    return [pscustomobject]@{ Path = $DllPath; State = 'current'; Detail = '' }
 }
 
 function Import-PwsshFiles {
     <#
-      Compiles several C# files together. Only usable where the files exist on disk, i.e. the
-      client. PwsshEngine.cs depends on plumbing that lives in PwsshAgent.cs, so both must be
-      in one compilation.
+      Compiles several C# files together for use in THIS process. PwsshEngine.cs depends on
+      plumbing that lives in the agent sources, so they must be in one compilation.
+
+      Note this is the client's own copy, compiled by PowerShell 7's Roslyn. It is unrelated to
+      the net48 DLL pushed to the remote, which src/agent/PwsshAgent.csproj builds from the same
+      sources -- two compilers, one set of sources.
 
       The result is cached as a DLL keyed on the sources' size and mtime: compiling costs
       ~1.1 s and is otherwise paid on every single connection, against ~0.3 s to load the
