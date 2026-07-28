@@ -130,3 +130,7 @@ It binds `127.0.0.1` only and is not part of the `ProxyCommand` path.
 
 `CLAUDE.md` carries the design rationale, the measurements behind each decision, and the
 PowerShell and WinRM traps found the hard way — worth reading before changing anything.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
