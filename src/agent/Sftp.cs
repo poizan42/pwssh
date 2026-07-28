@@ -23,8 +23,17 @@ namespace Pwssh
     // ------------------------------------------------------------------------ SFTP
     //
     // An SFTP version 3 server. It runs here rather than in the client engine because the
-    // files are here: the engine just carries channel bytes, exactly as it does for a child
-    // process's stdio, and this speaks the protocol at the end of that pipe.
+    // files are here, and this speaks the protocol at the end of the pipe the engine carries.
+    //
+    // The engine is no longer a pure conduit for those bytes, though, and a reader who assumes it
+    // is will be surprised: src/PwsshSftpReadAhead.cs parses this conversation as it passes and
+    // answers the client's READs from a buffer it fills over a SECOND, private sftp channel. That
+    // is invisible from here by design -- the read-ahead's channel is an ordinary channel running
+    // an ordinary AgentSftpChannel, and nothing in this file distinguishes it from the client's
+    // own. Two consequences worth knowing while editing here: a session may have two of these
+    // running against the same file, so nothing may assume one handle per path; and the paths
+    // arriving on the private channel are the client's own strings, copied through byte for byte,
+    // so path handling must stay identical on both.
     //
     // Version 3 is what OpenSSH's client speaks and what Windows' own sftp-server answers
     // with, so it is the only version worth implementing.

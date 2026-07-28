@@ -43,6 +43,11 @@ param(
     # Bulk-transfer window in MiB. Larger means fewer credit round trips on big transfers,
     # at the cost of how much the agent may buffer in this process before it has to wait.
     [int]$CreditMiB = 32,
+    # How far ahead an SFTP download is fetched, in 255 KiB chunks; 0 turns read-ahead off.
+    # A knob mainly so the effect can be settled by interleaved A/B rather than argued about.
+    # 64 by measurement: 1.42x on 32 MiB, where 16 gave nothing at all and 128 gave less than
+    # 64 because it asks for more than -CreditMiB allows to be in flight. Clamped to 128.
+    [int]$SftpReadAheadChunks = 64,
     # Testing hook: force the no-ConPTY path, so pty-req is refused and the shell falls
     # back to pipes even on a remote that supports ConPTY.
     [switch]$DisableConPty,
@@ -130,6 +135,7 @@ try {
     $cfg.HostKey = $hostKey
     $cfg.Agent = $proxy          # ExpectedUser is left unset: resolved from the agent's HELLO
     $cfg.AllowGatewayPorts = [bool]$GatewayPorts
+    $cfg.SftpReadAheadChunks = $SftpReadAheadChunks
 
     $engine = New-Object Pwssh.PwsshEngine $cfg
     $engine.Start()

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns the remote's `DOMAIN\user`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite runs 51 cases against each transport: **WinRM is 51/51**, loopback **50/51** with one environmental exception — the pty case that this client machine's ConPTY breaks (see *Running and testing*). The two runs differ in composition rather than count — WinRM has the graceful-degradation and IPv6 cases plus the gateway-ports check; loopback has the wrong-username check that the WinRM alias takes from `ssh_config`, along with the reverse-forward release and bind-failure cases that need the far side to be this machine.
+**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns the remote's `DOMAIN\user`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite runs 51–56 cases per transport: **WinRM is 56/56**, loopback **50/51** with one environmental exception — the pty case that this client machine's ConPTY breaks (see *Running and testing*). The two runs differ in composition rather than count — WinRM has the graceful-degradation and IPv6 cases plus the gateway-ports check; loopback has the wrong-username check that the WinRM alias takes from `ssh_config`, along with the reverse-forward release and bind-failure cases that need the far side to be this machine.
 
 **A run that fails one case with `exit=255` is usually a flake, not a regression.** 255 is ssh's own error code for a connection that never came up, and it turns up after the remote has been hammered with dozens of sessions in a row. Re-run the case before believing it: the final WinRM run here failed "shell exit status propagates" that way and passed 3/3 immediately afterwards.
 
@@ -198,15 +198,51 @@ All bit-exact, including 0, 1, and ±1 around every chunk boundary. Same compres
 | 8 MiB download | | 32 MiB download | |
 |---|---|---|---|
 | `exec` | 1.55 MiB/s | `exec` | 6.76 MiB/s |
-| `sftp` | 0.49 MiB/s | `sftp` | 2.22 MiB/s |
+| `sftp`, no read-ahead | 0.49 MiB/s | `sftp`, no read-ahead | 2.22 MiB/s |
+| `sftp`, default depth 64 | 0.76 MiB/s | `sftp`, default depth 64 | 3.29 MiB/s |
 
 Upload measured **0.35 MiB/s**, which is the transport's upstream ceiling — uploads are already optimal and no design change would help them.
 
 **Putting SFTP in the agent used to be paid for by `ssh host whoami` as well**, because the remote recompiled the agent source on every connection with no cache. Measured at the time, since it was the strongest argument against the agent-side design: the agent grew 54% (2,356 → 3,627 lines) and connection setup went from a **3,663 ms** median to **3,875 ms**, about 210 ms. That whole objection is now gone — the agent is a prebuilt assembly and the remote compiles nothing, which took connect to **3,412 ms**, i.e. faster than before SFTP was written. Kept here because it is the measurement that motivated the build step.
 
-Downloads are **round-trip-bound, not bandwidth-bound**, and the evidence is unambiguous: compressible and incompressible 8 MiB downloads measured 0.49 and 0.43 MiB/s, a 1.14× ratio where `exec` shows 4.5×; and 32 MiB costs only 2.7 s more than 2 MiB, i.e. 16× the data for a quarter more time. The cause is the client's request ramp — **`num_requests` starts at 1 and grows by one per reply**, so moving *C* chunks costs about √(2C) round trips before the window is deep enough to matter, plus a fixed ~4 round trips per file for the client's `LSTAT`, `STAT`, `OPEN` and `CLOSE`. At ~0.85 s per trip that is the ~11 s of fixed cost the table shows.
+Downloads *were* **round-trip-bound, not bandwidth-bound** — this is the diagnosis that motivated the read-ahead below, kept because it is what the numbers in the table above are measuring. The evidence was unambiguous: compressible and incompressible 8 MiB downloads measured 0.49 and 0.43 MiB/s, a 1.14× ratio where `exec` shows 4.5×; and 32 MiB costs only 2.7 s more than 2 MiB, i.e. 16× the data for a quarter more time. The cause is the client's request ramp — **`num_requests` starts at 1 and grows by one per reply**, so moving *C* chunks costs about √(2C) round trips before the window is deep enough to matter, plus a fixed ~4 round trips per file for the client's `LSTAT`, `STAT`, `OPEN` and `CLOSE`. At ~0.85 s per trip that is the ~11 s of fixed cost the table shows.
 
-**None of it can be fixed on the server side** — the pacing is inside the client. The remedy, if it ever matters enough, is the design deliberately not chosen: move `READ`/`READDIR` into the engine, where `OPEN_READ` becomes "stream this file back under the existing credit machinery" — literally the exec path — and the engine answers the client's `READ`s from a local buffer with a fallback to per-request reads when the access pattern stops being sequential. That trades a new RPC surface, per-request timeouts, and two bug classes the loopback host cannot catch (an engine that resolves a remote path against its own drives passes loopback and fails WinRM) for roughly a 3× on medium-file downloads.
+**None of it can be fixed on the *server* side** — the pacing is inside the client. It can be fixed on the client side, and now is: see *SFTP read-ahead* immediately below. The ramp is gone; the four fixed round trips per file remain, deliberately.
+
+#### SFTP read-ahead (`-SftpReadAheadChunks`, default 64)
+
+The engine opens a **second, private SFTP subsystem channel** to the agent and reads ahead on that, answering the client's `READ`s from a local buffer. The client's own channel stays byte-verbatim apart from the reads that are suppressed because they were answered locally.
+
+Why a private channel rather than injecting requests into the client's stream — the design that looks obvious and is wrong. `strings` on the real `sftp.exe` yields **`Unable to resume download of "%s": server reordered requests`**: the client detects an out-of-order server and abandons the transfer. Alongside `Can't find request for ID %u` and `Received more data than asked for`, that makes an injected id space a silent-hang risk rather than a tidy optimisation. A private channel gives a disjoint id space by construction, its own agent worker thread, its own credit pool, and no bytes ever added to the client's stream — which is what makes the safety valve **a flag flip at any instant**: leftover replies land where the client cannot see them. The client→agent stream is also not message-aligned (one `CHANNEL_DATA` is one `DATA` frame, which is why the agent has a reassembler at all), so injected bytes would splice into the middle of a client message.
+
+Measured, interleaved, medians — depth is the whole story and the bandwidth-delay arithmetic that suggested 16 was simply wrong:
+
+| 32 MiB compressible | | |
+|---|---|---|
+| read-ahead off | 2.31 MiB/s | — |
+| depth 16 | 2.32 | 0.97× |
+| depth 32 | 2.89 | 1.20× |
+| **depth 64** | **3.29** | **1.42×** |
+| depth 128 | 3.05 | 1.32× |
+
+**Depth 128 turns back down for a reason worth keeping**: 128 × 261120 is 33.4 MB, just past the agent's 32 MiB credit (`InitialCredit`, `-CreditMiB`), so the far side blocks on window instead of reading. Past the credit there is nothing to buy, which is why `SftpReadAhead.MAX_DEPTH` clamps at 128 — a ceiling on nonsense, not a tuning value. That clamp exists because a **misparsed depth of 326,496 built a single 10.6 MB request frame and WinRM rejected the object outright** (*"deserialized object size … exceeded the allowed maximum"*), killing the pipeline mid-download. Reproducible, and it would have been reachable by anyone typing a large number.
+
+At 8 MiB the same change is only **1.17×** (0.65 → 0.76), and incompressible 8 MiB does not move at all (0.48 → 0.53, with the paired rounds disagreeing in direction — noise, and expected, since that case is already at the downstream ceiling). The reason 8 MiB gains so little is arithmetic: ~3.4 s of connect plus ~3.4 s of the four fixed per-file round trips is ~6.8 s of an ~11 s transfer, and read-ahead cannot touch either. **Quote the 32 MiB figure; the 8 MiB one is mostly fixed cost.**
+
+**Per-file round trips now dominate anything that is not one large file.** 40 files of 900 bytes each — 36 KB in total — take **~150 s** whether read-ahead is on or off (152.7 s at depth 64 against 153.8 s and 148.8 s off, on the 300 ms dev host). That is `LSTAT`/`STAT`/`OPEN`/`CLOSE` per file and nothing else. It also settles a risk worth having checked: read-ahead issues up to `depth` requests before it learns where the file ends, so a small file costs ~64 requests instead of one — and it measures as **no regression**, because those requests pipeline into one frame and the fixed round trips swamp them. The plan's optional "cap the window from a passing `STAT`" was therefore left unimplemented, on measurement rather than argument.
+
+Hit ratio is the assertion that matters, since wall-clock on this transport has inverted conclusions twice. On the 300 ms dev host an 8 MiB download reports `clientReads=34 served=34 forwarded=0 parked=1 prefetchKiB=8192 nonSeq=0 valveTrips=0` — every read answered locally, prefetched bytes exactly equal to the file, no valve trips — in 6.5 s against 10.0 s with read-ahead off (1.54×).
+
+**The counters are logged when the client closes the file, not only at channel teardown.** `Kill()` does not run for an ordinary sftp session: ssh `TerminateProcesses` its ProxyCommand (`ssh_kill_proxy_command`), so the teardown summary was unobservable over WinRM — exactly where it is wanted. A `CLOSE` always arrives first. `Kill()` still reports when nothing else has, which covers a transfer that died part way.
+
+Other things load-bearing enough to state:
+
+- **The engine must never interpret a path.** The client's path string is copied byte-for-byte into our own `OPEN` and the agent does the mapping, as it does for the client. The loopback dev host **cannot** catch a violation — both sides are the same machine there — so an engine that resolved a remote path against its own drives would pass loopback and fail only over WinRM.
+- **Serve strictly FIFO.** It costs nothing (the agent's worker is serial and frames arrive in order, so the buffer fills in increasing offset order and the oldest parked read is always the first to become answerable) and it deletes the `server reordered requests` failure mode outright.
+- **Never answer short except at an agent-confirmed EOF.** One mid-file short reply makes the client permanently shrink its request size for the rest of the session, ~2.5×. Every other case parks or forwards.
+- **A parked read has a 30 s deadline**, carried on the engine's existing watchdog tick. Parking is normally a fraction of a round trip, but a lost reply would otherwise hang the client for good — SFTP has no timeout of its own. Past the deadline the read goes to the remote after all, which is always safe: a parked read was never forwarded, so the remote has not seen it.
+- **Prefetch credit is released as bytes leave the buffer**, and synthesised chunks carry `Credit = 0`. Releasing the *sent* count rather than the *accrued* count drifts by 13 bytes per reply and eventually withholds the agent's window for good.
+- Tripling download throughput reaches OpenSSH's ~1 GiB rekey threshold three times sooner in wall-clock. Not a new bug — **no rekeying** is a known limit — but a nearer one.
 
 ### Striping across sessions (`-Streams N`, default 1)
 

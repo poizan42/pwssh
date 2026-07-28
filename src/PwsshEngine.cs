@@ -36,7 +36,18 @@ namespace Pwssh
         // entirely and is the escape hatch if it ever misbehaves. It exists as a knob mainly so
         // the effect can be measured by interleaved A/B rather than argued about -- this transport
         // has twice produced a single measurement that inverted a conclusion.
-        public int SftpReadAheadChunks = 16;
+        //
+        // 64 by measurement, not arithmetic. Interleaved over 32 MiB compressible the depth is
+        // the whole story, and the bandwidth-delay estimate that suggested 16 was simply wrong:
+        //
+        //   depth   0  2.31 MiB/s      depth  32  2.89 (1.20x)
+        //   depth  16  2.32 (0.97x)    depth  64  3.29 (1.42x)   <- best
+        //                              depth 128  3.05 (1.32x)
+        //
+        // 128 turns back down because 128 chunks is 33.4 MB, just over the agent's 32 MiB credit
+        // (InitialCredit, -CreditMiB), so the far side starts stalling on window instead of
+        // reading. That is also why SftpReadAhead clamps: past the credit there is nothing to buy.
+        public int SftpReadAheadChunks = 64;
 
         // If the client vanishes without closing the session, the remote pipeline would
         // otherwise block forever and hold a WinRM shell until WinRM's own (2 hour)
@@ -561,7 +572,8 @@ namespace Pwssh
             worker.Name = "pwssh-protocol";
             worker.Start();
 
-            if (cfg.InactivityTimeoutSeconds > 0)
+            // Started for either job it does: the inactivity shutdown, or the SFTP park deadline.
+            if (cfg.InactivityTimeoutSeconds > 0 || cfg.SftpReadAheadChunks > 0)
             {
                 Thread wd = new Thread(new ThreadStart(Watchdog));
                 wd.IsBackground = true;
@@ -570,7 +582,9 @@ namespace Pwssh
             }
         }
 
-        // The protocol thread blocks in ReadPacket, so the timeout needs its own thread.
+        // The protocol thread blocks in ReadPacket, so the timeout needs its own thread. It also
+        // carries the SFTP park deadline, which wants the same "notice while nothing is happening"
+        // shape and does not justify a thread of its own.
         private void Watchdog()
         {
             int limitMs = cfg.InactivityTimeoutSeconds * 1000;
@@ -578,12 +592,32 @@ namespace Pwssh
             {
                 Thread.Sleep(5000);
                 if (finished) return;
-                if (unchecked(Environment.TickCount - lastInboundTick) > limitMs)
+                CheckSftpParkDeadlines();
+                if (limitMs > 0 && unchecked(Environment.TickCount - lastInboundTick) > limitMs)
                 {
                     Log("no inbound data for " + cfg.InactivityTimeoutSeconds + "s; shutting down");
                     Stop();
                     return;
                 }
+            }
+        }
+
+        // A snapshot under the lock, then the calls outside it: CheckParkDeadline can abandon a
+        // prefetch, which sends frames, and holding chanGate across that would put the watchdog
+        // in the way of the protocol thread for no reason.
+        private void CheckSftpParkDeadlines()
+        {
+            SessionChannel[] all;
+            lock (chanGate)
+            {
+                if (channels.Count == 0) return;
+                all = new SessionChannel[channels.Count];
+                channels.Values.CopyTo(all, 0);
+            }
+            for (int i = 0; i < all.Length; i++)
+            {
+                try { all[i].CheckSftpParkDeadline(); }
+                catch (Exception) { }
             }
         }
 
@@ -1754,10 +1788,18 @@ namespace Pwssh
             // does not keep.
             if (engine.SftpReadAheadEnabled)
             {
-                sftp = new SftpReadAhead(engine, agent, engine.SftpReadAheadChunks);
+                sftp = new SftpReadAhead(engine, agent, this, engine.SftpReadAheadChunks);
             }
             agent.Subsystem(localId, name);
             return true;
+        }
+
+        // Called from the engine's watchdog tick. A no-op on every channel that is not sftp,
+        // which is nearly all of them.
+        internal void CheckSftpParkDeadline()
+        {
+            SftpReadAhead s = sftp;
+            if (s != null) s.CheckParkDeadline();
         }
 
         // direct-tcpip. The sender thread deliberately does not start here: nothing may be
@@ -1891,11 +1933,28 @@ namespace Pwssh
         public void WriteFromClient(byte[] data)
         {
             // Read-ahead observes the SFTP conversation here and may answer a READ from its own
-            // buffer instead of letting it reach the remote. It never adds bytes to this stream:
-            // its own requests go out on a private channel.
-            bool forward = true;
-            if (sftp != null) forward = sftp.FromClient(data, 0, data.Length);
-            if (forward) agent.SendStdin(localId, data);
+            // buffer instead of letting it reach the remote, in which case what goes on is the
+            // remaining messages rather than the original bytes. It never *adds* anything to this
+            // stream: its own requests go out on a private channel.
+            if (sftp != null)
+            {
+                int off, len;
+                byte[] send = sftp.FromClient(data, 0, data.Length, out off, out len);
+                if (send != null && len > 0)
+                {
+                    if (send == data && off == 0 && len == data.Length) agent.SendStdin(localId, data);
+                    else
+                    {
+                        byte[] slice = new byte[len];
+                        Array.Copy(send, off, slice, 0, len);
+                        agent.SendStdin(localId, slice);
+                    }
+                }
+            }
+            else
+            {
+                agent.SendStdin(localId, data);
+            }
 
             // Eager window adjust: a lazy threshold would cost a full round trip, and on this
             // transport a round trip is ~600-900 ms.
@@ -1908,6 +1967,43 @@ namespace Pwssh
 
         public void ClientEof() { agent.CloseStdin(localId); }
 
+        // ---- called by SFTP read-ahead ----
+
+        // Sends bytes to the remote on THIS channel, as though the client had sent them. Used only
+        // to hand over reads that were parked and can no longer be answered locally; they carry the
+        // client's own ids and handle, so the remote cannot tell the difference.
+        internal void SendToAgentRaw(byte[] data)
+        {
+            if (data != null && data.Length > 0) agent.SendStdin(localId, data);
+        }
+
+        // Writes a reply the engine composed itself: a header it invented, followed by segments of
+        // data the agent already sent us. Queued as one unit so it cannot interleave with a reply
+        // being forwarded from the pump thread, and the header carries no credit because those
+        // bytes were never accrued.
+        internal void SendSynthetic(byte[] header, List<SftpReadAhead.Segment> body)
+        {
+            int n = 1 + (body == null ? 0 : body.Count);
+            Chunk[] chunks = new Chunk[n];
+
+            Chunk h = new Chunk();
+            h.Kind = Chunk.DATA; h.Data = header; h.Offset = 0; h.Count = header.Length;
+            h.Credit = 0;
+            chunks[0] = h;
+
+            for (int i = 0; body != null && i < body.Count; i++)
+            {
+                SftpReadAhead.Segment s = body[i];
+                Chunk c = new Chunk();
+                c.Kind = Chunk.DATA; c.Data = s.Data; c.Offset = s.Offset; c.Count = s.Count;
+                // The read-ahead has already returned this credit as the bytes left its buffer,
+                // so the sender must not return it a second time.
+                c.Credit = 0;
+                chunks[i + 1] = c;
+            }
+            EnqueueAll(chunks);
+        }
+
         public void Kill()
         {
             killed = true;
@@ -1916,7 +2012,11 @@ namespace Pwssh
             // assert on at all.
             if (sftp != null)
             {
-                engine.LogInternal(sftp.Summary());
+                // Only if the CLOSE path has not already said it, which for an ordinary session it
+                // has. This one covers the session that ends without a CLOSE -- a dropped link, or
+                // a transfer interrupted part way -- which is exactly when the counters are least
+                // guessable from the outside.
+                if (sftp.ShouldReport) engine.LogInternal(sftp.Summary());
                 sftp.Dispose();          // drops any prefetch channel still open on the remote
                 sftp = null;
             }

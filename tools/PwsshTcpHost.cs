@@ -24,16 +24,26 @@ namespace Pwssh.Dev
 
         public static void Run(int port, string hostKey, bool verbose, bool gatewayPorts, int latencyMs)
         {
+            Run(port, hostKey, verbose, gatewayPorts, latencyMs, -1);
+        }
+
+        // readAheadChunks: -1 leaves PwsshConfig's default alone, which is what every caller that
+        // is not specifically testing read-ahead wants. 0 disables it, and is how the suite gets a
+        // byte-for-byte forwarding run to compare against without needing WinRM.
+        public static void Run(int port, string hostKey, bool verbose, bool gatewayPorts,
+                               int latencyMs, int readAheadChunks)
+        {
             TcpListener l = new TcpListener(IPAddress.Loopback, port);
             l.Start();
             Console.Error.WriteLine("[pwssh] listening on 127.0.0.1:" + port
-                + (latencyMs > 0 ? ("  latency " + latencyMs + " ms each way") : ""));
+                + (latencyMs > 0 ? ("  latency " + latencyMs + " ms each way") : "")
+                + (readAheadChunks >= 0 ? ("  read-ahead " + readAheadChunks) : ""));
             while (true)
             {
                 TcpClient c = l.AcceptTcpClient();
                 Thread t = new Thread(new ParameterizedThreadStart(Serve));
                 t.IsBackground = true;
-                t.Start(new object[] { c, hostKey, verbose, gatewayPorts, latencyMs });
+                t.Start(new object[] { c, hostKey, verbose, gatewayPorts, latencyMs, readAheadChunks });
             }
         }
 
@@ -45,6 +55,7 @@ namespace Pwssh.Dev
             bool verbose = (bool)a[2];
             bool gatewayPorts = (bool)a[3];
             int latencyMs = (int)a[4];
+            int readAheadChunks = (int)a[5];
 
             Console.Error.WriteLine("[pwssh] connection from " + c.Client.RemoteEndPoint);
             PwsshEngine eng = null;
@@ -54,6 +65,7 @@ namespace Pwssh.Dev
                 PwsshConfig cfg = new PwsshConfig();
                 cfg.HostKey = hostKey;
                 cfg.AllowGatewayPorts = gatewayPorts;
+                if (readAheadChunks >= 0) cfg.SftpReadAheadChunks = readAheadChunks;
                 // In-process agent wired through the real frame protocol, so this harness
                 // exercises everything except the WinRM hop. ExpectedUser is deliberately left
                 // unset so the HELLO round trip is exercised too.

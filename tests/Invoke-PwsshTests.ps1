@@ -784,6 +784,40 @@ if (Test-Path -LiteralPath '$farPath') {
         ($r.Err -match 'buffer sizes 65536 / 261120; using 65536 / 261120') `
         "stderr: $(($r.Err -split "`r?`n" | Where-Object { $_ -match 'buffer sizes' }) -join ' | ')"
 
+    # ---- 5d. resuming a download must not trip the client's reordering check. sftp.exe abandons a
+    # resume outright with "server reordered requests" if replies arrive out of order, and that one
+    # string is the reason the read-ahead answers the client strictly FIFO rather than as soon as
+    # each read happens to be satisfiable. Nothing else here would catch a violation: an ordinary
+    # transfer tolerates reordering, so only the resume path checks.
+    $full522 = Join-Path $repo "tmp/sftp-d522240-$sftpTag.bin"
+    $resume = Join-Path $repo "tmp/sftp-resume-$sftpTag.bin"
+    if (Test-Path $full522) {
+        $fullBytes = [System.IO.File]::ReadAllBytes($full522)
+        $partial = New-Object byte[] 300000
+        [Array]::Copy($fullBytes, $partial, 300000)
+        [System.IO.File]::WriteAllBytes($resume, $partial)
+        $r = Invoke-Sftp "reget $farFwd/d522240.bin $($resume.Replace($bs,'/'))`nquit`n" 'reget' @('-vvv')
+        $resumed = if (Test-Path $resume) { Get-Sha ([System.IO.File]::ReadAllBytes($resume)) } else { 'MISSING' }
+        Assert-That 'reget resumes bit-exact, with no reordered replies' `
+            (($r.Err -notmatch 'reordered requests') -and ($resumed -eq (Get-Sha $fullBytes))) `
+            "$($r.Phase) hash=$resumed want=$(Get-Sha $fullBytes) stderr: $(($r.Err -split "`r?`n" | Where-Object { $_ -match 'reorder|resume' }) -join ' | ')"
+    }
+
+    # ---- 5e. the same file twice in one session, which is what cycles handles. A prefetch that
+    # stayed marked active past the first file would leave the second with no read-ahead at all --
+    # invisible in a hash check, so this asserts both copies rather than just the second.
+    $twiceA = Join-Path $repo "tmp/sftp-twice-a-$sftpTag.bin"
+    $twiceB = Join-Path $repo "tmp/sftp-twice-b-$sftpTag.bin"
+    $r = Invoke-Sftp @"
+get $farFwd/d522240.bin $($twiceA.Replace($bs,'/'))
+get $farFwd/d522240.bin $($twiceB.Replace($bs,'/'))
+quit
+"@ 'twice'
+    $hA = if (Test-Path $twiceA) { Get-Sha ([System.IO.File]::ReadAllBytes($twiceA)) } else { 'MISSING-A' }
+    $hB = if (Test-Path $twiceB) { Get-Sha ([System.IO.File]::ReadAllBytes($twiceB)) } else { 'MISSING-B' }
+    Assert-That 'the same file downloads twice in one session' (($hA -eq $hB) -and ($hA -notlike 'MISSING*')) `
+        "$($r.Phase) a=$hA b=$hB"
+
     # ---- 6. listings show what is there, and render a directory as a directory
     $r = Invoke-Sftp "mkdir $farFwd/adir`nls -l $farFwd`nquit`n" 'lsl'
     Assert-That 'ls shows an uploaded file' ($r.Out -match 'up\.bin') `

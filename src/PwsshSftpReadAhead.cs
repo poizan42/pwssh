@@ -58,6 +58,9 @@ namespace Pwssh
 
         public string Error;                 // non-null once the stream stopped making sense
 
+        // True while part of a message is held over, waiting for the rest.
+        public bool HasResidue { get { return residueLen > 0; } }
+
         // One message, as a range. Buffer/Offset/Count cover the message body (type byte first),
         // excluding the 4-byte length prefix.
         internal struct Msg
@@ -198,25 +201,51 @@ namespace Pwssh
 
         private readonly PwsshEngine engine;
         private readonly IPwsshAgent agent;
+        private readonly SessionChannel owner;
         private readonly int depth;              // how many chunks may be outstanding
 
         // Counters. The tests assert on these rather than on wall-clock, because the transport's
         // run-to-run spread is wide enough to invert a conclusion and has twice done so.
         private int clientReads;
         private int forwardedReads;
+        private int servedFromBuffer;
+        private long servedBytes;
+        private int parked;
+        private int nonSequential;
         private int prefetchIssued;
-        private int prefetchBytes;
+        private long prefetchBytes;
         private int valveTrips;
         private string valveReason;
 
-        public SftpReadAhead(PwsshEngine e, IPwsshAgent a, int depthChunks)
+        // The client handle of the file most recently prefetched, so its CLOSE can report the
+        // counters. Cleared once reported, so a second CLOSE of the same handle stays quiet.
+        private string lastPrefetchHandle;
+        private bool reported;                   // keeps Kill() from repeating what CLOSE said
+
+        // A depth beyond the agent's credit cannot be in flight however many requests are issued:
+        // the far side blocks on its window instead of reading, which is measurable -- depth 128
+        // is slower than 64 for exactly that reason. The requests are still sent, and the batch
+        // that opens a file is a single frame, so an absurd depth builds an absurd frame. Found
+        // the hard way: a misparsed 326,496 produced a 10.6 MB object and WinRM refused it
+        // outright ("deserialized object size ... exceeded the allowed maximum"), killing the
+        // pipeline mid-download. 128 is the default credit (32 MiB) divided by CHUNK, i.e. the
+        // most that can ever be outstanding; it is a ceiling on nonsense, not a tuning value.
+        internal const int MAX_DEPTH = 128;
+
+        public SftpReadAhead(PwsshEngine e, IPwsshAgent a, SessionChannel o, int depthChunks)
         {
             engine = e;
             agent = a;
-            depth = depthChunks;
+            owner = o;
+            depth = depthChunks > MAX_DEPTH ? MAX_DEPTH : depthChunks;
+            if (depthChunks > MAX_DEPTH)
+                e.LogInternal("sftp read-ahead depth " + depthChunks + " clamped to " + MAX_DEPTH);
         }
 
         public bool IsPassthrough { get { return mode == Mode.Passthrough; } }
+
+        // True when the counters have something to say that no CLOSE has reported yet.
+        public bool ShouldReport { get { lock (gate) { return !reported && prefetchIssued > 0; } } }
 
         // Reported once at teardown rather than per event: a per-read log line on a 32 MiB
         // transfer would be 128 lines of noise, and the ratio is the only interesting part.
@@ -225,12 +254,38 @@ namespace Pwssh
             lock (gate)
             {
                 string s = "sftp read-ahead: clientReads=" + clientReads
+                         + " served=" + servedFromBuffer
                          + " forwarded=" + forwardedReads
+                         + " parked=" + parked
+                         + " servedKiB=" + (servedBytes / 1024)
                          + " prefetched=" + prefetchIssued
                          + " prefetchKiB=" + (prefetchBytes / 1024)
+                         + " nonSeq=" + nonSequential
                          + " valveTrips=" + valveTrips;
                 if (valveReason != null) s += " (" + valveReason + ")";
                 return s;
+            }
+        }
+
+        // A parked read is waiting for bytes already in flight, which normally costs a fraction of
+        // a round trip. If that reply never comes, though, nothing else rescues the client: SFTP
+        // has no timeout of its own, so the session would hang for good and look like the link
+        // being slow. Past the deadline the read goes to the remote after all -- always safe,
+        // since a parked read was never forwarded and the remote has not seen it.
+        //
+        // Driven by the engine's watchdog tick rather than a thread of its own: it needs exactly
+        // the "notice while nothing is happening" shape that thread already has.
+        internal const int PARK_DEADLINE_MS = 30000;
+
+        public void CheckParkDeadline()
+        {
+            lock (gate)
+            {
+                if (mode == Mode.Passthrough) return;
+                Prefetch p = active;
+                if (p == null || p.Waiting.Count == 0) return;
+                if (unchecked(Environment.TickCount - p.Waiting.Peek().Tick) < PARK_DEADLINE_MS) return;
+                AbandonPrefetch("park deadline exceeded; the reply never arrived");
             }
         }
 
@@ -247,26 +302,87 @@ namespace Pwssh
 
         // ---- client -> agent ----
         //
-        // Returns true if the caller should forward these bytes to the agent unchanged, which is
-        // every case until the serving logic lands. Once it can answer a READ locally it will
-        // return false for that message alone and forward the rest.
-        public bool FromClient(byte[] data, int offset, int count)
+        // Returns what the caller should forward to the agent: the original array when nothing has
+        // to change, a rebuilt one when a READ was answered locally, or null when there is nothing
+        // to send at all.
+        //
+        // Whole messages, not raw bytes. A CHANNEL_DATA payload is not aligned to SFTP message
+        // boundaries, so a message can span two of them -- and whether to suppress it cannot be
+        // decided until it is complete. Forwarding eagerly would mean the first half had already
+        // gone by the time we knew. So incomplete messages are held, and only complete ones are
+        // passed on.
+        //
+        // The rebuild copies, which is fine: it only happens when a read was served, and the
+        // messages left to forward at that point are small. Upload traffic, which is the bulk of
+        // this direction, hits the no-change path.
+        public byte[] FromClient(byte[] data, int offset, int count, out int outOffset, out int outCount)
         {
+            outOffset = offset;
+            outCount = count;
             lock (gate)
             {
-                if (mode == Mode.Passthrough) return true;
+                if (mode == Mode.Passthrough) return data;
                 try
                 {
                     List<SftpFramer.Msg> msgs = fromClient.Feed(data, offset, count);
-                    if (fromClient.Error != null) { Trip("client stream: " + fromClient.Error); return true; }
-                    for (int i = 0; i < msgs.Count; i++) Inspect(msgs[i]);
+                    if (fromClient.Error != null)
+                    {
+                        Trip("client stream: " + fromClient.Error);
+                        // Anything already held back has to go now, or the agent is left waiting
+                        // for the rest of a message it half received.
+                        return FlushHeld(msgs, out outOffset, out outCount);
+                    }
+
+                    bool anySuppressed = false;
+                    List<SftpFramer.Msg> keep = new List<SftpFramer.Msg>();
+                    for (int i = 0; i < msgs.Count; i++)
+                    {
+                        if (Inspect(msgs[i])) keep.Add(msgs[i]);
+                        else anySuppressed = true;
+                    }
+
+                    // The fast path: every message complete within this buffer, none suppressed,
+                    // nothing held over. Then the buffer is exactly what should go, unchanged.
+                    if (!anySuppressed && !fromClient.HasResidue && msgs.Count > 0
+                        && msgs[0].Buffer == data && msgs[0].Offset == offset + 4)
+                    {
+                        return data;
+                    }
+
+                    return Rebuild(keep, out outOffset, out outCount);
                 }
                 catch (Exception ex)
                 {
                     Trip("client parse: " + ex.Message);
+                    return data;
                 }
-                return true;
             }
+        }
+
+        private byte[] FlushHeld(List<SftpFramer.Msg> msgs, out int outOffset, out int outCount)
+        {
+            return Rebuild(msgs, out outOffset, out outCount);
+        }
+
+        private static byte[] Rebuild(List<SftpFramer.Msg> msgs, out int outOffset, out int outCount)
+        {
+            outOffset = 0;
+            outCount = 0;
+            if (msgs.Count == 0) return null;
+
+            int total = 0;
+            for (int i = 0; i < msgs.Count; i++) total += 4 + msgs[i].Count;
+            byte[] buf = new byte[total];
+            int p = 0;
+            for (int i = 0; i < msgs.Count; i++)
+            {
+                // The 4-byte length prefix sits immediately before the body, in whichever buffer
+                // the framer produced the message from.
+                Array.Copy(msgs[i].Buffer, msgs[i].Offset - 4, buf, p, 4 + msgs[i].Count);
+                p += 4 + msgs[i].Count;
+            }
+            outCount = total;
+            return buf;
         }
 
         // ---- agent -> client ----
@@ -281,10 +397,9 @@ namespace Pwssh
                 if (mode == Mode.Passthrough) return true;
                 try
                 {
-                    // The messages are not needed yet -- this direction is framed only so that a
-                    // desync is detected here rather than after the policy starts depending on it.
-                    fromAgent.Feed(data, offset, count);
+                    List<SftpFramer.Msg> msgs = fromAgent.Feed(data, offset, count);
                     if (fromAgent.Error != null) { Trip("agent stream: " + fromAgent.Error); return true; }
+                    for (int i = 0; i < msgs.Count; i++) InspectReply(msgs[i]);
                 }
                 catch (Exception ex)
                 {
@@ -299,15 +414,18 @@ namespace Pwssh
         // business, and all of them forward correctly without being understood. What DOES trip
         // the valve is a message we think we recognise but cannot parse, which is why the cases
         // that read fields do so defensively.
-        private void Inspect(SftpFramer.Msg m)
+        // Returns whether this message should be forwarded to the remote. Only a READ answered
+        // from the buffer is ever held back.
+        private bool Inspect(SftpFramer.Msg m)
         {
-            if (m.Count < 1) { Trip("empty SFTP message"); return; }
+            if (m.Count < 1) { Trip("empty SFTP message"); return true; }
             byte type = m.Buffer[m.Offset];
 
             switch (type)
             {
                 case SftpMsg.READ:
                     clientReads++;
+                    if (TryServeRead(m)) return false;    // answered locally; do not forward
                     forwardedReads++;
                     break;
 
@@ -316,8 +434,7 @@ namespace Pwssh
                     break;
 
                 case SftpMsg.CLOSE:
-                    // The client is done with a handle. Ours is separate and is dropped when its
-                    // own file has been read to the end, so there is nothing to do here yet.
+                    OnClientClose(m);
                     break;
 
                 // Listed only because it is the one message with no request id, so it must never
@@ -327,6 +444,258 @@ namespace Pwssh
 
                 default:
                     break;
+            }
+            return true;
+        }
+
+        // Watches the replies going back to the client for one thing only: the HANDLE that answers
+        // the OPEN we started a prefetch from. Until that arrives a client READ cannot be matched
+        // to the prefetch, because the client's handle string is not ours and the two are unrelated
+        // strings chosen independently by the remote.
+        private void InspectReply(SftpFramer.Msg m)
+        {
+            Prefetch p = active;
+            if (p == null || !p.AwaitingClientHandle) return;
+            if (m.Count < 1) return;
+            byte type = m.Buffer[m.Offset];
+
+            if (type == SftpMsg.HANDLE)
+            {
+                SshLikeReader r = new SshLikeReader(m.Buffer, m.Offset + 1);
+                uint id = r.UInt32();
+                if (id != p.ClientOpenId) return;
+                p.ClientHandle = r.Text();
+                lastPrefetchHandle = p.ClientHandle;
+                p.AwaitingClientHandle = false;
+                if (p.ClientHandle.Length == 0) AbandonPrefetch("empty client handle");
+            }
+            else if (type == SftpMsg.STATUS)
+            {
+                SshLikeReader r = new SshLikeReader(m.Buffer, m.Offset + 1);
+                uint id = r.UInt32();
+                if (id != p.ClientOpenId) return;
+                // The client's own open failed, so there is nothing to serve it from.
+                p.AwaitingClientHandle = false;
+                AbandonPrefetch("client open failed");
+            }
+        }
+
+        // ---- serving a client READ ----
+        //
+        // Returns true if the read was answered from the buffer or parked for it, in which case
+        // the caller must NOT forward it. The guarantee that matters: a synthesised reply carries
+        // either exactly the requested length, or a short read at an offset the remote has already
+        // proven to be the end of the file. Nothing else is ever answered locally. A short reply
+        // anywhere else makes the client permanently shrink its request size, which measured a
+        // ~2.5x loss for the rest of the session.
+        private bool TryServeRead(SftpFramer.Msg m)
+        {
+            Prefetch p = active;
+            if (p == null || p.Failed || p.ClientHandle == null) return false;
+
+            // READ is: byte type, uint32 id, string handle, uint64 offset, uint32 length.
+            SshLikeReader r = new SshLikeReader(m.Buffer, m.Offset + 1);
+            uint id = r.UInt32();
+            string handle = r.Text();
+            long offset = (long)r.UInt64();
+            int want = (int)r.UInt32();
+
+            if (handle != p.ClientHandle) return false;          // a different file; not ours
+            if (want <= 0 || want > CHUNK) return false;          // let the agent's own clamp decide
+
+            // Past a proven end of file: the same STATUS the remote would send, one round trip
+            // sooner. Only ever when the remote actually proved it.
+            if (offset >= p.EofOffset)
+            {
+                SendStatusEof(id);
+                servedFromBuffer++;
+                return true;
+            }
+
+            // Before the buffer means the client seeked backwards. Forward it and give up on
+            // read-ahead for this file rather than trying to guess the new pattern -- which is
+            // what keeps a random-access client at today's behaviour instead of worse.
+            if (offset < p.BufStart)
+            {
+                nonSequential++;
+                AbandonPrefetch("client read backwards");
+                return false;
+            }
+
+            // Either satisfiable now, or in flight and worth waiting for. Waiting costs a
+            // fraction of a round trip; forwarding costs a whole one and fetches the bytes twice.
+            if (Satisfiable(p, offset, want))
+            {
+                ServeFromBuffer(p, id, offset, want);
+                return true;
+            }
+
+            if (offset < p.NextOffset || !p.Eof)
+            {
+                Parked w = new Parked();
+                w.Id = id; w.Offset = offset; w.Length = want;
+                w.Tick = Environment.TickCount;
+                p.Waiting.Enqueue(w);
+                parked++;
+                return true;
+            }
+
+            return false;                                        // beyond anything we will fetch
+        }
+
+        private static bool Satisfiable(Prefetch p, long offset, int want)
+        {
+            if (offset < p.BufStart) return false;
+            if (offset + want <= p.BufEnd) return true;
+            // A request running past the end of the file is satisfiable with what exists, which
+            // is the one legitimate short reply.
+            return p.EofOffset != long.MaxValue && p.BufEnd >= p.EofOffset && offset < p.EofOffset;
+        }
+
+        // Builds the reply as a header chunk plus the buffered segments it covers, enqueued in one
+        // go. The segments carry the agent's credit; the header we invented carries none.
+        private void ServeFromBuffer(Prefetch p, uint id, long offset, int want)
+        {
+            int available = (int)Math.Min((long)want, p.BufEnd - offset);
+            if (p.EofOffset != long.MaxValue)
+            {
+                available = (int)Math.Min((long)available, p.EofOffset - offset);
+            }
+            if (available <= 0) { SendStatusEof(id); servedFromBuffer++; return; }
+
+            List<Segment> parts = TakeRange(p, offset, available);
+
+            // uint32 length, byte type, uint32 id, uint32 data length
+            SshLikeWriter head = new SshLikeWriter();
+            head.UInt32((uint)(1 + 4 + 4 + available));
+            head.Byte(SftpMsg.DATA);
+            head.UInt32(id);
+            head.UInt32((uint)available);
+
+            owner.SendSynthetic(head.ToArray(), parts);
+            servedFromBuffer++;
+            servedBytes += available;
+            Refill(p);
+        }
+
+        private void SendStatusEof(uint id)
+        {
+            SshLikeWriter w = new SshLikeWriter();
+            SshLikeWriter body = new SshLikeWriter();
+            body.Byte(SftpMsg.STATUS);
+            body.UInt32(id);
+            body.UInt32(SftpMsg.STATUS_EOF);
+            body.Text("end of file");
+            body.Text("");
+            AppendFramed(w, body);
+            owner.SendSynthetic(w.ToArray(), null);
+        }
+
+        // Consumes exactly 'count' bytes from the front of the buffer. Anything the client did not
+        // ask for stays where it is, split if necessary, so nothing is dropped or double-counted.
+        private List<Segment> TakeRange(Prefetch p, long offset, int count)
+        {
+            List<Segment> parts = new List<Segment>();
+
+            // Discard anything before the requested offset: the client has moved past it and will
+            // not ask again while the read-ahead is still sequential.
+            while (p.Segs.Count > 0)
+            {
+                Segment s = p.Segs.Peek();
+                if (s.FileOffset + s.Count <= offset)
+                {
+                    p.Segs.Dequeue();
+                    p.BufStart = s.FileOffset + s.Count;
+                    ReleasePrefetchCredit(s.Count);
+                    continue;
+                }
+                break;
+            }
+
+            int need = count;
+            while (need > 0 && p.Segs.Count > 0)
+            {
+                Segment s = p.Segs.Peek();
+                int skip = (int)(offset - s.FileOffset);
+                if (skip < 0) break;                             // a gap; should not happen
+                int avail = s.Count - skip;
+                if (avail <= 0) { p.Segs.Dequeue(); continue; }
+
+                int take = Math.Min(avail, need);
+                Segment part = new Segment();
+                part.Data = s.Data; part.Offset = s.Offset + skip; part.Count = take;
+                part.FileOffset = offset;
+                parts.Add(part);
+
+                offset += take;
+                need -= take;
+
+                if (skip + take >= s.Count)
+                {
+                    p.Segs.Dequeue();
+                    p.BufStart = s.FileOffset + s.Count;
+                    // The whole segment has been handed over, so its credit goes back now.
+                    ReleasePrefetchCredit(s.Count);
+                }
+                else
+                {
+                    // Partly consumed: keep the remainder, and account only what left.
+                    s.Offset += skip + take;
+                    s.Count -= skip + take;
+                    s.FileOffset = offset;
+                    p.BufStart = offset;
+                    ReleasePrefetchCredit(skip + take);
+                }
+            }
+            return parts;
+        }
+
+        // Answers whatever parked reads the newly-arrived data has made satisfiable, oldest
+        // first. Strict arrival order is deliberate and free: the buffer fills forwards, so the
+        // oldest parked read is always the first to become answerable. It also means the client
+        // never observes a reordering -- which matters because its resume path detects a server
+        // that reorders and fails the transfer outright.
+        private void DrainWaiting(Prefetch p)
+        {
+            while (p.Waiting.Count > 0)
+            {
+                Parked w = p.Waiting.Peek();
+                if (w.Offset >= p.EofOffset)
+                {
+                    p.Waiting.Dequeue();
+                    SendStatusEof(w.Id);
+                    continue;
+                }
+                if (!Satisfiable(p, w.Offset, w.Length)) break;
+                p.Waiting.Dequeue();
+                ServeFromBuffer(p, w.Id, w.Offset, w.Length);
+            }
+        }
+
+        private void OnClientClose(SftpFramer.Msg m)
+        {
+            SshLikeReader r = new SshLikeReader(m.Buffer, m.Offset + 1);
+            r.UInt32();
+            string handle = r.Text();
+
+            Prefetch p = active;
+            if (p != null && p.ClientHandle != null && handle == p.ClientHandle)
+            {
+                // The client is finished with this file, so anything still buffered or in flight is
+                // waste. Its own CLOSE is forwarded untouched and answered by the remote as usual.
+                AbandonPrefetch("client closed the file");
+            }
+
+            // Reported here, and not only from Kill(), because Kill() does not run: ssh
+            // TerminateProcesses its ProxyCommand on exit (ssh_kill_proxy_command), so for an
+            // ordinary sftp session the teardown summary is never reached and the counters were
+            // unobservable over WinRM -- which is precisely where they are wanted. A CLOSE always
+            // arrives first, and per-file is more informative than one cumulative line anyway.
+            if (handle != null && handle == lastPrefetchHandle)
+            {
+                lastPrefetchHandle = null;
+                reported = true;
+                engine.LogInternal(Summary());
             }
         }
 
@@ -346,9 +715,44 @@ namespace Pwssh
             public uint NextId = 1;              // request ids on our own channel start at 1
             public uint OpenId;                  // the id of our OPEN, to match its HANDLE reply
             public long NextOffset;              // where the next prefetch request starts
+            public long DataOffset;              // where the next reply's bytes belong in the file
             public int Outstanding;              // requests issued and not yet answered
             public bool Eof;                     // the remote reported the end of the file
             public bool Failed;                  // the remote refused; stop and stay out of the way
+
+            // The client's handle for the same file, learned from the HANDLE reply to ITS open.
+            // Until that is known a client READ cannot be matched to this prefetch at all.
+            public string ClientHandle;
+            public uint ClientOpenId;
+            public bool AwaitingClientHandle;
+
+            // Buffered data, in arrival order, which is also offset order: the agent's worker is
+            // serial and frames arrive in order, so the buffer always fills forwards.
+            public readonly Queue<Segment> Segs = new Queue<Segment>();
+            public long BufStart;                // offset of the first buffered byte
+            public long BufEnd;                  // offset just past the last buffered byte
+            public long EofOffset = long.MaxValue;   // the end of the file, once the remote proves it
+
+            // Client reads waiting on data still in flight, answered strictly in arrival order.
+            public readonly Queue<Parked> Waiting = new Queue<Parked>();
+        }
+
+        // One run of buffered bytes. Holds the frame buffer by reference rather than copying:
+        // OnData hands the frame through as a range and nothing else will touch it.
+        internal sealed class Segment
+        {
+            public byte[] Data;
+            public int Offset;
+            public int Count;
+            public long FileOffset;              // where these bytes sit in the file
+        }
+
+        private sealed class Parked
+        {
+            public uint Id;                      // the client's request id, echoed back verbatim
+            public long Offset;
+            public int Length;
+            public int Tick;                     // when it was parked, for the deadline below
         }
 
         private void OnClientOpen(SftpFramer.Msg m)
@@ -359,7 +763,7 @@ namespace Pwssh
 
             // OPEN is: byte type, uint32 id, string path, uint32 pflags, ATTRS.
             SshLikeReader r = new SshLikeReader(m.Buffer, m.Offset + 1);
-            r.UInt32();                                   // request id -- the client's, not ours
+            uint clientOpenId = r.UInt32();
             string path = r.Text();
             uint pflags = r.UInt32();
 
@@ -376,6 +780,8 @@ namespace Pwssh
             Prefetch p = new Prefetch();
             p.Channel = ch;
             p.Path = path;
+            p.ClientOpenId = clientOpenId;
+            p.AwaitingClientHandle = true;
             active = p;
 
             // One frame carrying INIT and OPEN back to back. The agent's worker is serial, so it
@@ -477,6 +883,7 @@ namespace Pwssh
                     agent.GrantWindow(ch, (uint)count);
                     return;
                 }
+                retainedThisFeed = 0;
                 try
                 {
                     List<SftpFramer.Msg> msgs = fromPrefetch.Feed(buffer, offset, count);
@@ -489,16 +896,39 @@ namespace Pwssh
                         return;
                     }
                     for (int i = 0; i < msgs.Count; i++) HandlePrefetchReply(p, msgs[i]);
+                    DrainWaiting(p);
                 }
                 catch (Exception ex)
                 {
                     AbandonPrefetch("prefetch parse: " + ex.Message);
                 }
 
-                // Credit is returned for every byte received. Phase 3 will hold some of these
-                // bytes back for the client and release their credit as they are handed over;
-                // until then nothing is retained, so everything is released immediately.
-                agent.GrantWindow(ch, (uint)count);
+                // Every byte received has exactly one fate and is accounted once. Framing and
+                // anything not retained is released now; bytes held for the client are released
+                // when they are handed over, or when they are discarded. Getting this wrong in
+                // the obvious way -- releasing nothing for retained bytes -- would let the
+                // outstanding total climb until credit was withheld permanently and the agent's
+                // channel stalled with no timeout to break it.
+                int releaseNow = count - retainedThisFeed;
+                if (releaseNow > 0) agent.GrantWindow(ch, (uint)releaseNow);
+                prefetchOwed += retainedThisFeed;
+            }
+        }
+
+        // Bytes sitting in the buffer whose credit has not yet gone back, and the channel they
+        // belong to. Tracked so that a discard can return exactly what it holds.
+        private int retainedThisFeed;
+        private long prefetchOwed;
+
+        // Called as buffered bytes leave, whether to the client or to the bin.
+        internal void ReleasePrefetchCredit(int bytes)
+        {
+            if (bytes <= 0) return;
+            Prefetch p = active;
+            prefetchOwed -= bytes;
+            if (p != null)
+            {
+                try { agent.GrantWindow(p.Channel, (uint)bytes); } catch (Exception) { }
             }
         }
 
@@ -530,10 +960,33 @@ namespace Pwssh
                         if (!r.Blob(out off, out len)) { AbandonPrefetch("truncated prefetch DATA"); return; }
                         p.Outstanding--;
                         prefetchBytes += len;
-                        // Phase 3 buffers this. For now the fetch is proven and the bytes are
-                        // dropped, which is why this phase is expected to make transfers no
-                        // faster -- only to show that prefetching works and cleans up.
-                        if (len < CHUNK) p.Eof = true;    // a short read means the file ended
+
+                        // The buffer must stay contiguous, because that is what lets a client read
+                        // be answered by simple arithmetic. Replies arrive in request order on a
+                        // serial worker, so this holds -- but if it ever did not, serving from a
+                        // gapped buffer would hand the client the wrong bytes, so check rather
+                        // than assume.
+                        if (p.Segs.Count == 0 && p.BufEnd == 0 && p.BufStart == 0)
+                        {
+                            p.BufStart = p.DataOffset;
+                            p.BufEnd = p.DataOffset;
+                        }
+                        if (p.DataOffset != p.BufEnd)
+                        {
+                            AbandonPrefetch("prefetch arrived out of order");
+                            return;
+                        }
+
+                        Segment s = new Segment();
+                        s.Data = m.Buffer; s.Offset = off; s.Count = len; s.FileOffset = p.DataOffset;
+                        p.Segs.Enqueue(s);
+                        p.BufEnd += len;
+                        p.DataOffset += len;
+                        retainedThisFeed += len;
+
+                        // A reply shorter than asked for is how the end of the file announces
+                        // itself, and the agent only ever answers short when the file truly ended.
+                        if (len < CHUNK) { p.Eof = true; p.EofOffset = p.BufEnd; }
                         Refill(p);
                         break;
                     }
@@ -543,7 +996,13 @@ namespace Pwssh
                         r.UInt32();                       // request id
                         uint code = r.UInt32();
                         p.Outstanding--;
-                        if (code == SftpMsg.STATUS_EOF) p.Eof = true;
+                        if (code == SftpMsg.STATUS_EOF)
+                        {
+                            p.Eof = true;
+                            // Where the file ends: the buffer holds everything up to here, so a
+                            // client read at or past it can be answered EOF without asking.
+                            if (p.EofOffset == long.MaxValue) p.EofOffset = p.BufEnd;
+                        }
                         else if (code != SftpMsg.STATUS_OK)
                         {
                             // The remote refused something. It is authoritative about the file,
@@ -600,9 +1059,48 @@ namespace Pwssh
             if (p == null) return;
             engine.LogInternal("sftp prefetch abandoned: " + reason);
             p.Failed = true;
+
+            // Anything still parked must be let through rather than dropped, or the client waits
+            // for a reply that will never come -- and SFTP has no timeout to rescue it.
+            ReplayParked(p);
+            DiscardBuffer(p);
+
             try { agent.CloseChannel(p.Channel); } catch (Exception) { }
             engine.ForgetPrefetchChannel(p.Channel);
             active = null;
+        }
+
+        // Returns the buffer's credit before letting go of it. Skipping this would leak the
+        // agent's window a chunk at a time until it stalled.
+        private void DiscardBuffer(Prefetch p)
+        {
+            while (p.Segs.Count > 0)
+            {
+                Segment s = p.Segs.Dequeue();
+                ReleasePrefetchCredit(s.Count);
+            }
+            p.BufStart = p.BufEnd;
+        }
+
+        // Parked reads cannot be answered any more, so they go to the remote after all. They were
+        // never forwarded, so the remote has not seen them and will answer each exactly once.
+        private void ReplayParked(Prefetch p)
+        {
+            if (p.Waiting.Count == 0 || p.ClientHandle == null) return;
+            SshLikeWriter w = new SshLikeWriter();
+            int n = 0;
+            while (p.Waiting.Count > 0)
+            {
+                Parked k = p.Waiting.Dequeue();
+                AppendRead(w, k.Id, p.ClientHandle, k.Offset, k.Length);
+                n++;
+            }
+            if (n == 0) return;
+            // Onto the CLIENT's channel, with the client's own ids and handle: from the remote's
+            // point of view these are simply the client's reads arriving a little late.
+            owner.SendToAgentRaw(w.ToArray());
+            forwardedReads += n;
+            engine.LogInternal("sftp read-ahead replayed " + n + " parked read(s) to the remote");
         }
 
         public void OnPrefetchClosed(uint ch)

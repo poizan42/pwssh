@@ -32,21 +32,22 @@ implements the protocol itself.
 | Not implemented | rekeying, symlink creation |
 
 Tested against OpenSSH 9.5p2 on Windows, with a Windows PowerShell 5.1 / .NET Framework 4.8
-remote. The test suite drives the real `ssh`, `sftp` and `scp` binaries: 51 cases against each
-of WinRM and a loopback dev host.
+remote. The test suite drives the real `ssh`, `sftp` and `scp` binaries: 56 cases over WinRM and
+51 against a loopback dev host.
 
 Two warts worth knowing:
 
 - **`-R` ports linger.** `ssh` kills its `ProxyCommand` when it exits, so pwssh gets no chance
   to tell the remote to unbind the listening port. The remote's own watchdog releases it about
   two minutes later, so reconnecting with the *same* `-R` port inside that window fails.
-- **SFTP downloads are round-trip-bound, not bandwidth-bound.** The `sftp` client raises its
-  request count one at a time from one, so a transfer pays roughly √(2 × chunks) round trips
-  before it is going full speed, plus four per file for its own stat/open/close. On a link
-  where a round trip is most of a second that is ~11 s of fixed cost per file, after which data
-  moves quickly. Measured 8 MiB at 0.49 MiB/s and 32 MiB at 2.22 MiB/s. Uploads, at
-  ~0.35 MiB/s, are already at the link's upstream ceiling. **Do not pass `sftp -B`** — it
-  suppresses the buffer negotiation that keeps this from being far worse.
+- **SFTP pays four round trips per file, and that dominates anything but one large file.** The
+  client stats, opens and closes each file separately, so on a link where a round trip is most
+  of a second a small file costs ~3 s however few bytes it holds: 40 files of 900 bytes measured
+  **~150 s**. One large file is fine — pwssh reads ahead on a private channel and downloads
+  measured 3.29 MiB/s at 32 MiB (1.42× over forwarding the client's requests one at a time), and
+  0.76 MiB/s at 8 MiB, where the fixed cost is most of the transfer. Uploads, at ~0.35 MiB/s,
+  are already at the link's upstream ceiling. **Do not pass `sftp -B`** — it suppresses the
+  buffer negotiation that keeps this from being far worse.
 
 ## What it needs on the remote
 
@@ -124,6 +125,7 @@ Useful options on `pwssh-connect.ps1`:
 | `-AgentDllPath` | where to find `PwsshAgent.dll`. Defaults to the build output, then to a copy beside the script |
 | `-CreditMiB` | bulk transfer window, default 32. Larger means fewer round trips on big transfers, at the cost of how much the agent may buffer client-side |
 | `-Streams N` | extra receive sessions for bulk **incompressible** transfers (see below), default 1 |
+| `-SftpReadAheadChunks` | how far ahead an SFTP download is fetched, in 255 KiB chunks, default 64 (≈16 MiB held client-side). `0` turns read-ahead off and restores byte-for-byte forwarding |
 | `-GatewayPorts` | let `ssh -R` bind a non-loopback address on the remote. Off by default, matching OpenSSH's `GatewayPorts no`; a request for a wider address is refused rather than quietly narrowed |
 | `-Diagnostics` | progress to stderr. Off by default, since ssh shows a ProxyCommand's stderr on every connection |
 
@@ -137,7 +139,8 @@ The transport is high-latency and asymmetric, and that shapes everything.
 | Keystroke echo, interactive | ~250–900 ms — one WinRM round trip per keystroke |
 | Bulk download via `exec`, compressible | ~7 MiB/s |
 | Bulk download via `exec`, incompressible | ~0.4 MiB/s, or ~1 MiB/s with `-Streams 4` |
-| Bulk download via `sftp`/`scp` | ~0.5 MiB/s at 8 MiB, ~2.2 MiB/s at 32 MiB |
+| Bulk download via `sftp`/`scp` | ~0.76 MiB/s at 8 MiB, ~3.3 MiB/s at 32 MiB |
+| Many small files via `sftp`/`scp` | ~3 s each, whatever their size — four round trips per file |
 | Upload, any path | ~0.35–0.4 MiB/s — the link's upstream ceiling |
 
 Three notes on the numbers. Compressible output is much faster because WinRM compresses the
@@ -147,8 +150,9 @@ parallel receive threads, so once compression has already relieved that bottlene
 sessions merely cost setup time. It measured **2.8× on incompressible** data and **0.83×
 — slower — on compressible** data, hence opt-in.
 
-And SFTP is slower than `exec` for the same bytes because it is a request/response protocol
-whose pacing the *client* controls — see the wart above. If you are moving a directory tree,
+And SFTP is still slower than `exec` for the same bytes because it is a request/response
+protocol whose pacing the *client* controls. Read-ahead removes the client's slow request ramp
+but not its four round trips per file — see the wart above. If you are moving a directory tree,
 archiving it on the far side and transferring one file will beat `scp -r` by a wide margin:
 
 ```bash

@@ -19,6 +19,10 @@ param(
     # 300 here means 600 there. Without it the dev host proves correctness and hides every
     # round-trip cost, which makes it useless for judging anything that reduces them.
     [int]$LatencyMs = 0,
+    # SFTP read-ahead depth in 255 KiB chunks, as pwssh-connect.ps1's -SftpReadAheadChunks does.
+    # -1 leaves the engine's own default, so only a run that is specifically about read-ahead
+    # has to name a value.
+    [int]$SftpReadAheadChunks = -1,
     [switch]$Quiet
 )
 
@@ -41,4 +45,4 @@ Import-PwsshFiles -Path (@(Get-PwsshAgentFiles -Repo $repo) + @(
 $key = Get-PwsshHostKey -Path $HostKeyPath
 
 Write-Host "pwssh dev host: 127.0.0.1:$Port  hostkey=$HostKeyPath$(if ($LatencyMs -gt 0) { "  latency=${LatencyMs}ms" })"
-[Pwssh.Dev.TcpHost]::Run($Port, $key, (-not $Quiet), [bool]$GatewayPorts, $LatencyMs)
+[Pwssh.Dev.TcpHost]::Run($Port, $key, (-not $Quiet), [bool]$GatewayPorts, $LatencyMs, $SftpReadAheadChunks)
