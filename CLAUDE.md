@@ -87,6 +87,12 @@ Implementation notes that are easy to get wrong:
 
 **Interactive latency is unchanged by any of this.** Each keystroke is a WinRM round trip, so echo takes roughly 250–900 ms. ConPTY buys correctness, not responsiveness.
 
+**Output pumps coalesce whatever is already pending** (`PipePeek.Available`, an anonymous-pipe `PeekNamedPipe`) instead of sending a frame per read. The condition is "bytes available right now", never a timer, so a lone keystroke echo is still sent immediately and interactive latency is untouched. `-DisableCoalescing` turns it off for measurement.
+
+It is worth less than it looks. Interleaved over `ls C:\Windows\System32` under a pty, three rounds, coalescing winning each: **5,264 ms of streaming versus 5,634 ms, so 1.07×**, with 10 stalls instead of 11. The reason the gain is small is instructive — of ~5.3 s of streaming, ~4.5 s is stalls either way, and those stalls are PowerShell taking ~5 s to *produce* the listing (measured remote-side: 1.75 MB in 4.9 s with no gap over 100 ms). Coalescing cannot batch data that does not exist yet. Two things follow: a slow producer, not the transport, sets the pace for chatty interactive output; and `-Streams` is useless here, measured at 0.83× with identical total stall time, because parallel receive threads do not shorten a turnaround.
+
+Note also that reading `FileStream.SafeFileHandle` flushes the stream, which a pipe cannot re-seek, so the handle is captured **before** the first read and the ConPTY streams are created unbuffered so the peek agrees with what is actually pending.
+
 ### Striping across sessions (`-Streams N`, default 1)
 
 Each PSSession gets its own WSMan receive thread on the client, and that thread is the ceiling, so extra sessions multiply receive capacity. Sessions beyond the first are receive-only "mules": they run `src/Start-PwsshMule.ps1`, which connects to a local named pipe published by the agent and relays whatever arrives to its own pipeline output. Mules need no compilation — they never inspect a frame. Everything the client *sends* still goes to the primary session, so there is only one ordering problem, solved by `FrameResequencer`.

@@ -29,7 +29,9 @@ param(
     [int]$CreditMiB = 32,
     # Testing hook: forces the no-ConPTY path so the graceful-degradation behaviour can be
     # exercised on a remote that does have ConPTY.
-    [bool]$DisableConPty = $false
+    [bool]$DisableConPty = $false,
+    # Testing hook: turn off output read coalescing, for measuring its effect.
+    [bool]$DisableCoalescing = $false
 )
 
 $ErrorActionPreference = 'Stop'
@@ -46,6 +48,7 @@ try {
 
     if ($CreditMiB -gt 0) { [Pwssh.PwsshAgentHost]::InitialCredit = [uint32]($CreditMiB * 1MB) }
     [Pwssh.PwsshAgentHost]::DisableConPty = $DisableConPty
+    [Pwssh.PwsshAgentHost]::DisableCoalescing = $DisableCoalescing
 
     $agent = New-Object Pwssh.PwsshAgentHost
     # Pipes must exist before Start(), so the mules have something to connect to while the

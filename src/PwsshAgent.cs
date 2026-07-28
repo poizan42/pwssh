@@ -766,6 +766,10 @@ namespace Pwssh
         // graceful-degradation behaviour can be exercised rather than assumed.
         public static bool DisableConPty;
 
+        // Testing hook: turns off read coalescing in the output pumps, so its effect can be
+        // measured by interleaved A/B rather than asserted.
+        public static bool DisableCoalescing;
+
         // The shell, matching what Windows OpenSSH runs by default.
         public static string ShellPath()
         {
@@ -1127,6 +1131,36 @@ namespace Pwssh
         }
     }
 
+    // How many bytes are already sitting in a pipe, without blocking. Works on anonymous
+    // pipes, which is what both ConPTY output and redirected stdout are.
+    internal static class PipePeek
+    {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool PeekNamedPipe(IntPtr hPipe, IntPtr buffer, uint bufferSize,
+            IntPtr bytesRead, out uint totalAvail, IntPtr bytesLeftThisMessage);
+
+        public static uint Available(IntPtr handle)
+        {
+            if (handle == IntPtr.Zero) return 0;
+            uint avail;
+            if (!PeekNamedPipe(handle, IntPtr.Zero, 0, IntPtr.Zero, out avail, IntPtr.Zero)) return 0;
+            return avail;
+        }
+
+        // Must be called before the stream has buffered anything: reading FileStream's
+        // SafeFileHandle flushes it, and a pipe cannot be repositioned.
+        public static IntPtr HandleOf(Stream s)
+        {
+            try
+            {
+                FileStream fs = s as FileStream;
+                if (fs != null) return fs.SafeFileHandle.DangerousGetHandle();
+            }
+            catch (Exception) { }
+            return IntPtr.Zero;
+        }
+    }
+
     internal sealed class ConPtySession : IDisposable
     {
         [StructLayout(LayoutKind.Sequential)]
@@ -1217,8 +1251,9 @@ namespace Pwssh
         private IntPtr inWrite = IntPtr.Zero;
         private readonly JobObject job = new JobObject();
 
-        public Stream Output;    // read: everything the terminal emits
-        public Stream Input;     // write: keystrokes
+        public Stream Output;         // read: everything the terminal emits
+        public Stream Input;          // write: keystrokes
+        public IntPtr OutputHandle;   // for peeking how much is pending
 
         public bool Start(string commandLine, uint cols, uint rows)
         {
@@ -1269,8 +1304,11 @@ namespace Pwssh
             inWrite = inW;
             job.Assign(hProcess);
 
-            Output = new FileStream(new SafeFileHandle(outR, true), FileAccess.Read, 4096, false);
-            Input = new FileStream(new SafeFileHandle(inW, false), FileAccess.Write, 4096, false);
+            OutputHandle = outR;
+            // Unbuffered: the pump peeks the pipe directly to decide whether to keep reading,
+            // and a FileStream read buffer would make that peek disagree with what is pending.
+            Output = new FileStream(new SafeFileHandle(outR, true), FileAccess.Read, 1, false);
+            Input = new FileStream(new SafeFileHandle(inW, false), FileAccess.Write, 1, false);
             return true;
         }
 
@@ -1431,14 +1469,17 @@ namespace Pwssh
 
         private void StartPump(Stream src, bool isStderr)
         {
-            Thread t = new Thread(new ThreadStart(delegate { Pump(src, isStderr); }));
+            // The handle must be taken before anything is read: reading FileStream's
+            // SafeFileHandle flushes it, and a pipe cannot be repositioned.
+            IntPtr h = (pty != null && !isStderr) ? pty.OutputHandle : PipePeek.HandleOf(src);
+            Thread t = new Thread(new ThreadStart(delegate { Pump(src, isStderr, h); }));
             t.IsBackground = true;
             t.Start();
         }
 
         // Raw streams only. PowerShell's native-command bridge decodes as text and splits
         // lines, which destroys binary: measured 128 of 256 byte values lost.
-        private void Pump(Stream src, bool isStderr)
+        private void Pump(Stream src, bool isStderr, IntPtr handle)
         {
             byte[] buf = new byte[READ_BUFFER];
             try
@@ -1447,6 +1488,25 @@ namespace Pwssh
                 {
                     int n = src.Read(buf, 0, buf.Length);
                     if (n <= 0) break;
+
+                    // Coalesce whatever is *already* pending into the same frame. Output that
+                    // trickles out slowly would otherwise become hundreds of tiny frames, and
+                    // each time the client's queue empties the refill costs a WinRM turnaround.
+                    //
+                    // The condition is "bytes are available right now", never a timer, so a
+                    // lone keystroke echo is still sent immediately and interactive latency is
+                    // unchanged. A misleading peek can only cost the optimisation, never data:
+                    // the reads still go through the stream.
+                    if (!PwsshAgentHost.DisableCoalescing && handle != IntPtr.Zero)
+                    {
+                        while (n < buf.Length && PipePeek.Available(handle) > 0)
+                        {
+                            int more = src.Read(buf, n, buf.Length - n);
+                            if (more <= 0) break;
+                            n += more;
+                        }
+                    }
+
                     SendPayload(buf, n, isStderr);
                 }
             }

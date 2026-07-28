@@ -43,6 +43,8 @@ param(
     # Testing hook: force the no-ConPTY path, so pty-req is refused and the shell falls
     # back to pipes even on a remote that supports ConPTY.
     [switch]$DisableConPty,
+    # Testing hook: turn off output read coalescing on the agent.
+    [switch]$DisableCoalescing,
     [string]$LogFile,
     # Progress messages on stderr. Off by default: ssh shows the ProxyCommand's stderr
     # directly in the user's terminal, so it would be noise on every connection.
@@ -142,6 +144,7 @@ try {
     if ($EmitRemoteLog) { $null = $ps.AddParameter('EmitLog', $true) }
     $null = $ps.AddParameter('CreditMiB', $CreditMiB)
     $null = $ps.AddParameter('DisableConPty', [bool]$DisableConPty)
+    $null = $ps.AddParameter('DisableCoalescing', [bool]$DisableCoalescing)
     if ($stripes -gt 0) {
         $null = $ps.AddParameter('PipePrefix', $pipePrefix)
         $null = $ps.AddParameter('Stripes', $stripes)
