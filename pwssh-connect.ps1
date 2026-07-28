@@ -117,7 +117,7 @@ try {
 
     # The engine depends on plumbing that lives in the agent sources, so they compile together
     # here. This side is PowerShell 7, i.e. Roslyn, and the result is cached as a DLL.
-    Import-PwsshFiles -Path (@(Get-PwsshAgentFiles -Repo $PSScriptRoot) + "$PSScriptRoot\src\PwsshEngine.cs")
+    Import-PwsshFiles -Path (@(Get-PwsshAgentFiles -Repo $PSScriptRoot) + @("$PSScriptRoot\src\PwsshEngine.cs", "$PSScriptRoot\src\PwsshSftpReadAhead.cs"))
 
     if (-not $HostKeyDirectory) { $HostKeyDirectory = Join-Path $HOME '.pwssh\hostkeys' }
     $safeName = ($ComputerName.ToLowerInvariant() -replace '[^a-z0-9._-]', '_')
@@ -251,6 +251,15 @@ try {
         }
         if ($ps.Streams.Warning.Count -gt 0) {
             foreach ($w in $ps.Streams.Warning.ReadAll()) { Write-Diag "remote: $w" }
+        }
+
+        # The engine logs from several background threads into a bounded queue and cannot write
+        # anywhere itself -- a scriptblock delegate invoked off its runspace would throw. Nothing
+        # drained it on this path until now, so every engine diagnostic was discarded; the dev
+        # host was the only place they were ever visible. Draining here routes them to -LogFile
+        # and to -Diagnostics like everything else.
+        if ($Diagnostics -or $LogFile) {
+            foreach ($line in $engine.DrainLog()) { Write-Diag $line }
         }
 
         # The engine finishing is the real end of the conversation; tell the agent so its

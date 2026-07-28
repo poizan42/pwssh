@@ -32,6 +32,12 @@ namespace Pwssh
         // OpenSSH's GatewayPorts no, which means loopback only.
         public bool AllowGatewayPorts;
 
+        // How far ahead an SFTP download may be fetched, in 255 KiB chunks; 0 disables read-ahead
+        // entirely and is the escape hatch if it ever misbehaves. It exists as a knob mainly so
+        // the effect can be measured by interleaved A/B rather than argued about -- this transport
+        // has twice produced a single measurement that inverted a conclusion.
+        public int SftpReadAheadChunks = 16;
+
         // If the client vanishes without closing the session, the remote pipeline would
         // otherwise block forever and hold a WinRM shell until WinRM's own (2 hour)
         // timeout. Bounded here instead. 0 disables.
@@ -1448,6 +1454,8 @@ namespace Pwssh
         internal void NotifyChannelFinished() { finished = true; }
         internal uint InitialWindow { get { return INITIAL_WINDOW; } }
         internal void LogInternal(string m) { Log(m); }
+        internal bool SftpReadAheadEnabled { get { return cfg.SftpReadAheadChunks > 0; } }
+        internal int SftpReadAheadChunks { get { return cfg.SftpReadAheadChunks; } }
 
         // ---- IPwsshChannelSink: called from the agent side, must not block ----
 
@@ -1612,6 +1620,10 @@ namespace Pwssh
             public int Count;
             public bool Stderr;
             public uint Status;
+            // How much agent credit this chunk represents, which is not always Count. Bytes we
+            // synthesised locally were never accrued and so must release nothing, or the
+            // accounting drifts upward and eventually withholds credit for good.
+            public int Credit;
         }
 
         private readonly PwsshEngine engine;
@@ -1649,6 +1661,9 @@ namespace Pwssh
         private Thread sender;
         private volatile bool killed;
         private bool execStarted;
+
+        // Non-null only on an sftp subsystem channel, and only when read-ahead is enabled.
+        private SftpReadAhead sftp;
 
         public SessionChannel(PwsshEngine e, PacketLayer p, IPwsshAgent a,
                               uint local, uint peer, uint window, uint maxPacket)
@@ -1689,6 +1704,9 @@ namespace Pwssh
         {
             if (name != "sftp") return false;
             if (!BeginSending()) return false;
+            // Also the only record that this channel is a subsystem, which the class otherwise
+            // does not keep.
+            if (engine.SftpReadAheadEnabled) sftp = new SftpReadAhead();
             agent.Subsystem(localId, name);
             return true;
         }
@@ -1740,8 +1758,13 @@ namespace Pwssh
 
         public void OnAgentData(byte[] buffer, int offset, int count, bool stderr)
         {
+            // Gated on !stderr deliberately: OnAgentError synthesises human-readable text through
+            // this same method, and parsing that as SFTP would be nonsense.
+            if (sftp != null && !stderr) sftp.FromAgent(buffer, offset, count);
+
             Chunk c = new Chunk();
             c.Kind = Chunk.DATA; c.Data = buffer; c.Offset = offset; c.Count = count; c.Stderr = stderr;
+            c.Credit = count;
             Enqueue(c);
             AccrueCredit(count);
         }
@@ -1800,11 +1823,30 @@ namespace Pwssh
             lock (outGate) { outQ.Enqueue(c); Monitor.PulseAll(outGate); }
         }
 
+        // Several chunks that must reach ssh consecutively -- an SFTP reply's header followed by
+        // its body segments. Two threads enqueue on an sftp channel (the pump thread forwards
+        // replies, the protocol thread answers reads from the buffer), so taking outGate once
+        // per chunk would let two multi-chunk writes interleave. The symptom would be SFTP
+        // corruption that only appears under load, which is why this exists.
+        private void EnqueueAll(Chunk[] chunks)
+        {
+            lock (outGate)
+            {
+                for (int i = 0; i < chunks.Length; i++) outQ.Enqueue(chunks[i]);
+                Monitor.PulseAll(outGate);
+            }
+        }
+
         // ---- called from the ssh side ----
 
         public void WriteFromClient(byte[] data)
         {
-            agent.SendStdin(localId, data);
+            // Read-ahead observes the SFTP conversation here and may answer a READ from its own
+            // buffer instead of letting it reach the remote. It never adds bytes to this stream:
+            // its own requests go out on a private channel.
+            bool forward = true;
+            if (sftp != null) forward = sftp.FromClient(data, 0, data.Length);
+            if (forward) agent.SendStdin(localId, data);
 
             // Eager window adjust: a lazy threshold would cost a full round trip, and on this
             // transport a round trip is ~600-900 ms.
@@ -1820,6 +1862,14 @@ namespace Pwssh
         public void Kill()
         {
             killed = true;
+            // Reported once, here, rather than per read: the ratio is the only interesting part,
+            // and the tests assert on it because wall-clock on this transport is too noisy to
+            // assert on at all.
+            if (sftp != null)
+            {
+                engine.LogInternal(sftp.Summary());
+                sftp = null;
+            }
             lock (windowGate) { Monitor.PulseAll(windowGate); }
             lock (outGate) { Monitor.PulseAll(outGate); }
             try { agent.CloseChannel(localId); } catch { }
@@ -1844,7 +1894,8 @@ namespace Pwssh
                     if (c.Kind == Chunk.DATA)
                     {
                         SendData(c.Data, c.Offset, c.Count, c.Stderr);
-                        ReleaseCredit(c.Count);
+                        // Credit, not Count: see Chunk.Credit.
+                        if (c.Credit > 0) ReleaseCredit(c.Credit);
                     }
                     else if (c.Kind == Chunk.EXIT) { SendExitStatus(c.Status); }
                     else { SendEofAndClose(); return; }

@@ -14,6 +14,11 @@ param(
     [string]$HostKeyPath,
     # Honour a client-specified bind address for -R, as pwssh-connect.ps1's -GatewayPorts does.
     [switch]$GatewayPorts,
+    # Inject a one-way delay into the in-process link, in milliseconds, so this harness can
+    # reproduce a round-trip-bound transfer. The real transport is 600-900 ms per round trip;
+    # 300 here means 600 there. Without it the dev host proves correctness and hides every
+    # round-trip cost, which makes it useless for judging anything that reduces them.
+    [int]$LatencyMs = 0,
     [switch]$Quiet
 )
 
@@ -29,10 +34,11 @@ if (-not $HostKeyPath) { $HostKeyPath = Join-Path $PSScriptRoot '.devhostkey' }
 # rather than the prebuilt net48 DLL the real path pushes to the remote.
 Import-PwsshFiles -Path (@(Get-PwsshAgentFiles -Repo $repo) + @(
     "$repo\src\PwsshEngine.cs",
+    "$repo\src\PwsshSftpReadAhead.cs",
     "$PSScriptRoot\PwsshTcpHost.cs"
 )) -ProbeType 'Pwssh.Dev.TcpHost'
 
 $key = Get-PwsshHostKey -Path $HostKeyPath
 
-Write-Host "pwssh dev host: 127.0.0.1:$Port  hostkey=$HostKeyPath"
-[Pwssh.Dev.TcpHost]::Run($Port, $key, (-not $Quiet), [bool]$GatewayPorts)
+Write-Host "pwssh dev host: 127.0.0.1:$Port  hostkey=$HostKeyPath$(if ($LatencyMs -gt 0) { "  latency=${LatencyMs}ms" })"
+[Pwssh.Dev.TcpHost]::Run($Port, $key, (-not $Quiet), [bool]$GatewayPorts, $LatencyMs)

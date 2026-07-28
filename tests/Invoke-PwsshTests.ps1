@@ -731,6 +731,59 @@ if (Test-Path -LiteralPath '$farPath') {
     Assert-That 'chunk-boundary sizes transfer exactly' ($badEdges.Count -eq 0) `
         "wrong at: $($badEdges -join ', ')"
 
+    # ---- 5b. the same boundaries in the DOWNLOAD direction.
+    # Case 5 only covers upload, and case 4 downloads a single 256 KiB file, so a server that
+    # mis-handles the tail of a read would go unnoticed. Truncation is the one failure mode with
+    # no diagnostic: the client reports success and the bytes are simply missing. All the sizes
+    # are created in one far-side call and fetched in one sftp batch, because over WinRM each
+    # extra connection costs several seconds.
+    $dlEdges = @(0, 1, 32768, 261119, 261120, 261121, 522240, 522241)
+    $mkEdges = New-Object System.Text.StringBuilder
+    foreach ($n in $dlEdges) {
+        [void]$mkEdges.AppendLine("`$b = New-Object byte[] $n")
+        [void]$mkEdges.AppendLine("if ($n -gt 0) { (New-Object System.Random $n).NextBytes(`$b) }")
+        [void]$mkEdges.AppendLine("[System.IO.File]::WriteAllBytes('$farDir${bs}d$n.bin', `$b)")
+        [void]$mkEdges.AppendLine("[Console]::Out.Write([Convert]::ToBase64String([System.Security.Cryptography.SHA256]::Create().ComputeHash(`$b)) + '|')")
+    }
+    $farHashes = (Far-Sftp $mkEdges.ToString()) -split '\|'
+
+    $getBatch = New-Object System.Text.StringBuilder
+    foreach ($n in $dlEdges) {
+        $lp = (Join-Path $repo "tmp/sftp-d$n-$sftpTag.bin").Replace($bs, '/')
+        if (Test-Path $lp) { [System.IO.File]::Delete($lp) }
+        [void]$getBatch.AppendLine("get $farFwd/d$n.bin $lp")
+    }
+    [void]$getBatch.AppendLine('quit')
+    $r = Invoke-Sftp $getBatch.ToString() 'getedges'
+
+    $badDl = @()
+    for ($i = 0; $i -lt $dlEdges.Count; $i++) {
+        $n = $dlEdges[$i]
+        $lp = Join-Path $repo "tmp/sftp-d$n-$sftpTag.bin"
+        $got = if (Test-Path $lp) { Get-Sha ([System.IO.File]::ReadAllBytes($lp)) } else { 'MISSING' }
+        if ($got -ne $farHashes[$i]) { $badDl += "$n($got vs $($farHashes[$i]))" }
+    }
+    Assert-That 'chunk-boundary sizes download exactly' ($badDl.Count -eq 0) `
+        "$($r.Phase) wrong at: $($badDl -join ', ')"
+
+    # ---- 5c. the client must never be answered short in the middle of a file.
+    # A mid-file short reply makes it re-request and then *permanently* shrink its request size
+    # for the rest of the session, which measured ~2.5x -- and nothing surfaces it except the
+    # client's own debug output.
+    #
+    # The size is deliberately an exact multiple of the 261120-byte chunk, so a correct server
+    # produces no short reply at all and the assertion needs no tolerance. A file that is NOT a
+    # multiple legitimately yields exactly one short reply at the tail: the client asks for a
+    # whole chunk spanning the end and gets the bytes that exist, which is what the reference
+    # server does too. Asserting against that would be testing the protocol, not this code.
+    $r = Invoke-Sftp "get $farFwd/d522240.bin $((Join-Path $repo "tmp/sftp-vv-$sftpTag.bin").Replace($bs,'/'))`nquit`n" 'vvv' @('-vvv')
+    Assert-That 'no short data blocks mid-file' `
+        ($r.Err -notmatch 'Short data block') `
+        "stderr: $(($r.Err -split "`r?`n" | Where-Object { $_ -match 'Short data|re-request' }) -join ' | ')"
+    Assert-That 'the client adopts the advertised transfer limits' `
+        ($r.Err -match 'buffer sizes 65536 / 261120; using 65536 / 261120') `
+        "stderr: $(($r.Err -split "`r?`n" | Where-Object { $_ -match 'buffer sizes' }) -join ' | ')"
+
     # ---- 6. listings show what is there, and render a directory as a directory
     $r = Invoke-Sftp "mkdir $farFwd/adir`nls -l $farFwd`nquit`n" 'lsl'
     Assert-That 'ls shows an uploaded file' ($r.Out -match 'up\.bin') `
