@@ -23,7 +23,10 @@ param(
     # Downstream striping: one named pipe per mule session, which the client starts
     # separately. Zero means everything goes through this session.
     [string]$PipePrefix,
-    [int]$Stripes = 0
+    [int]$Stripes = 0,
+    # Bulk-transfer window, in MiB. Also bounds how much the agent can push into the
+    # client's memory before it must wait for credit.
+    [int]$CreditMiB = 32
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,6 +40,8 @@ try {
     . ([scriptblock]::Create($CommonSource))
 
     Import-PwsshSource -CsSource $CsSource
+
+    if ($CreditMiB -gt 0) { [Pwssh.PwsshAgentHost]::InitialCredit = [uint32]($CreditMiB * 1MB) }
 
     $agent = New-Object Pwssh.PwsshAgentHost
     # Pipes must exist before Start(), so the mules have something to connect to while the

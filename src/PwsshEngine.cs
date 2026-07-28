@@ -1224,12 +1224,19 @@ namespace Pwssh
         private readonly Queue<Chunk> outQ = new Queue<Chunk>();
         private readonly object outGate = new object();
 
-        // Credit is returned to the agent in batches. Granting per SSH packet meant ~256 tiny
-        // WINDOW frames for an 8 MiB download, all travelling upstream -- the slow direction --
-        // and competing with the download on the same link. The threshold must stay well below
-        // PwsshAgentHost.INITIAL_CREDIT so the agent never actually runs dry.
-        private const int GRANT_THRESHOLD = 1024 * 1024;
-        private long pendingGrant;
+        // Credit is returned to the agent in batches: granting per SSH packet meant ~256 tiny
+        // WINDOW frames for an 8 MiB download, all travelling upstream -- the slow direction.
+        //
+        // Crucially it is returned when data is *received and queued*, not after it reaches
+        // ssh. Granting after the send put two windows in series -- the agent's credit could
+        // only come back as fast as ssh drained its own 2 MB channel window, so a 48 MiB
+        // transfer serialised into ~48 upstream round trips and spent most of its time idle.
+        // Queue depth provides the backpressure instead.
+        private const int GRANT_THRESHOLD = 2 * 1024 * 1024;
+        private const long MAX_PENDING = 32L * 1024 * 1024;
+        private readonly object grantGate = new object();
+        private long pendingGrant;      // credit earned but not yet announced
+        private long pendingBytes;      // queued here, not yet handed to ssh
 
         private Thread sender;
         private volatile bool killed;
@@ -1271,6 +1278,42 @@ namespace Pwssh
             Chunk c = new Chunk();
             c.Kind = Chunk.DATA; c.Data = buffer; c.Offset = offset; c.Count = count; c.Stderr = stderr;
             Enqueue(c);
+            AccrueCredit(count);
+        }
+
+        // Credit is earned on arrival so it can travel back while ssh is still being fed, but
+        // is withheld once too much is queued here -- otherwise a slow ssh would let the agent
+        // fill this process's memory.
+        private void AccrueCredit(int received)
+        {
+            uint grant = 0;
+            lock (grantGate)
+            {
+                pendingBytes += received;
+                pendingGrant += received;
+                if (pendingGrant >= GRANT_THRESHOLD && pendingBytes < MAX_PENDING)
+                {
+                    grant = (uint)pendingGrant;
+                    pendingGrant = 0;
+                }
+            }
+            if (grant > 0) agent.GrantWindow(peerChannel, grant);
+        }
+
+        // Called as the sender drains the queue: releases any credit held back by MAX_PENDING.
+        private void ReleaseCredit(int sent)
+        {
+            uint grant = 0;
+            lock (grantGate)
+            {
+                pendingBytes -= sent;
+                if (pendingGrant >= GRANT_THRESHOLD && pendingBytes < MAX_PENDING)
+                {
+                    grant = (uint)pendingGrant;
+                    pendingGrant = 0;
+                }
+            }
+            if (grant > 0) agent.GrantWindow(peerChannel, grant);
         }
 
         public void OnAgentExit(uint status)
@@ -1333,7 +1376,11 @@ namespace Pwssh
                         c = outQ.Dequeue();
                     }
 
-                    if (c.Kind == Chunk.DATA) { SendData(c.Data, c.Offset, c.Count, c.Stderr); }
+                    if (c.Kind == Chunk.DATA)
+                    {
+                        SendData(c.Data, c.Offset, c.Count, c.Stderr);
+                        ReleaseCredit(c.Count);
+                    }
                     else if (c.Kind == Chunk.EXIT) { SendExitStatus(c.Status); }
                     else { SendEofAndClose(); return; }
                 }
@@ -1364,15 +1411,6 @@ namespace Pwssh
                 // Written straight from the source range into the packet buffer.
                 pkt.WriteChannelData(peerChannel, data, off, allowed, stderr);
                 off += allowed;
-
-                // Return credit in batches, so the agent's in-flight output stays bounded by
-                // the initial grant without flooding the upstream direction with tiny frames.
-                pendingGrant += allowed;
-                if (pendingGrant >= GRANT_THRESHOLD)
-                {
-                    agent.GrantWindow(peerChannel, (uint)pendingGrant);
-                    pendingGrant = 0;
-                }
             }
         }
 

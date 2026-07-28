@@ -646,10 +646,11 @@ namespace Pwssh
 
     public sealed class PwsshAgentHost : IByteReceiver
     {
-        // Granted at EXEC and topped up by WINDOW frames. Large and eagerly refilled: each
-        // WINDOW frame costs a full WinRM turnaround, so a small window would stall bulk
-        // output once per round trip.
-        public const uint INITIAL_CREDIT = 8 * 1024 * 1024;
+        // Granted at EXEC and topped up by WINDOW frames. Each WINDOW frame costs a full
+        // WinRM turnaround, so a small window stalls bulk output once per round trip -- but
+        // the credit is also what bounds how much the agent can push into the client's memory
+        // before it must wait. Tunable so the trade-off can be measured rather than guessed.
+        public static uint InitialCredit = 32 * 1024 * 1024;
 
         private readonly FrameQueue outbound = new FrameQueue();
         private readonly Dictionary<uint, AgentChannel> channels = new Dictionary<uint, AgentChannel>();
@@ -884,7 +885,7 @@ namespace Pwssh
         private readonly PwsshAgentHost host;
         private readonly uint channel;
         private readonly object creditGate = new object();
-        private long credit = PwsshAgentHost.INITIAL_CREDIT;
+        private long credit = PwsshAgentHost.InitialCredit;
 
         private Process proc;
         private int pumpsDone;

@@ -367,7 +367,33 @@ This only affects interactive `shell` responsiveness — bulk transfer already p
 
   Effect: `GC.AllocateUninitializedArray`, previously 8.8% of managed CPU, no longer appears in the profile's top frames. Throughput over 48 MiB measured 4.16–5.15 MiB/s (mean 4.80) against 4.58 before — unchanged within noise. Worth having for memory pressure; it was never going to be a speed win.
 
-  Two leads the post-refactor profile turned up, not yet investigated: `SharedArrayPool.InitializeTlsBucketsAndTrimming` pegging the **finalizer thread at 100% of a core**, and `Monitor.Enter_Slowpath` at 17% of managed CPU on a thread at 85%, suggesting real lock contention (candidates: `PacketLayer.writeGate`, `ByteChannel.gate`).
+### The profiler's CPU numbers are inflated — check them against the process
+
+Two leads from the post-refactor profile were investigated and **both were dead ends, one of them because the tool lied**.
+
+`SharedArrayPool.InitializeTlsBucketsAndTrimming` appeared to peg the finalizer thread at 100% of a core. Its full stack is `…Trimming` ← `Gen2GcCallback.Finalize` ← `GC.RunFinalizers`: the runtime's own array-pool trimming, not our allocation. And it is not real CPU. Ground truth settles it: during a 48 MiB transfer the proxy process used **0.33 cores average**, while the same trace attributed **1.89 cores**. The EventPipe sampler samples every managed thread on a timer and labels a managed top frame `CPU_TIME` whether or not the thread is running, so threads parked inside managed frames accumulate phantom CPU.
+
+**Always sanity-check a trace's absolute CPU against `Process.TotalProcessorTime`.** Relative ranking between genuinely busy threads still seems sound; absolute figures are not.
+
+The `Monitor.Enter_Slowpath` contention was real but not ours: the stack is `PSMemberSet.ReplicateInstance` ← `PSObject.GetPSStandardMember`, i.e. PowerShell's own member-collection locking while constructing received `PSObject`s. Same for `WindowsIdentity.GetTokenInformation` ← `ReceiveDataCollection.ProcessRawData` — SMA re-checks the impersonated identity for every received chunk. Nothing to fix on our side.
+
+### Credit round trips were the real bulk-transfer cost
+
+Chasing those leads turned up the actual problem. Facts that did not add up: the remote can produce and deflate the test payload at **43 MiB/s**, compression takes it to **0.9%** of its size (48 MiB → ~440 KB on the wire), and the client uses a third of a core — yet the transfer took 13 s.
+
+The cause was **two windows in series**. Credit was returned to the agent only *after* data had been written to ssh, so it was gated by ssh's own 2 MB channel window as well as costing a WinRM round trip per grant. A 48 MiB transfer serialised into dozens of upstream round trips.
+
+Fixed by returning credit when data is *received and queued* (`SessionChannel.AccrueCredit`), with queue depth (`MAX_PENDING`) providing the backpressure instead of ssh's consumption. Window size is now tunable via `-CreditMiB` (default 32), since the credit is also what bounds how much the agent can buffer in the client before it must wait.
+
+Interleaved over 48 MiB compressible, four rounds, credit 64 winning every round:
+
+| credit | throughput |
+|---|---|
+| 8 MiB | 4.71 MiB/s |
+| 32 MiB | 6.91 MiB/s |
+| 64 MiB | 7.76 MiB/s |
+
+32 MiB captures nearly all of it at half the worst-case memory, hence the default. Note the first single-sample measurement of this change read 6.04 and the second read 4.38 — **the spread on this transport is wide enough to invert a conclusion, and only the interleaved run settled it.**
 
   **Tooling note:** `dotnet-trace` from NuGet is 9.0 and produces an empty trace against pwsh 7.6, which runs on .NET 10 — 0 samples and a "potentially broken trace" warning. Version 10.0.731102 is not on NuGet (broken publish pipeline); get the signed binary from the [dotnet/diagnostics release](https://github.com/dotnet/diagnostics/releases/tag/v10.0.731102). Also make sure the traced process **outlives the trace duration**: if it exits mid-session the rundown never happens and stacks cannot be resolved. The speedscope output is *evented*, and hangs `CPU_TIME`/`UNMANAGED_CODE_TIME` pseudo-leaves under each real frame, so self time must be credited to the nearest real ancestor — and `UNMANAGED_CODE_TIME` is mostly blocked threads, not CPU.
 - **Encrypting before WinRM costs ~29× of throughput.** WinRM compression is enabled by default, and an SSH-encrypted payload is incompressible, so that compression is wasted. Measured downstream over 8 MiB, interleaved across 3 rounds: incompressible **0.36–0.39 MiB/s** versus compressible plaintext **6.3–11.3 MiB/s**. (The ratio is the reliable figure; absolute numbers vary between sessions — earlier runs on smaller payloads reached 3.5–4 MiB/s incompressible.) This is the strongest argument for terminating SSH in the client-side ProxyCommand rather than on the remote: it makes the WinRM payload plaintext, which also removes all crypto from the remote and turns the ~10 SSH handshake round trips into local ones.

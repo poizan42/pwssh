@@ -37,6 +37,9 @@ param(
     # downstream on incompressible data, 2 sessions ~2.7x and 4 sessions ~3.3x. Costs one
     # extra wsmprovhost per stream on the remote and ~1-2 s of setup each.
     [int]$Streams = 1,
+    # Bulk-transfer window in MiB. Larger means fewer credit round trips on big transfers,
+    # at the cost of how much the agent may buffer in this process before it has to wait.
+    [int]$CreditMiB = 32,
     [string]$LogFile,
     # Progress messages on stderr. Off by default: ssh shows the ProxyCommand's stderr
     # directly in the user's terminal, so it would be noise on every connection.
@@ -134,6 +137,7 @@ try {
     $null = $ps.AddParameter('CsSource', $agentSource)
     $null = $ps.AddParameter('CommonSource', $commonSource)
     if ($EmitRemoteLog) { $null = $ps.AddParameter('EmitLog', $true) }
+    $null = $ps.AddParameter('CreditMiB', $CreditMiB)
     if ($stripes -gt 0) {
         $null = $ps.AddParameter('PipePrefix', $pipePrefix)
         $null = $ps.AddParameter('Stripes', $stripes)
