@@ -25,7 +25,7 @@ function Import-PwsshSource {
 
     $isDesktop = ($PSVersionTable.PSEdition -eq 'Desktop') -or (-not $PSVersionTable.PSEdition)
     if ($isDesktop) {
-        Add-Type -TypeDefinition $CsSource -ReferencedAssemblies 'System.Numerics', 'System.Core', 'System' -ErrorAction Stop
+        Add-Type -TypeDefinition $CsSource -ReferencedAssemblies 'System.Numerics', 'System.Core', 'System', 'System.IO.Compression' -ErrorAction Stop
     }
     else {
         Add-Type -TypeDefinition $CsSource -ErrorAction Stop
