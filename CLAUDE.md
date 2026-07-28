@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns `REMOTEDOM\kb`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite passes against both transports (17/17 loopback, 18/18 WinRM; the WinRM run has the two extra graceful-degradation cases, the loopback run has the wrong-username check that the WinRM alias takes from `ssh_config`).
+**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns the remote's `DOMAIN\user`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite passes against both transports (17/17 loopback, 18/18 WinRM; the WinRM run has the two extra graceful-degradation cases, the loopback run has the wrong-username check that the WinRM alias takes from `ssh_config`).
 
 **SSH terminates in the client.** `pwssh-connect.ps1` runs the whole SSH engine locally and only plaintext agent frames cross the WinRM link. The remote does no cryptography at all. This was a deliberate change from an earlier design that ran the engine on the remote, and it bought:
 
