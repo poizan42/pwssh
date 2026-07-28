@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns the remote's `DOMAIN\user`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite runs 51–57 cases per transport: **WinRM is 57/57**, loopback **50/51** with one environmental exception — the pty case that this client machine's ConPTY breaks (see *Running and testing*). The two runs differ in composition rather than count — WinRM has the graceful-degradation and IPv6 cases plus the gateway-ports check; loopback has the wrong-username check that the WinRM alias takes from `ssh_config`, along with the reverse-forward release and bind-failure cases that need the far side to be this machine.
+**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns the remote's `DOMAIN\user`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite runs 54–61 cases per transport: **WinRM is 61/61**, loopback **53/54** with one environmental exception — the pty case that this client machine's ConPTY breaks (see *Running and testing*). The two runs differ in composition rather than count — WinRM has the graceful-degradation and IPv6 cases plus the gateway-ports check; loopback has the wrong-username check that the WinRM alias takes from `ssh_config`, along with the reverse-forward release and bind-failure cases that need the far side to be this machine.
 
 **A run that fails one case with `exit=255` is usually a flake, not a regression.** 255 is ssh's own error code for a connection that never came up, and it turns up after the remote has been hammered with dozens of sessions in a row. Re-run the case before believing it: the final WinRM run here failed "shell exit status propagates" that way and passed 3/3 immediately afterwards.
 
@@ -245,6 +245,14 @@ Other things load-bearing enough to state:
 - **A parked read has a 30 s deadline**, carried on the engine's existing watchdog tick. Parking is normally a fraction of a round trip, but a lost reply would otherwise hang the client for good — SFTP has no timeout of its own. Past the deadline the read goes to the remote after all, which is always safe: a parked read was never forwarded, so the remote has not seen it.
 - **Prefetch credit is released as bytes leave the buffer**, and synthesised chunks carry `Credit = 0`. Releasing the *sent* count rather than the *accrued* count drifts by 13 bytes per reply and eventually withholds the agent's window for good.
 - Tripling download throughput reaches OpenSSH's ~1 GiB rekey threshold three times sooner in wall-clock. Not a new bug — **no rekeying** is a known limit — but a nearer one.
+
+**The chunk-alignment assumption turned out not to be load-bearing.** That the client's read offsets are multiples of 261120 was inferred from its `-vvv` output, not read from its source, and the design was built so that a wrong guess would only cost hit ratio. `sftp -B 32768` and `-B 262144` are now in the suite and both download bit-exact, so the splice path is exercised rather than assumed. `-R 1` (no client pipelining at all) is there too, as is a run with read-ahead disabled — the path a valve trip degrades *to*, which is worth having end to end because everything else is worthless if the fallback is broken.
+
+What is **not** covered, and would need a client that behaves differently from `sftp`:
+
+- **A true mid-transfer backwards seek.** `reget` covers starting at a non-zero offset, but nothing in the stock client seeks backwards mid-file, so the `nonSequential` counter and the 3-restart thrash limit are reasoned about rather than tested. An `sshfs`-style client is what would exercise them.
+- **Two files prefetching at once.** Only one prefetch is active at a time by design — `sftp` and `scp -r` read one file after another — and the same-file-twice case covers handle cycling, but genuine concurrent handles do not arise from the CLI.
+- **A single transfer exceeding the credit pool** has no dedicated case, but the depth sweep crossed that boundary in anger: depth 128 asks for 33.4 MB against a 32 MiB credit and completed bit-exact twice, which is the condition the credit-deadlock worry was about.
 
 ### Striping across sessions (`-Streams N`, default 1)
 

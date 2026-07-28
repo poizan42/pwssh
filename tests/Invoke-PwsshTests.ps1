@@ -818,6 +818,45 @@ quit
     Assert-That 'the same file downloads twice in one session' (($hA -eq $hB) -and ($hA -notlike 'MISSING*')) `
         "$($r.Phase) a=$hA b=$hB"
 
+    # ---- 5f. buffer sizes the read-ahead was not designed around. Our chunks are 261120 bytes and
+    # the belief that the client's read offsets are multiples of that is an *inference* from its
+    # -vvv "using 65536 / 261120" line, not something read from its source. -B forces other sizes,
+    # so reads stop matching chunk boundaries and every one has to be spliced out of the buffer --
+    # and -R 1 removes the client's pipelining entirely, so each read is issued alone. A splice or
+    # accounting bug shows up here as corruption, which is why these assert hashes and not timing.
+    $idx522 = $dlEdges.IndexOf(522240)
+    if ($idx522 -ge 0) {
+        foreach ($variant in @(@('-B', '32768'), @('-B', '262144'), @('-R', '1'))) {
+            $vtag = ($variant -join '')
+            $vLocal = Join-Path $repo "tmp/sftp-v$vtag-$sftpTag.bin"
+            if (Test-Path $vLocal) { [System.IO.File]::Delete($vLocal) }
+            $r = Invoke-Sftp "get $farFwd/d522240.bin $($vLocal.Replace($bs,'/'))`nquit`n" "opt$vtag" $variant
+            $vh = if (Test-Path $vLocal) { Get-Sha ([System.IO.File]::ReadAllBytes($vLocal)) } else { 'MISSING' }
+            Assert-That "sftp $($variant -join ' ') downloads bit-exact" ($vh -eq $farHashes[$idx522]) `
+                "$($r.Phase) got $vh want $($farHashes[$idx522])"
+        }
+    }
+
+    # ---- 5g. read-ahead switched off is the valve's floor: the code path a trip degrades *to*,
+    # end to end. If this ever fails, no amount of read-ahead correctness matters, because the
+    # fallback is broken too. WinRM only, for the same reason as the fault case below.
+    if ($Port -eq 0) {
+        $offLocal = Join-Path $repo "tmp/sftp-raoff-$sftpTag.bin"
+        if (Test-Path $offLocal) { [System.IO.File]::Delete($offLocal) }
+        [Environment]::SetEnvironmentVariable('PWSSH_SFTP_READAHEAD_CHUNKS', '0')
+        try {
+            $r = Invoke-Sftp "get $farFwd/d522240.bin $($offLocal.Replace($bs,'/'))`nquit`n" 'raoff'
+        } finally {
+            [Environment]::SetEnvironmentVariable('PWSSH_SFTP_READAHEAD_CHUNKS', $null)
+        }
+        $oh = if (Test-Path $offLocal) { Get-Sha ([System.IO.File]::ReadAllBytes($offLocal)) } else { 'MISSING' }
+        Assert-That 'a download with read-ahead disabled is bit-exact' ($oh -eq $farHashes[$idx522]) `
+            "$($r.Phase) got $oh want $($farHashes[$idx522])"
+    }
+    else {
+        Write-Host '  SKIP  a download with read-ahead disabled is bit-exact (dev host: use -SftpReadAheadChunks 0)' -ForegroundColor DarkGray
+    }
+
     # ---- 6. listings show what is there, and render a directory as a directory
     $r = Invoke-Sftp "mkdir $farFwd/adir`nls -l $farFwd`nquit`n" 'lsl'
     Assert-That 'ls shows an uploaded file' ($r.Out -match 'up\.bin') `

@@ -141,7 +141,15 @@ try {
     $cfg.HostKey = $hostKey
     $cfg.Agent = $proxy          # ExpectedUser is left unset: resolved from the agent's HELLO
     $cfg.AllowGatewayPorts = [bool]$GatewayPorts
-    $cfg.SftpReadAheadChunks = $SftpReadAheadChunks
+    # The environment is consulted only when the parameter was not given, and exists for the same
+    # reason the fault hook does: the suite drives an unmodified ssh_config and cannot add a second
+    # alias per variation.
+    $cfg.SftpReadAheadChunks =
+        if ($PSBoundParameters.ContainsKey('SftpReadAheadChunks')) { $SftpReadAheadChunks }
+        elseif ($null -ne $env:PWSSH_SFTP_READAHEAD_CHUNKS -and $env:PWSSH_SFTP_READAHEAD_CHUNKS -ne '') {
+            [int]$env:PWSSH_SFTP_READAHEAD_CHUNKS
+        }
+        else { $SftpReadAheadChunks }
     $fault = if ($SftpFaultAfterKiB -gt 0) { $SftpFaultAfterKiB }
              elseif ($env:PWSSH_SFTP_FAULT_AFTER_KIB) { [int]$env:PWSSH_SFTP_FAULT_AFTER_KIB }
              else { 0 }
