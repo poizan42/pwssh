@@ -18,6 +18,7 @@ using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.IO.Pipes;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -52,6 +53,7 @@ namespace Pwssh
         public const byte PTY = 0x07;     // payload: uint32 cols, uint32 rows, UTF-8 term
         public const byte RESIZE = 0x08;  // payload: uint32 cols, uint32 rows
         public const byte SIGNAL = 0x09;  // payload: UTF-8 signal name
+        public const byte CONNECT = 0x0A; // payload: UTF-8 host, uint32 port (direct-tcpip)
 
         // agent -> client
         public const byte OUT = 0x81;     // payload: stdout bytes
@@ -60,6 +62,8 @@ namespace Pwssh
         public const byte DONE = 0x84;    // no payload: channel finished
         public const byte HELLO = 0x85;   // payload: UTF-8 remote account name
         public const byte FAIL = 0x86;    // payload: UTF-8 message
+        public const byte CONNECT_OK = 0x87;   // no payload: the outbound socket is up
+        public const byte CONNECT_FAIL = 0x88; // payload: UTF-8 reason
 
         // Flag bit: the payload is raw-deflate compressed. None of the types above use
         // 0x40, so it composes with any of them.
@@ -566,6 +570,9 @@ namespace Pwssh
         void Attach(IPwsshChannelSink sink);
         void Exec(uint channel, string command);
         void Shell(uint channel);
+        // direct-tcpip: the result arrives asynchronously via IPwsshChannelSink, because
+        // blocking the protocol loop on a remote connect would stall every other channel.
+        void Connect(uint channel, string host, int port);
         void RequestPty(uint channel, uint cols, uint rows, string term);
         void Resize(uint channel, uint cols, uint rows);
         void Signal(uint channel, string name);
@@ -589,6 +596,7 @@ namespace Pwssh
         void OnData(uint channel, byte[] buffer, int offset, int count, bool stderr);
         void OnExit(uint channel, uint status);
         void OnClose(uint channel);
+        void OnConnectResult(uint channel, bool ok, string message);
         void OnAgentError(string message);
     }
 
@@ -662,6 +670,12 @@ namespace Pwssh
                         Monitor.PulseAll(helloGate);
                     }
                     break;
+                case FrameType.CONNECT_OK:
+                    if (sink != null) sink.OnConnectResult(ch, true, null);
+                    break;
+                case FrameType.CONNECT_FAIL:
+                    if (sink != null) sink.OnConnectResult(ch, false, Frame.PayloadText(frame));
+                    break;
                 case FrameType.FAIL:
                     if (sink != null) sink.OnAgentError(Frame.PayloadText(frame));
                     break;
@@ -698,6 +712,13 @@ namespace Pwssh
         public void Shell(uint channel)
         {
             outbound.Enqueue(Frame.Make(FrameType.SHELL, channel, null));
+        }
+
+        public void Connect(uint channel, string host, int port)
+        {
+            SshLikeWriter w = new SshLikeWriter();
+            w.Text(host); w.UInt32((uint)port);
+            outbound.Enqueue(Frame.Make(FrameType.CONNECT, channel, w.ToArray()));
         }
 
         public void RequestPty(uint channel, uint cols, uint rows, string term)
@@ -780,6 +801,23 @@ namespace Pwssh
 
         // pty-req arrives before shell/exec, so the parameters wait here for the channel.
         private readonly Dictionary<uint, PtyRequest> pendingPty = new Dictionary<uint, PtyRequest>();
+
+        // Forwarded connections get their own, much smaller window: a SOCKS client can have
+        // dozens open at once, and the session default (32 MiB) each would be absurd. At a
+        // ~0.5 s round trip 2 MiB still sustains several MiB/s per channel.
+        public static uint InitialTcpCredit = 2 * 1024 * 1024;
+
+        private readonly Dictionary<uint, AgentTcpChannel> tcpChannels = new Dictionary<uint, AgentTcpChannel>();
+
+        private AgentTcpChannel FindTcp(uint ch)
+        {
+            lock (chanGate)
+            {
+                AgentTcpChannel c;
+                if (tcpChannels.TryGetValue(ch, out c)) return c;
+                return null;
+            }
+        }
 
         public bool Finished { get { return finished; } }
 
@@ -941,31 +979,53 @@ namespace Pwssh
                         }
                         break;
 
+                    case FrameType.CONNECT:
+                        {
+                            SshLikeReader r = new SshLikeReader(frame, Frame.HEADER);
+                            string target = r.Text();
+                            int port = (int)r.UInt32();
+                            AgentTcpChannel c = new AgentTcpChannel(this, ch);
+                            lock (chanGate) { tcpChannels[ch] = c; }
+                            c.BeginConnect(target, port);
+                        }
+                        break;
+
+                    // The remaining channel frames apply to either kind, so each looks in
+                    // both maps. A channel id is only ever in one of them.
                     case FrameType.DATA:
                         {
                             AgentChannel c = Find(ch);
-                            if (c != null) c.WriteStdin(frame, Frame.HEADER, Frame.PayloadLength(frame));
+                            if (c != null) { c.WriteStdin(frame, Frame.HEADER, Frame.PayloadLength(frame)); break; }
+                            AgentTcpChannel t = FindTcp(ch);
+                            if (t != null) t.Write(frame, Frame.HEADER, Frame.PayloadLength(frame));
                         }
                         break;
 
                     case FrameType.EOF:
                         {
                             AgentChannel c = Find(ch);
-                            if (c != null) c.CloseStdin();
+                            if (c != null) { c.CloseStdin(); break; }
+                            AgentTcpChannel t = FindTcp(ch);
+                            if (t != null) t.CloseWrite();
                         }
                         break;
 
                     case FrameType.CLOSE:
                         {
                             AgentChannel c = Find(ch);
-                            if (c != null) c.Kill();
+                            if (c != null) { c.Kill(); break; }
+                            AgentTcpChannel t = FindTcp(ch);
+                            if (t != null) t.Kill();
                         }
                         break;
 
                     case FrameType.WINDOW:
                         {
+                            uint add = Frame.PayloadUInt32(frame);
                             AgentChannel c = Find(ch);
-                            if (c != null) c.AddCredit(Frame.PayloadUInt32(frame));
+                            if (c != null) { c.AddCredit(add); break; }
+                            AgentTcpChannel t = FindTcp(ch);
+                            if (t != null) t.AddCredit(add);
                         }
                         break;
 
@@ -993,6 +1053,7 @@ namespace Pwssh
             lock (chanGate)
             {
                 foreach (AgentChannel c in channels.Values) { try { c.Kill(); } catch { } }
+                foreach (AgentTcpChannel t in tcpChannels.Values) { try { t.Kill(); } catch { } }
             }
             foreach (PipeSink p in stripes) { try { p.Close(); } catch { } }
             outbound.Close();
@@ -1036,7 +1097,7 @@ namespace Pwssh
 
         internal void Forget(uint ch)
         {
-            lock (chanGate) { channels.Remove(ch); }
+            lock (chanGate) { channels.Remove(ch); tcpChannels.Remove(ch); }
         }
     }
 
@@ -1640,6 +1701,163 @@ namespace Pwssh
             try { if (pty != null) pty.Kill(); } catch { }
             try { if (proc != null && !proc.HasExited) proc.Kill(); } catch { }
             try { if (job != null) job.Dispose(); } catch { }   // takes the child's children too
+        }
+    }
+
+    // -------------------------------------------------------------- forwarded TCP
+    //
+    // The remote end of a direct-tcpip channel: connect outbound, then be a byte pipe.
+    // Deliberately a sibling of AgentChannel rather than a subclass -- almost nothing is
+    // shared beyond credit accounting, and a socket has neither stderr nor an exit status.
+
+    internal sealed class AgentTcpChannel
+    {
+        private const int READ_BUFFER = 65536;
+
+        private readonly PwsshAgentHost host;
+        private readonly uint channel;
+        private readonly object creditGate = new object();
+        private long credit = PwsshAgentHost.InitialTcpCredit;
+
+        private TcpClient client;
+        private NetworkStream stream;
+        private volatile bool killed;
+
+        public AgentTcpChannel(PwsshAgentHost h, uint ch) { host = h; channel = ch; }
+
+        public void AddCredit(uint add)
+        {
+            lock (creditGate) { credit += add; Monitor.PulseAll(creditGate); }
+        }
+
+        // Connects on its own thread: this is called from the frame dispatch path, and a
+        // blocking connect there would stall every other channel.
+        public void BeginConnect(string hostName, int port)
+        {
+            Thread t = new Thread(new ThreadStart(delegate { Connect(hostName, port); }));
+            t.IsBackground = true;
+            t.Name = "pwssh-connect";
+            t.Start();
+        }
+
+        private void Connect(string hostName, int port)
+        {
+            try
+            {
+                TcpClient c = new TcpClient();
+                c.NoDelay = true;                 // forwarded traffic is usually latency-bound
+                c.Connect(hostName, port);
+                if (killed) { try { c.Close(); } catch { } return; }
+
+                client = c;
+                stream = c.GetStream();
+                host.Log("channel " + channel + " connected to " + hostName + ":" + port);
+                host.Send(Frame.Make(FrameType.CONNECT_OK, channel, null));
+
+                Thread pump = new Thread(new ThreadStart(Pump));
+                pump.IsBackground = true;
+                pump.Name = "pwssh-tcp-pump";
+                pump.Start();
+            }
+            catch (Exception ex)
+            {
+                host.Log("connect to " + hostName + ":" + port + " failed: " + ex.Message);
+                host.Send(Frame.MakeText(FrameType.CONNECT_FAIL, channel, ex.Message));
+                host.Forget(channel);
+            }
+        }
+
+        private void Pump()
+        {
+            byte[] buf = new byte[READ_BUFFER];
+            try
+            {
+                while (!killed)
+                {
+                    int n = stream.Read(buf, 0, buf.Length);
+                    if (n <= 0) break;
+
+                    // Same coalescing idea as the pipe pumps, but a socket cannot be peeked
+                    // with PeekNamedPipe -- Socket.Available answers the same question.
+                    if (!PwsshAgentHost.DisableCoalescing)
+                    {
+                        while (n < buf.Length && client.Client.Available > 0)
+                        {
+                            int more = stream.Read(buf, n, buf.Length - n);
+                            if (more <= 0) break;
+                            n += more;
+                        }
+                    }
+
+                    SendPayload(buf, n);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!killed) host.Log("tcp pump ended: " + ex.Message);
+            }
+            finally
+            {
+                // No exit status for a socket; DONE alone closes the channel.
+                host.Send(Frame.Make(FrameType.DONE, channel, null));
+                host.Forget(channel);
+            }
+        }
+
+        private void SendPayload(byte[] buf, int count)
+        {
+            int off = 0;
+            while (off < count && !killed)
+            {
+                int allowed;
+                lock (creditGate)
+                {
+                    while (credit <= 0 && !killed) Monitor.Wait(creditGate, 500);
+                    if (killed) return;
+                    allowed = (int)Math.Min((long)(count - off), credit);
+                    credit -= allowed;
+                }
+                if (allowed <= 0) continue;
+
+                byte[] packed = null;
+                try { packed = Zip.Deflate(buf, off, allowed); }
+                catch (Exception ex) { host.Log("deflate failed: " + ex.Message); }
+
+                if (packed != null && packed.Length < allowed - (allowed / 8))
+                {
+                    host.Send(Frame.Make((byte)(FrameType.OUT | FrameType.COMPRESSED), channel, packed));
+                }
+                else
+                {
+                    host.Send(Frame.Make(FrameType.OUT, channel, buf, off, allowed));
+                }
+                off += allowed;
+            }
+        }
+
+        public void Write(byte[] frame, int offset, int count)
+        {
+            if (count <= 0) return;
+            try
+            {
+                NetworkStream s = stream;
+                if (s != null) { s.Write(frame, offset, count); s.Flush(); }
+            }
+            catch (Exception ex) { host.Log("tcp write failed: " + ex.Message); }
+        }
+
+        // SSH channel EOF is a half-close, so shut down only our sending direction and let
+        // the peer keep replying.
+        public void CloseWrite()
+        {
+            try { if (client != null) client.Client.Shutdown(SocketShutdown.Send); } catch { }
+        }
+
+        public void Kill()
+        {
+            killed = true;
+            lock (creditGate) { Monitor.PulseAll(creditGate); }
+            try { if (client != null) client.Close(); } catch { }
         }
     }
 

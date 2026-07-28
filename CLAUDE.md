@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns the remote's `DOMAIN\user`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite passes against both transports (17/17 loopback, 18/18 WinRM; the WinRM run has the two extra graceful-degradation cases, the loopback run has the wrong-username check that the WinRM alias takes from `ssh_config`).
+**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns the remote's `DOMAIN\user`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite passes against both transports (22/22 loopback, 23/23 WinRM; the WinRM run has the two extra graceful-degradation cases, the loopback run has the wrong-username check that the WinRM alias takes from `ssh_config`).
 
 **SSH terminates in the client.** `pwssh-connect.ps1` runs the whole SSH engine locally and only plaintext agent frames cross the WinRM link. The remote does no cryptography at all. This was a deliberate change from an earlier design that ran the engine on the remote, and it bought:
 
@@ -15,9 +15,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The throughput gain is WinRM's own compression, which an encrypted stream made useless. The same suite reports **0.31 MiB/s for an incompressible 8 MiB payload** — essentially identical to what the old architecture managed on *compressible* data, which is exactly what the mechanism predicts and a good confirmation of it.
 
-Implemented: version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, `none` auth with username matching, session channel, `exec`, `shell`, `pty-req` via ConPTY, `window-change`, `signal`, exit status, stderr as `CHANNEL_EXTENDED_DATA`, window management, credit-based flow control to the agent.
+Implemented: version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, `none` auth with username matching, session channel, `exec`, `shell`, `pty-req` via ConPTY, `window-change`, `signal`, `direct-tcpip` forwarding (`-L`/`-D`/`-W`), exit status, stderr as `CHANNEL_EXTENDED_DATA`, window management, credit-based flow control to the agent.
 
-Not implemented: port forwarding, SFTP, rekeying.
+Not implemented: remote port forwarding (`-R`), SFTP, rekeying.
 
 **The host key is now purely ceremonial.** It authenticates this proxy, not the remote machine — nothing about it crosses the link. It still has to be stable, because the client pins it in `known_hosts`.
 
@@ -55,7 +55,7 @@ One transport item is exactly one frame; items cross intact and in order, so the
 [1 byte type][4 bytes big-endian channel id][4 bytes big-endian sequence][payload…]
 ```
 
-Client → agent: `0x01 EXEC`, `0x02 DATA` (stdin), `0x03 EOF`, `0x04 CLOSE`, `0x05 WINDOW`, `0x06 SHELL`, `0x07 PTY`, `0x08 RESIZE`, `0x09 SIGNAL`. Agent → client: `0x81 DATA`, `0x82 STDERR`, `0x83 EXIT`, `0x84 DONE`, `0x85 HELLO`, `0x86 FAIL`. The high bit marks direction. Channel ids exist so `direct-tcpip` can be added without reworking the protocol.
+Client → agent: `0x01 EXEC`, `0x02 DATA` (stdin), `0x03 EOF`, `0x04 CLOSE`, `0x05 WINDOW`, `0x06 SHELL`, `0x07 PTY`, `0x08 RESIZE`, `0x09 SIGNAL`, `0x0A CONNECT`. Agent → client: `0x81 DATA`, `0x82 STDERR`, `0x83 EXIT`, `0x84 DONE`, `0x85 HELLO`, `0x86 FAIL`, `0x87 CONNECT_OK`, `0x88 CONNECT_FAIL`. The high bit marks direction.
 
 `HELLO` carries `key=value` pairs (`user=kb;conpty=1`), not a bare account name — see the shell section.
 
@@ -92,6 +92,18 @@ Implementation notes that are easy to get wrong:
 It is worth less than it looks. Interleaved over `ls C:\Windows\System32` under a pty, three rounds, coalescing winning each: **5,264 ms of streaming versus 5,634 ms, so 1.07×**, with 10 stalls instead of 11. The reason the gain is small is instructive — of ~5.3 s of streaming, ~4.5 s is stalls either way, and those stalls are PowerShell taking ~5 s to *produce* the listing (measured remote-side: 1.75 MB in 4.9 s with no gap over 100 ms). Coalescing cannot batch data that does not exist yet. Two things follow: a slow producer, not the transport, sets the pace for chatty interactive output; and `-Streams` is useless here, measured at 0.83× with identical total stall time, because parallel receive threads do not shorten a turnaround.
 
 Note also that reading `FileStream.SafeFileHandle` flushes the stream, which a pipe cannot re-seek, so the handle is captured **before** the first read and the ConPTY streams are created unbuffered so the peek agrees with what is actually pending.
+
+### Port forwarding (`direct-tcpip`)
+
+`ssh -L`, `ssh -D` (SOCKS) and `ssh -W` all work, because the client does the listening and the SOCKS parsing itself and only asks us to open outbound connections — one channel type covers all three. `-R` is not implemented.
+
+- **Channels are multiplexed.** The engine keys them by *our* local id, allocated monotonically. Client channel numbers are recycled after close, so keying remote state on them risks a close/open collision; the channel object holds both identities.
+- **`CHANNEL_CLOSE` closes one channel, not the session.** The connection ends only on `DISCONNECT` or transport EOF. `ssh -N` therefore works with no session channel at all.
+- **A `direct-tcpip` open is answered with the real connect result**, which means it cannot be answered synchronously: whether the remote can reach the target is only known a round trip later, and blocking the protocol loop there would stall every other channel. So the open is recorded, `CONNECT` is sent, and `OnConnectResult` sends either the confirmation or `CHANNEL_OPEN_FAILURE` with reason 2. That is what makes ssh print a real `connect failed: ... actively refused it` instead of handing the user a dead tunnel.
+- **Forwarded channels get a much smaller window** (`InitialTcpCredit`, 2 MiB) than session channels (`-CreditMiB`, 32 MiB): a SOCKS client can hold dozens open at once. The cost is bulk through a single forward measuring ~0.85 MiB/s against ~1.2 MiB/s for a session channel; raise `InitialTcpCredit` if single-stream forwarded bulk ever matters more than many-channel memory.
+- The pipe pumps coalesce with `PeekNamedPipe`, which does not work on sockets — `AgentTcpChannel` uses `Socket.Available` for the same test.
+
+Measured: four concurrent forwarded connections complete in the time of about one (1.6 s), so opens pipeline rather than serialising. Bulk through a forward is bit-exact over 8 MiB.
 
 ### Striping across sessions (`-Streams N`, default 1)
 

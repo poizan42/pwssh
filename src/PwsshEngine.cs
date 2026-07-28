@@ -1067,24 +1067,53 @@ namespace Pwssh
             int live;
             lock (chanGate) { live = channels.Count; }
 
-            if (!authenticated || kind != "session" || live >= MAX_CHANNELS)
+            if (!authenticated || live >= MAX_CHANNELS)
             {
-                string why = !authenticated ? "not authenticated"
-                           : (live >= MAX_CHANNELS ? "too many open channels"
-                                                   : "unsupported channel type: " + kind);
-                RejectChannelOpen(peerChannel, 3, why);
+                RejectChannelOpen(peerChannel, 3,
+                    authenticated ? "too many open channels" : "not authenticated");
                 return;
             }
 
-            uint localId;
-            SessionChannel c;
-            lock (chanGate)
+            if (kind == "session")
             {
-                localId = nextChannelId++;
-                c = new SessionChannel(this, pkt, cfg.Agent, localId, peerChannel, peerWindow, peerMaxPacket);
-                channels[localId] = c;
+                uint id = NewChannel(peerChannel, peerWindow, peerMaxPacket);
+                ConfirmChannelOpen(peerChannel, id);
+                Log("session channel " + id + " open");
+                return;
             }
 
+            if (kind == "direct-tcpip")
+            {
+                string target = r.StrUtf8();
+                uint targetPort = r.UInt32();
+                r.StrUtf8();                 // originator address, unused
+                r.UInt32();                  // originator port, unused
+
+                uint id = NewChannel(peerChannel, peerWindow, peerMaxPacket);
+                Log("direct-tcpip channel " + id + " -> " + target + ":" + targetPort);
+
+                // No reply yet. Whether the remote can reach that address is only known after
+                // a round trip, and blocking here would stall every other channel, so the
+                // confirmation is sent from OnConnectResult.
+                Find(id).StartConnect(target, (int)targetPort);
+                return;
+            }
+
+            RejectChannelOpen(peerChannel, 3, "unsupported channel type: " + kind);
+        }
+
+        private uint NewChannel(uint peerChannel, uint peerWindow, uint peerMaxPacket)
+        {
+            lock (chanGate)
+            {
+                uint id = nextChannelId++;
+                channels[id] = new SessionChannel(this, pkt, cfg.Agent, id, peerChannel, peerWindow, peerMaxPacket);
+                return id;
+            }
+        }
+
+        private void ConfirmChannelOpen(uint peerChannel, uint localId)
+        {
             SshWriter w = new SshWriter();
             w.Byte(Msg.CHANNEL_OPEN_CONFIRMATION);
             w.UInt32(peerChannel);
@@ -1092,7 +1121,6 @@ namespace Pwssh
             w.UInt32(INITIAL_WINDOW);
             w.UInt32(MAX_PACKET);
             pkt.WritePacket(w.ToArray());
-            Log("session channel " + localId + " open");
         }
 
         private void RejectChannelOpen(uint peerChannel, uint reason, string text)
@@ -1205,6 +1233,27 @@ namespace Pwssh
         {
             SessionChannel c = Find(ch);
             if (c != null) c.OnAgentClose();
+        }
+
+        // Completes a direct-tcpip open. Reason 2 is SSH_OPEN_CONNECT_FAILED, which is what
+        // makes ssh print a useful "connect failed" rather than silently handing the user a
+        // dead tunnel.
+        public void OnConnectResult(uint ch, bool ok, string message)
+        {
+            SessionChannel c = Find(ch);
+            if (c == null) return;
+
+            if (ok)
+            {
+                ConfirmChannelOpen(c.PeerChannel, ch);
+                c.BeginForwarding();
+                Log("channel " + ch + " forward established");
+            }
+            else
+            {
+                RejectChannelOpen(c.PeerChannel, 2, string.IsNullOrEmpty(message) ? "connect failed" : message);
+                ForgetChannel(ch);
+            }
         }
 
         public void OnAgentError(string message)
@@ -1379,6 +1428,13 @@ namespace Pwssh
             agent.Shell(localId);
             return true;
         }
+
+        // direct-tcpip. The sender thread deliberately does not start here: nothing may be
+        // written to the client until the channel has been confirmed, which happens only once
+        // the remote socket is actually up.
+        public void StartConnect(string host, int port) { agent.Connect(localId, host, port); }
+
+        public void BeginForwarding() { BeginSending(); }
 
         private bool BeginSending()
         {

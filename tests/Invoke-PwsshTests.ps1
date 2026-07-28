@@ -18,6 +18,14 @@ param(
     # path can be exercised on a remote that does support ConPTY.
     [string]$DegradedTarget,
     [string]$DegradedConfigFile,
+    # host:port that is reachable *from the far side* and sends something on connect. For the
+    # WinRM target its own WinRM listener works; for the loopback host, the dev host's own
+    # port works, since an SSH server greets with its identification string.
+    [string]$ForwardTarget,
+    [string]$ForwardExpect = 'HTTP/1\.1|^SSH-',
+    # 0 picks a free port at run time. A fixed one collides with leftovers from a previous
+    # run and then the failure looks like a forwarding bug rather than a bind conflict.
+    [int]$ForwardLocalPort = 0,
     [switch]$SkipLarge
 )
 
@@ -249,6 +257,107 @@ if ($DegradedTarget) {
     $so = [System.Text.Encoding]::ASCII.GetString($r.Stdout)
     Assert-That 'shell still works without ConPTY' ($so -match 'hello-degraded') `
         "stdout='$($so -replace '\s+', ' ')'"
+}
+
+# ------------------------------------------------------------ 7c. port forwarding
+if ($ForwardTarget) {
+    $probe = [System.Text.Encoding]::ASCII.GetBytes("GET / HTTP/1.0`r`nHost: localhost`r`n`r`n")
+
+    # -W is the simplest forward: our stdin goes to the remote socket, its replies to stdout.
+    $r = Invoke-Ssh -Command '' -Extra @('-W', $ForwardTarget) -StdinBytes $probe
+    $so = [System.Text.Encoding]::ASCII.GetString($r.Stdout)
+    Assert-That 'stdio forward (-W) reaches the target' ($so -match $ForwardExpect) `
+        "got '$(($so -split "`r?`n")[0])' stderr='$($r.Stderr)'"
+
+    # A refused connection must be reported as a channel-open failure, not left as a tunnel
+    # that silently swallows data. Port 9 (discard) is not listening on the test remote.
+    $r = Invoke-Ssh -Command '' -Extra @('-W', '127.0.0.1:9') -StdinBytes $probe
+    Assert-That 'refused forward reports failure' `
+        (($r.ExitCode -ne 0) -and ($r.Stderr -match 'open failed|connect failed|forwarding failed')) `
+        "exit=$($r.ExitCode) stderr='$($r.Stderr)'"
+
+    # -L exercises the client-side listener, and -N proves the engine copes with a connection
+    # that never opens a session channel at all.
+    if ($ForwardLocalPort -le 0) {
+        $probeListener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+        $probeListener.Start()
+        $ForwardLocalPort = $probeListener.LocalEndpoint.Port
+        $probeListener.Stop()
+    }
+
+    $lpsi = New-Object System.Diagnostics.ProcessStartInfo
+    $lpsi.FileName = 'ssh'
+    foreach ($a in (Get-SshArgs '' @('-N', '-L', "${ForwardLocalPort}:$ForwardTarget"))) { $lpsi.ArgumentList.Add($a) }
+    $lpsi.UseShellExecute = $false
+    $lpsi.RedirectStandardOutput = $true; $lpsi.RedirectStandardError = $true
+    $lp = [System.Diagnostics.Process]::Start($lpsi)
+    $lErr = $lp.StandardError.ReadToEndAsync()
+    $null = $lp.StandardOutput.ReadToEndAsync()
+
+    function Test-LocalPort([int]$port) {
+        try { $c = New-Object System.Net.Sockets.TcpClient; $c.Connect('127.0.0.1', $port); $c.Close(); $true }
+        catch { $false }
+    }
+    $deadline = (Get-Date).AddSeconds(60)
+    while (-not (Test-LocalPort $ForwardLocalPort) -and (Get-Date) -lt $deadline -and -not $lp.HasExited) {
+        Start-Sleep -Milliseconds 300
+    }
+    # Never touch $lErr.Result while ssh is still running: reading it blocks until the stream
+    # closes, i.e. until ssh exits, which stalls the test until the session idle-times out.
+    Assert-That 'local forward (-L -N) listens' (Test-LocalPort $ForwardLocalPort) `
+        "ssh already exited=$($lp.HasExited) on port $ForwardLocalPort"
+
+    function Probe-Local([int]$port) {
+        try {
+            $c = New-Object System.Net.Sockets.TcpClient
+            $c.Connect('127.0.0.1', $port)
+            $s = $c.GetStream(); $s.ReadTimeout = 40000
+            $q = [System.Text.Encoding]::ASCII.GetBytes("GET / HTTP/1.0`r`nHost: localhost`r`n`r`n")
+            $s.Write($q, 0, $q.Length); $s.Flush()
+            $b = New-Object byte[] 4096
+            $n = $s.Read($b, 0, $b.Length)
+            $c.Close()
+            if ($n -le 0) { return '' }
+            return [System.Text.Encoding]::ASCII.GetString($b, 0, $n)
+        }
+        catch { return '' }
+    }
+
+    $probed = Probe-Local $ForwardLocalPort
+    Assert-That 'local forward carries a connection' ($probed -match $ForwardExpect) `
+        "port $ForwardLocalPort got '$(($probed -split "`r?`n")[0])'"
+
+    # Several at once: this is what the multi-channel work was for.
+    $shells = 1..4 | ForEach-Object {
+        [powershell]::Create().AddScript({
+            param($port, $expect)
+            try {
+                $c = New-Object System.Net.Sockets.TcpClient
+                $c.Connect('127.0.0.1', $port)
+                $s = $c.GetStream(); $s.ReadTimeout = 40000
+                $q = [System.Text.Encoding]::ASCII.GetBytes("GET / HTTP/1.0`r`nHost: localhost`r`n`r`n")
+                $s.Write($q, 0, $q.Length); $s.Flush()
+                $b = New-Object byte[] 4096
+                $n = $s.Read($b, 0, $b.Length)
+                $c.Close()
+                ($n -gt 0) -and ([System.Text.Encoding]::ASCII.GetString($b, 0, $n) -match $expect)
+            }
+            catch { $false }
+        }).AddArgument($ForwardLocalPort).AddArgument($ForwardExpect)
+    }
+    $hs = $shells | ForEach-Object { $_.BeginInvoke() }
+    $okCount = 0
+    for ($i = 0; $i -lt $shells.Count; $i++) {
+        if (($shells[$i].EndInvoke($hs[$i]) | Select-Object -First 1) -eq $true) { $okCount++ }
+        $shells[$i].Dispose()
+    }
+    Assert-That 'four concurrent forwarded connections' ($okCount -eq 4) "$okCount of 4 succeeded"
+
+    try { if (-not $lp.HasExited) { $lp.Kill() } } catch { }
+    $lp.WaitForExit(5000) | Out-Null
+    # Safe to read now that ssh has exited.
+    $lStderr = ($lErr.Result -split "`r?`n" | Where-Object { $_ -and $_ -notmatch 'Killed by' }) -join ' | '
+    if ($lStderr) { Write-Host ("        forward ssh stderr: {0}" -f $lStderr) -ForegroundColor DarkGray }
 }
 
 # --------------------------------------------------------- 8. username rejected
