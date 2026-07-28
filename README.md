@@ -26,11 +26,11 @@ and `Ctrl+C`, where the remote supports ConPTY.
 
 | | |
 |---|---|
-| Implemented | version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, session channels, `exec`, `shell`, `pty-req` (ConPTY), `window-change`, `signal`, `direct-tcpip` forwarding (`-L`, `-D`, `-W`), exit status, separate stderr, flow control |
+| Implemented | version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, session channels, `exec`, `shell`, `pty-req` (ConPTY), `window-change`, `signal`, `direct-tcpip` forwarding (`-L`, `-D`, `-W`; IPv4 and IPv6), exit status, separate stderr, flow control |
 | Not implemented | remote forwarding (`-R`), SFTP subsystem, rekeying |
 
 Tested against OpenSSH 9.5p2 on Windows, with a Windows PowerShell 5.1 / .NET Framework 4.8
-remote. The test suite drives the real `ssh` binary: 23 cases over WinRM, 22 against a
+remote. The test suite drives the real `ssh` binary: 24 cases over WinRM, 22 against a
 loopback dev host.
 
 ## What it needs on the remote

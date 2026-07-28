@@ -23,6 +23,9 @@ param(
     # port works, since an SSH server greets with its identification string.
     [string]$ForwardTarget,
     [string]$ForwardExpect = 'HTTP/1\.1|^SSH-',
+    # Optional IPv6 form of the same target, e.g. '[::1]:5985'. Only meaningful where the far
+    # side actually listens on IPv6; the loopback dev host binds IPv4 only.
+    [string]$ForwardTarget6,
     # 0 picks a free port at run time. A fixed one collides with leftovers from a previous
     # run and then the failure looks like a forwarding bug rather than a bind conflict.
     [int]$ForwardLocalPort = 0,
@@ -268,6 +271,15 @@ if ($ForwardTarget) {
     $so = [System.Text.Encoding]::ASCII.GetString($r.Stdout)
     Assert-That 'stdio forward (-W) reaches the target' ($so -match $ForwardExpect) `
         "got '$(($so -split "`r?`n")[0])' stderr='$($r.Stderr)'"
+
+    # IPv6 must work too. This regressed once because TcpClient's default constructor makes an
+    # IPv4-only socket, so an IPv6 target failed with a nonsensical WSAENOTCONN.
+    if ($ForwardTarget6) {
+        $r = Invoke-Ssh -Command '' -Extra @('-W', $ForwardTarget6) -StdinBytes $probe
+        $so6 = [System.Text.Encoding]::ASCII.GetString($r.Stdout)
+        Assert-That 'stdio forward reaches an IPv6 target' ($so6 -match $ForwardExpect) `
+            "target $ForwardTarget6 got '$(($so6 -split "`r?`n")[0])' stderr='$($r.Stderr)'"
+    }
 
     # A refused connection must be reported as a channel-open failure, not left as a tunnel
     # that silently swallows data. Port 9 (discard) is not listening on the test remote.

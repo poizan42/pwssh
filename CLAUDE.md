@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns the remote's `DOMAIN\user`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite passes against both transports (22/22 loopback, 23/23 WinRM; the WinRM run has the two extra graceful-degradation cases, the loopback run has the wrong-username check that the WinRM alias takes from `ssh_config`).
+**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns the remote's `DOMAIN\user`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite passes against both transports (22/22 loopback, 24/24 WinRM; the WinRM run has the two extra graceful-degradation cases, the loopback run has the wrong-username check that the WinRM alias takes from `ssh_config`).
 
 **SSH terminates in the client.** `pwssh-connect.ps1` runs the whole SSH engine locally and only plaintext agent frames cross the WinRM link. The remote does no cryptography at all. This was a deliberate change from an earlier design that ran the engine on the remote, and it bought:
 
@@ -15,7 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The throughput gain is WinRM's own compression, which an encrypted stream made useless. The same suite reports **0.31 MiB/s for an incompressible 8 MiB payload** — essentially identical to what the old architecture managed on *compressible* data, which is exactly what the mechanism predicts and a good confirmation of it.
 
-Implemented: version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, `none` auth with username matching, session channel, `exec`, `shell`, `pty-req` via ConPTY, `window-change`, `signal`, `direct-tcpip` forwarding (`-L`/`-D`/`-W`), exit status, stderr as `CHANNEL_EXTENDED_DATA`, window management, credit-based flow control to the agent.
+Implemented: version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, `none` auth with username matching, session channel, `exec`, `shell`, `pty-req` via ConPTY, `window-change`, `signal`, `direct-tcpip` forwarding (`-L`/`-D`/`-W`, IPv4 and IPv6), exit status, stderr as `CHANNEL_EXTENDED_DATA`, window management, credit-based flow control to the agent.
 
 Not implemented: remote port forwarding (`-R`), SFTP, rekeying.
 
@@ -102,6 +102,9 @@ Note also that reading `FileStream.SafeFileHandle` flushes the stream, which a p
 - **A `direct-tcpip` open is answered with the real connect result**, which means it cannot be answered synchronously: whether the remote can reach the target is only known a round trip later, and blocking the protocol loop there would stall every other channel. So the open is recorded, `CONNECT` is sent, and `OnConnectResult` sends either the confirmation or `CHANNEL_OPEN_FAILURE` with reason 2. That is what makes ssh print a real `connect failed: ... actively refused it` instead of handing the user a dead tunnel.
 - **Forwarded channels get a much smaller window** (`InitialTcpCredit`, 2 MiB) than session channels (`-CreditMiB`, 32 MiB): a SOCKS client can hold dozens open at once. The cost is bulk through a single forward measuring ~0.85 MiB/s against ~1.2 MiB/s for a session channel; raise `InitialTcpCredit` if single-stream forwarded bulk ever matters more than many-channel memory.
 - The pipe pumps coalesce with `PeekNamedPipe`, which does not work on sockets — `AgentTcpChannel` uses `Socket.Available` for the same test.
+- **Never connect with `new TcpClient()`.** Its default constructor produces an `AddressFamily.InterNetwork` (IPv4) socket, so an IPv6 target fails with a nonsensical `WSAENOTCONN` — *"A request to send or receive data was disallowed because the socket is not connected"* — rather than a routing error. It also meant a host with both AAAA and A records never fell back to IPv4. `AgentTcpChannel` resolves the name, strips a bracketed IPv6 literal, and tries each address with a socket of that address family.
+- **Each attempt is capped at 8 s when there is more than one candidate address.** A dual-stack host with dead IPv6 otherwise burns the OS connect timeout (~21 s observed) before trying IPv4, which is intolerable for SOCKS browsing. A single candidate keeps the OS default so a legitimately slow target still works.
+- `ssh` itself rejects a bare `::1:5985` in `-W` with "Bad stdio forwarding specification"; IPv6 literals need brackets. Not our parsing.
 
 Measured: four concurrent forwarded connections complete in the time of about one (1.6 s), so opens pipeline rather than serialising. Bulk through a forward is bit-exact over 8 MiB.
 

@@ -18,6 +18,7 @@ using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.IO.Pipes;
+using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -1719,7 +1720,7 @@ namespace Pwssh
         private readonly object creditGate = new object();
         private long credit = PwsshAgentHost.InitialTcpCredit;
 
-        private TcpClient client;
+        private Socket sock;
         private NetworkStream stream;
         private volatile bool killed;
 
@@ -1742,29 +1743,84 @@ namespace Pwssh
 
         private void Connect(string hostName, int port)
         {
-            try
-            {
-                TcpClient c = new TcpClient();
-                c.NoDelay = true;                 // forwarded traffic is usually latency-bound
-                c.Connect(hostName, port);
-                if (killed) { try { c.Close(); } catch { } return; }
+            IPAddress[] addrs;
+            try { addrs = Resolve(hostName); }
+            catch (Exception ex) { Fail("cannot resolve " + hostName + ": " + ex.Message); return; }
+            if (addrs.Length == 0) { Fail("no addresses for " + hostName); return; }
 
-                client = c;
-                stream = c.GetStream();
-                host.Log("channel " + channel + " connected to " + hostName + ":" + port);
-                host.Send(Frame.Make(FrameType.CONNECT_OK, channel, null));
+            // With more than one candidate, cap each attempt: an unroutable address family
+            // otherwise burns the OS connect timeout (~21 s observed) before the next address
+            // is tried, which is exactly the case a dual-stack host with dead IPv6 hits. A
+            // single candidate keeps the OS default, so a legitimately slow target still works.
+            int perAddressMs = (addrs.Length > 1) ? 8000 : -1;
 
-                Thread pump = new Thread(new ThreadStart(Pump));
-                pump.IsBackground = true;
-                pump.Name = "pwssh-tcp-pump";
-                pump.Start();
-            }
-            catch (Exception ex)
+            Exception last = null;
+            for (int i = 0; i < addrs.Length && !killed; i++)
             {
-                host.Log("connect to " + hostName + ":" + port + " failed: " + ex.Message);
-                host.Send(Frame.MakeText(FrameType.CONNECT_FAIL, channel, ex.Message));
-                host.Forget(channel);
+                Socket s = null;
+                try
+                {
+                    // A socket per address family. TcpClient's default constructor produces an
+                    // IPv4-only socket, so pointing it at an IPv6 address fails with a bogus
+                    // "socket is not connected" (WSAENOTCONN) instead of a routing error --
+                    // which also meant a host with both AAAA and A records never fell back.
+                    s = new Socket(addrs[i].AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+                    s.NoDelay = true;             // forwarded traffic is usually latency-bound
+
+                    if (perAddressMs < 0)
+                    {
+                        s.Connect(new IPEndPoint(addrs[i], port));
+                    }
+                    else
+                    {
+                        IAsyncResult ar = s.BeginConnect(new IPEndPoint(addrs[i], port), null, null);
+                        if (!ar.AsyncWaitHandle.WaitOne(perAddressMs))
+                            throw new TimeoutException("connect timed out after " + perAddressMs + " ms");
+                        s.EndConnect(ar);
+                    }
+
+                    if (killed) { try { s.Close(); } catch { } return; }
+
+                    sock = s;
+                    stream = new NetworkStream(s, false);
+                    host.Log("channel " + channel + " connected to " + addrs[i] + ":" + port);
+                    host.Send(Frame.Make(FrameType.CONNECT_OK, channel, null));
+
+                    Thread pump = new Thread(new ThreadStart(Pump));
+                    pump.IsBackground = true;
+                    pump.Name = "pwssh-tcp-pump";
+                    pump.Start();
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    // Try the next address: a target with both AAAA and A records should still
+                    // work on a host whose IPv6 has no route.
+                    last = ex;
+                    host.Log("channel " + channel + " could not reach " + addrs[i] + ":" + port + ": " + ex.Message);
+                    if (s != null) { try { s.Close(); } catch { } }
+                }
             }
+
+            Fail(last == null ? "connect failed" : last.Message);
+        }
+
+        private static IPAddress[] Resolve(string hostName)
+        {
+            string h = (hostName == null) ? "" : hostName.Trim();
+            // SOCKS clients can hand over a bracketed IPv6 literal.
+            if (h.Length > 1 && h[0] == '[' && h[h.Length - 1] == ']') h = h.Substring(1, h.Length - 2);
+
+            IPAddress literal;
+            if (IPAddress.TryParse(h, out literal)) return new IPAddress[] { literal };
+            return Dns.GetHostAddresses(h);
+        }
+
+        private void Fail(string message)
+        {
+            host.Log("channel " + channel + " connect failed: " + message);
+            host.Send(Frame.MakeText(FrameType.CONNECT_FAIL, channel, message));
+            host.Forget(channel);
         }
 
         private void Pump()
@@ -1781,7 +1837,7 @@ namespace Pwssh
                     // with PeekNamedPipe -- Socket.Available answers the same question.
                     if (!PwsshAgentHost.DisableCoalescing)
                     {
-                        while (n < buf.Length && client.Client.Available > 0)
+                        while (n < buf.Length && sock.Available > 0)
                         {
                             int more = stream.Read(buf, n, buf.Length - n);
                             if (more <= 0) break;
@@ -1850,14 +1906,14 @@ namespace Pwssh
         // the peer keep replying.
         public void CloseWrite()
         {
-            try { if (client != null) client.Client.Shutdown(SocketShutdown.Send); } catch { }
+            try { if (sock != null) sock.Shutdown(SocketShutdown.Send); } catch { }
         }
 
         public void Kill()
         {
             killed = true;
             lock (creditGate) { Monitor.PulseAll(creditGate); }
-            try { if (client != null) client.Close(); } catch { }
+            try { if (sock != null) sock.Close(); } catch { }
         }
     }
 
