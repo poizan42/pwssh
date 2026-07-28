@@ -106,6 +106,8 @@ Note also that reading `FileStream.SafeFileHandle` flushes the stream, which a p
 - **Each attempt is capped at 8 s when there is more than one candidate address.** A dual-stack host with dead IPv6 otherwise burns the OS connect timeout (~21 s observed) before trying IPv4, which is intolerable for SOCKS browsing. A single candidate keeps the OS default so a legitimately slow target still works.
 - `ssh` itself rejects a bare `::1:5985` in `-W` with "Bad stdio forwarding specification"; IPv6 literals need brackets. Not our parsing.
 
+**`-D` against a remote without IPv6 logs benign failures.** Confirmed with Firefox: a SOCKS client hands over a literal address, so there is one candidate and no fallback inside pwssh, and every AAAA attempt ends as `channel N: open failed: connect failed: ...` once the connect times out. Nothing is wrong — browsers race the families in parallel, so pages load over IPv4 with no user-visible delay. `ssh -q` (or `LogLevel QUIET`) silences the messages and does not change the exit code; disabling IPv6 in the browser removes the attempts altogether. A per-connect timeout knob was considered and rejected: with the parallel racing there is nothing to gain.
+
 Measured: four concurrent forwarded connections complete in the time of about one (1.6 s), so opens pipeline rather than serialising. Bulk through a forward is bit-exact over 8 MiB.
 
 ### Striping across sessions (`-Streams N`, default 1)
