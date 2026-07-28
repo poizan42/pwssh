@@ -48,6 +48,12 @@ param(
     # 64 by measurement: 1.42x on 32 MiB, where 16 gave nothing at all and 128 gave less than
     # 64 because it asks for more than -CreditMiB allows to be in flight. Clamped to 128.
     [int]$SftpReadAheadChunks = 64,
+    # Testing hook: trip the SFTP read-ahead's safety valve part way through a transfer, once
+    # this many KiB have been served from the buffer. Also readable as
+    # PWSSH_SFTP_FAULT_AFTER_KIB, which is how the suite reaches it: ssh spawns this script
+    # fresh per connection and it inherits the test's environment, so one test process can
+    # exercise the valve without a second ssh_config alias to switch between.
+    [int]$SftpFaultAfterKiB = 0,
     # Testing hook: force the no-ConPTY path, so pty-req is refused and the shell falls
     # back to pipes even on a remote that supports ConPTY.
     [switch]$DisableConPty,
@@ -136,6 +142,10 @@ try {
     $cfg.Agent = $proxy          # ExpectedUser is left unset: resolved from the agent's HELLO
     $cfg.AllowGatewayPorts = [bool]$GatewayPorts
     $cfg.SftpReadAheadChunks = $SftpReadAheadChunks
+    $fault = if ($SftpFaultAfterKiB -gt 0) { $SftpFaultAfterKiB }
+             elseif ($env:PWSSH_SFTP_FAULT_AFTER_KIB) { [int]$env:PWSSH_SFTP_FAULT_AFTER_KIB }
+             else { 0 }
+    $cfg.SftpFaultAfterKiB = $fault
 
     $engine = New-Object Pwssh.PwsshEngine $cfg
     $engine.Start()

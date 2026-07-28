@@ -221,6 +221,7 @@ namespace Pwssh
         // counters. Cleared once reported, so a second CLOSE of the same handle stays quiet.
         private string lastPrefetchHandle;
         private bool reported;                   // keeps Kill() from repeating what CLOSE said
+        private readonly long faultAfterBytes;   // test hook; 0 is off
 
         // A depth beyond the agent's credit cannot be in flight however many requests are issued:
         // the far side blocks on its window instead of reading, which is measurable -- depth 128
@@ -240,6 +241,7 @@ namespace Pwssh
             depth = depthChunks > MAX_DEPTH ? MAX_DEPTH : depthChunks;
             if (depthChunks > MAX_DEPTH)
                 e.LogInternal("sftp read-ahead depth " + depthChunks + " clamped to " + MAX_DEPTH);
+            faultAfterBytes = (long)e.SftpFaultAfterKiB * 1024;
         }
 
         public bool IsPassthrough { get { return mode == Mode.Passthrough; } }
@@ -281,7 +283,10 @@ namespace Pwssh
         {
             lock (gate)
             {
-                if (mode == Mode.Passthrough) return;
+                // Deliberately NOT skipped in passthrough. Trip() abandons the prefetch and replays
+                // what was parked, so there should be nothing left -- but this is the backstop for
+                // a client that would otherwise wait for ever, and a backstop that trusts the thing
+                // it is backing up is not one.
                 Prefetch p = active;
                 if (p == null || p.Waiting.Count == 0) return;
                 if (unchecked(Environment.TickCount - p.Waiting.Peek().Tick) < PARK_DEADLINE_MS) return;
@@ -298,6 +303,15 @@ namespace Pwssh
             mode = Mode.Passthrough;
             valveTrips++;
             if (valveReason == null) valveReason = reason;
+            engine.LogInternal("sftp read-ahead valve tripped: " + reason);
+
+            // Abandoning is not optional here, and this was a hang waiting to happen. A read parked
+            // at the moment of the trip is waiting on data the prefetch would have delivered; going
+            // to passthrough means nothing ever will, and SFTP has no timeout to rescue the client.
+            // AbandonPrefetch replays those reads to the remote, which has never seen them and will
+            // answer each exactly once. Ordering is safe: the framer never forwards a partial
+            // message, so the agent's stream is at a message boundary whenever this runs.
+            AbandonPrefetch("valve tripped: " + reason);
         }
 
         // ---- client -> agent ----
@@ -520,6 +534,15 @@ namespace Pwssh
                 nonSequential++;
                 AbandonPrefetch("client read backwards");
                 return false;
+            }
+
+            // Test hook, checked here because this is the one place that is reliably part way
+            // through a transfer with a prefetch running and reads possibly parked -- the worst
+            // instant to degrade, which is exactly the instant worth testing.
+            if (faultAfterBytes > 0 && servedBytes >= faultAfterBytes)
+            {
+                Trip("fault injection after " + (servedBytes / 1024) + " KiB");
+                return false;                                    // forward this read as-is
             }
 
             // Either satisfiable now, or in flight and worth waiting for. Waiting costs a

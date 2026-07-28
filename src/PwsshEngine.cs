@@ -49,6 +49,14 @@ namespace Pwssh
         // reading. That is also why SftpReadAhead clamps: past the credit there is nothing to buy.
         public int SftpReadAheadChunks = 64;
 
+        // Test-only: trip the SFTP read-ahead's safety valve once this many KiB have been served
+        // from the buffer, part way through a transfer. 0 is off. The valve's whole claim is that
+        // degrading to passthrough at any instant still yields the right bytes, and a claim that
+        // is never exercised is not evidence -- this is what makes the test able to exercise it.
+        // It also earned its keep before it was used: writing it surfaced that Trip() orphaned
+        // parked reads, which would have hung the client outright.
+        public int SftpFaultAfterKiB;
+
         // If the client vanishes without closing the session, the remote pipeline would
         // otherwise block forever and hold a WinRM shell until WinRM's own (2 hour)
         // timeout. Bounded here instead. 0 disables.
@@ -1526,6 +1534,7 @@ namespace Pwssh
         internal void LogInternal(string m) { Log(m); }
         internal bool SftpReadAheadEnabled { get { return cfg.SftpReadAheadChunks > 0; } }
         internal int SftpReadAheadChunks { get { return cfg.SftpReadAheadChunks; } }
+        internal int SftpFaultAfterKiB { get { return cfg.SftpFaultAfterKiB; } }
 
         // ---- IPwsshChannelSink: called from the agent side, must not block ----
 

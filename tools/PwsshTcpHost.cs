@@ -24,26 +24,34 @@ namespace Pwssh.Dev
 
         public static void Run(int port, string hostKey, bool verbose, bool gatewayPorts, int latencyMs)
         {
-            Run(port, hostKey, verbose, gatewayPorts, latencyMs, -1);
+            Run(port, hostKey, verbose, gatewayPorts, latencyMs, -1, 0);
+        }
+
+        public static void Run(int port, string hostKey, bool verbose, bool gatewayPorts,
+                               int latencyMs, int readAheadChunks)
+        {
+            Run(port, hostKey, verbose, gatewayPorts, latencyMs, readAheadChunks, 0);
         }
 
         // readAheadChunks: -1 leaves PwsshConfig's default alone, which is what every caller that
         // is not specifically testing read-ahead wants. 0 disables it, and is how the suite gets a
         // byte-for-byte forwarding run to compare against without needing WinRM.
         public static void Run(int port, string hostKey, bool verbose, bool gatewayPorts,
-                               int latencyMs, int readAheadChunks)
+                               int latencyMs, int readAheadChunks, int faultAfterKiB)
         {
             TcpListener l = new TcpListener(IPAddress.Loopback, port);
             l.Start();
             Console.Error.WriteLine("[pwssh] listening on 127.0.0.1:" + port
                 + (latencyMs > 0 ? ("  latency " + latencyMs + " ms each way") : "")
-                + (readAheadChunks >= 0 ? ("  read-ahead " + readAheadChunks) : ""));
+                + (readAheadChunks >= 0 ? ("  read-ahead " + readAheadChunks) : "")
+                + (faultAfterKiB > 0 ? ("  VALVE FAULT after " + faultAfterKiB + " KiB") : ""));
             while (true)
             {
                 TcpClient c = l.AcceptTcpClient();
                 Thread t = new Thread(new ParameterizedThreadStart(Serve));
                 t.IsBackground = true;
-                t.Start(new object[] { c, hostKey, verbose, gatewayPorts, latencyMs, readAheadChunks });
+                t.Start(new object[] { c, hostKey, verbose, gatewayPorts, latencyMs,
+                                       readAheadChunks, faultAfterKiB });
             }
         }
 
@@ -56,6 +64,7 @@ namespace Pwssh.Dev
             bool gatewayPorts = (bool)a[3];
             int latencyMs = (int)a[4];
             int readAheadChunks = (int)a[5];
+            int faultAfterKiB = (int)a[6];
 
             Console.Error.WriteLine("[pwssh] connection from " + c.Client.RemoteEndPoint);
             PwsshEngine eng = null;
@@ -66,6 +75,7 @@ namespace Pwssh.Dev
                 cfg.HostKey = hostKey;
                 cfg.AllowGatewayPorts = gatewayPorts;
                 if (readAheadChunks >= 0) cfg.SftpReadAheadChunks = readAheadChunks;
+                cfg.SftpFaultAfterKiB = faultAfterKiB;
                 // In-process agent wired through the real frame protocol, so this harness
                 // exercises everything except the WinRM hop. ExpectedUser is deliberately left
                 // unset so the HELLO round trip is exercised too.

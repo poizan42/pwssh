@@ -915,6 +915,33 @@ quit
         Assert-That 'bulk sftp download is bit-exact (8 MiB)' ($bh -eq $mkBig) `
             "$($r.Phase) got $bh want $mkBig"
         Write-Host ("        sftp download: {0:N2} MiB/s (includes ~4-6 s of connect)" -f (8 / $sw.Elapsed.TotalSeconds)) -ForegroundColor DarkGray
+
+        # ---- 12b. the read-ahead's safety valve, exercised rather than claimed. It degrades to
+        # verbatim forwarding on any anomaly, and the whole argument for the private-channel design
+        # is that this is safe at ANY instant -- including part way through a transfer with a read
+        # parked on data already in flight. So trip it there deliberately and check the bytes.
+        #
+        # This is the case that would have caught a hang: Trip() used to abandon nothing, leaving
+        # parked reads with no one to answer them and no SFTP timeout to rescue the client.
+        #
+        # WinRM only. The dev host's engine lives in a process started before this script, so it
+        # cannot see the variable; there the same path is reached with -SftpFaultAfterKiB.
+        if ($Port -eq 0) {
+            $faultLocal = Join-Path $repo "tmp/sftp-fault-$sftpTag.bin"
+            if (Test-Path $faultLocal) { [System.IO.File]::Delete($faultLocal) }
+            [Environment]::SetEnvironmentVariable('PWSSH_SFTP_FAULT_AFTER_KIB', '2048')
+            try {
+                $r = Invoke-Sftp "get $farFwd/big.bin $($faultLocal.Replace($bs,'/'))`nquit`n" 'fault' @() '' '' 600000
+            } finally {
+                [Environment]::SetEnvironmentVariable('PWSSH_SFTP_FAULT_AFTER_KIB', $null)
+            }
+            $fh = if (Test-Path $faultLocal) { Get-Sha ([System.IO.File]::ReadAllBytes($faultLocal)) } else { 'MISSING' }
+            Assert-That 'a valve trip mid-transfer still downloads bit-exact' ($fh -eq $mkBig) `
+                "$($r.Phase) got $fh want $mkBig err='$($r.Err -replace "`r?`n", ' | ')'"
+        }
+        else {
+            Write-Host '  SKIP  a valve trip mid-transfer still downloads bit-exact (dev host: use -SftpFaultAfterKiB)' -ForegroundColor DarkGray
+        }
     }
 
     # ---- teardown

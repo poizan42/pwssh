@@ -23,6 +23,8 @@ param(
     # -1 leaves the engine's own default, so only a run that is specifically about read-ahead
     # has to name a value.
     [int]$SftpReadAheadChunks = -1,
+    # Testing hook: trip the read-ahead's safety valve after this many KiB have been served.
+    [int]$SftpFaultAfterKiB = 0,
     [switch]$Quiet
 )
 
@@ -45,4 +47,4 @@ Import-PwsshFiles -Path (@(Get-PwsshAgentFiles -Repo $repo) + @(
 $key = Get-PwsshHostKey -Path $HostKeyPath
 
 Write-Host "pwssh dev host: 127.0.0.1:$Port  hostkey=$HostKeyPath$(if ($LatencyMs -gt 0) { "  latency=${LatencyMs}ms" })"
-[Pwssh.Dev.TcpHost]::Run($Port, $key, (-not $Quiet), [bool]$GatewayPorts, $LatencyMs, $SftpReadAheadChunks)
+[Pwssh.Dev.TcpHost]::Run($Port, $key, (-not $Quiet), [bool]$GatewayPorts, $LatencyMs, $SftpReadAheadChunks, $SftpFaultAfterKiB)

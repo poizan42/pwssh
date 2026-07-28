@@ -32,7 +32,7 @@ implements the protocol itself.
 | Not implemented | rekeying, symlink creation |
 
 Tested against OpenSSH 9.5p2 on Windows, with a Windows PowerShell 5.1 / .NET Framework 4.8
-remote. The test suite drives the real `ssh`, `sftp` and `scp` binaries: 56 cases over WinRM and
+remote. The test suite drives the real `ssh`, `sftp` and `scp` binaries: 57 cases over WinRM and
 51 against a loopback dev host.
 
 Two warts worth knowing:
