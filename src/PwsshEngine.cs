@@ -462,7 +462,32 @@ namespace Pwssh
         private bool authenticated;
         private int authFailures;
 
-        private SessionChannel channel;
+        // Several channels can be live at once: ssh -L/-D opens one per forwarded connection,
+        // and a session channel closing must no longer end the whole connection.
+        //
+        // Keyed by OUR local channel id, which is also the id the agent uses. Ours are
+        // allocated monotonically and never reused, whereas the client recycles its channel
+        // numbers after close -- keying the agent on those risks a close/open collision.
+        private readonly Dictionary<uint, SessionChannel> channels = new Dictionary<uint, SessionChannel>();
+        private readonly object chanGate = new object();
+        private uint nextChannelId;
+
+        private const int MAX_CHANNELS = 256;
+
+        private SessionChannel Find(uint localId)
+        {
+            lock (chanGate)
+            {
+                SessionChannel c;
+                if (channels.TryGetValue(localId, out c)) return c;
+                return null;
+            }
+        }
+
+        private void ForgetChannel(uint localId)
+        {
+            lock (chanGate) { channels.Remove(localId); }
+        }
 
         public PwsshEngine(PwsshConfig config)
         {
@@ -521,7 +546,19 @@ namespace Pwssh
             finished = true;
             inbound.Close();
             outbound.Close();
-            if (channel != null) channel.Kill();
+            KillAllChannels();
+        }
+
+        private void KillAllChannels()
+        {
+            SessionChannel[] all;
+            lock (chanGate)
+            {
+                all = new SessionChannel[channels.Count];
+                channels.Values.CopyTo(all, 0);
+                channels.Clear();
+            }
+            for (int i = 0; i < all.Length; i++) { try { all[i].Kill(); } catch { } }
         }
 
         // Diagnostics are queued rather than delivered by callback: the engine logs from
@@ -573,7 +610,7 @@ namespace Pwssh
             finally
             {
                 finished = true;
-                if (channel != null) channel.Kill();
+                KillAllChannels();
                 // let the transport drain whatever is already queued
                 outbound.Close();
             }
@@ -849,21 +886,36 @@ namespace Pwssh
                     case Msg.CHANNEL_WINDOW_ADJUST:
                         {
                             SshReader r = new SshReader(payload);
-                            r.Byte(); r.UInt32();
+                            r.Byte();
+                            uint id = r.UInt32();
                             uint add = r.UInt32();
-                            if (channel != null) channel.AddRemoteWindow(add);
+                            SessionChannel wc = Find(id);
+                            if (wc != null) wc.AddRemoteWindow(add);
                         }
                         break;
 
                     case Msg.CHANNEL_EOF:
-                        if (channel != null) channel.ClientEof();
+                        {
+                            SshReader r = new SshReader(payload);
+                            r.Byte();
+                            SessionChannel ec = Find(r.UInt32());
+                            if (ec != null) ec.ClientEof();
+                        }
                         break;
 
                     case Msg.CHANNEL_CLOSE:
-                        Log("client closed channel");
-                        if (channel != null) channel.Kill();
-                        finished = true;
-                        return;
+                        {
+                            SshReader r = new SshReader(payload);
+                            r.Byte();
+                            uint id = r.UInt32();
+                            SessionChannel cc = Find(id);
+                            if (cc != null) { cc.Kill(); ForgetChannel(id); }
+                            Log("channel " + id + " closed by client");
+                            // Deliberately does NOT finish the session: other channels may
+                            // still be live. The connection ends on DISCONNECT or on transport
+                            // EOF when ssh closes our stdin.
+                        }
+                        break;
 
                     case Msg.DISCONNECT:
                         Log("client disconnected");
@@ -1012,28 +1064,47 @@ namespace Pwssh
             uint peerWindow = r.UInt32();
             uint peerMaxPacket = r.UInt32();
 
-            if (!authenticated || kind != "session" || channel != null)
+            int live;
+            lock (chanGate) { live = channels.Count; }
+
+            if (!authenticated || kind != "session" || live >= MAX_CHANNELS)
             {
-                SshWriter f = new SshWriter();
-                f.Byte(Msg.CHANNEL_OPEN_FAILURE);
-                f.UInt32(peerChannel);
-                f.UInt32(3);
-                f.Str(authenticated ? ("unsupported channel type: " + kind) : "not authenticated");
-                f.Str("");
-                pkt.WritePacket(f.ToArray());
+                string why = !authenticated ? "not authenticated"
+                           : (live >= MAX_CHANNELS ? "too many open channels"
+                                                   : "unsupported channel type: " + kind);
+                RejectChannelOpen(peerChannel, 3, why);
                 return;
             }
 
-            channel = new SessionChannel(this, pkt, cfg.Agent, peerChannel, peerWindow, peerMaxPacket);
+            uint localId;
+            SessionChannel c;
+            lock (chanGate)
+            {
+                localId = nextChannelId++;
+                c = new SessionChannel(this, pkt, cfg.Agent, localId, peerChannel, peerWindow, peerMaxPacket);
+                channels[localId] = c;
+            }
 
             SshWriter w = new SshWriter();
             w.Byte(Msg.CHANNEL_OPEN_CONFIRMATION);
             w.UInt32(peerChannel);
-            w.UInt32(0);                  // our channel id
+            w.UInt32(localId);
             w.UInt32(INITIAL_WINDOW);
             w.UInt32(MAX_PACKET);
             pkt.WritePacket(w.ToArray());
-            Log("session channel open");
+            Log("session channel " + localId + " open");
+        }
+
+        private void RejectChannelOpen(uint peerChannel, uint reason, string text)
+        {
+            SshWriter f = new SshWriter();
+            f.Byte(Msg.CHANNEL_OPEN_FAILURE);
+            f.UInt32(peerChannel);
+            f.UInt32(reason);
+            f.Str(text);
+            f.Str("");
+            pkt.WritePacket(f.ToArray());
+            Log("channel open rejected: " + text);
         }
 
         private void HandleChannelRequest(byte[] payload)
@@ -1044,6 +1115,7 @@ namespace Pwssh
             string req = r.StrUtf8();
             bool wantReply = r.Bool();
 
+            SessionChannel channel = Find(localChannel);
             bool ok = false;
             if (channel != null)
             {
@@ -1104,9 +1176,10 @@ namespace Pwssh
         {
             SshReader r = new SshReader(payload);
             r.Byte();
-            r.UInt32();
+            uint id = r.UInt32();
             byte[] data = r.Str();
-            if (channel != null) channel.WriteFromClient(data);
+            SessionChannel c = Find(id);
+            if (c != null) c.WriteFromClient(data);
         }
 
         internal void NotifyChannelFinished() { finished = true; }
@@ -1115,22 +1188,23 @@ namespace Pwssh
 
         // ---- IPwsshChannelSink: called from the agent side, must not block ----
 
+        // The agent addresses channels by our local id, so these are direct lookups.
         public void OnData(uint ch, byte[] buffer, int offset, int count, bool stderr)
         {
-            SessionChannel c = channel;
-            if (c != null && c.PeerChannel == ch) c.OnAgentData(buffer, offset, count, stderr);
+            SessionChannel c = Find(ch);
+            if (c != null) c.OnAgentData(buffer, offset, count, stderr);
         }
 
         public void OnExit(uint ch, uint status)
         {
-            SessionChannel c = channel;
-            if (c != null && c.PeerChannel == ch) c.OnAgentExit(status);
+            SessionChannel c = Find(ch);
+            if (c != null) c.OnAgentExit(status);
         }
 
         public void OnClose(uint ch)
         {
-            SessionChannel c = channel;
-            if (c != null && c.PeerChannel == ch) c.OnAgentClose();
+            SessionChannel c = Find(ch);
+            if (c != null) c.OnAgentClose();
         }
 
         public void OnAgentError(string message)
@@ -1246,6 +1320,9 @@ namespace Pwssh
         private readonly PwsshEngine engine;
         private readonly PacketLayer pkt;
         private readonly IPwsshAgent agent;
+        // Two identities: peerChannel addresses ssh, localId addresses the agent. They are
+        // different numbers because the client reuses its channel ids and we never do.
+        private readonly uint localId;
         private readonly uint peerChannel;
         private readonly uint peerMaxPacket;
 
@@ -1274,14 +1351,15 @@ namespace Pwssh
         private bool execStarted;
 
         public SessionChannel(PwsshEngine e, PacketLayer p, IPwsshAgent a,
-                              uint peer, uint window, uint maxPacket)
+                              uint local, uint peer, uint window, uint maxPacket)
         {
-            engine = e; pkt = p; agent = a; peerChannel = peer;
+            engine = e; pkt = p; agent = a; localId = local; peerChannel = peer;
             remoteWindow = window;
             peerMaxPacket = maxPacket == 0 ? 32768 : maxPacket;
         }
 
         public uint PeerChannel { get { return peerChannel; } }
+        public uint LocalId { get { return localId; } }
 
         public void AddRemoteWindow(uint add)
         {
@@ -1291,14 +1369,14 @@ namespace Pwssh
         public bool StartExec(string command)
         {
             if (!BeginSending()) return false;
-            agent.Exec(peerChannel, command);
+            agent.Exec(localId, command);
             return true;
         }
 
         public bool StartShell()
         {
             if (!BeginSending()) return false;
-            agent.Shell(peerChannel);
+            agent.Shell(localId);
             return true;
         }
 
@@ -1319,13 +1397,13 @@ namespace Pwssh
         public bool RequestPty(uint cols, uint rows, string term)
         {
             if (!agent.RemoteSupportsPty) return false;
-            agent.RequestPty(peerChannel, cols, rows, term);
+            agent.RequestPty(localId, cols, rows, term);
             return true;
         }
 
-        public void Resize(uint cols, uint rows) { agent.Resize(peerChannel, cols, rows); }
+        public void Resize(uint cols, uint rows) { agent.Resize(localId, cols, rows); }
 
-        public void Signal(string name) { agent.Signal(peerChannel, name); }
+        public void Signal(string name) { agent.Signal(localId, name); }
 
         // ---- called from the agent side (must not block) ----
 
@@ -1353,7 +1431,7 @@ namespace Pwssh
                     pendingGrant = 0;
                 }
             }
-            if (grant > 0) agent.GrantWindow(peerChannel, grant);
+            if (grant > 0) agent.GrantWindow(localId, grant);
         }
 
         // Called as the sender drains the queue: releases any credit held back by MAX_PENDING.
@@ -1369,7 +1447,7 @@ namespace Pwssh
                     pendingGrant = 0;
                 }
             }
-            if (grant > 0) agent.GrantWindow(peerChannel, grant);
+            if (grant > 0) agent.GrantWindow(localId, grant);
         }
 
         public void OnAgentExit(uint status)
@@ -1395,7 +1473,7 @@ namespace Pwssh
 
         public void WriteFromClient(byte[] data)
         {
-            agent.SendStdin(peerChannel, data);
+            agent.SendStdin(localId, data);
 
             // Eager window adjust: a lazy threshold would cost a full round trip, and on this
             // transport a round trip is ~600-900 ms.
@@ -1406,14 +1484,14 @@ namespace Pwssh
             pkt.WritePacket(w.ToArray());
         }
 
-        public void ClientEof() { agent.CloseStdin(peerChannel); }
+        public void ClientEof() { agent.CloseStdin(localId); }
 
         public void Kill()
         {
             killed = true;
             lock (windowGate) { Monitor.PulseAll(windowGate); }
             lock (outGate) { Monitor.PulseAll(outGate); }
-            try { agent.CloseChannel(peerChannel); } catch { }
+            try { agent.CloseChannel(localId); } catch { }
         }
 
         // ---- sender ----
