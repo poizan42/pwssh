@@ -494,6 +494,42 @@ namespace Pwssh
             }
         }
 
+        // Channels the engine opened for its own SFTP read-ahead. They are ordinary agent
+        // channels sharing the same id space -- the agent cannot tell them apart from the
+        // client's -- but no SessionChannel exists for them, because ssh knows nothing about
+        // them and nothing they carry is ever written to it.
+        private readonly Dictionary<uint, SftpReadAhead> prefetch = new Dictionary<uint, SftpReadAhead>();
+
+        // Drawn from the same monotonic counter as client channels, which is what makes a
+        // collision impossible rather than merely unlikely. Zero cannot signal failure here:
+        // it is a perfectly good channel id, and the first one handed out.
+        internal bool TryRegisterPrefetchChannel(SftpReadAhead owner, out uint id)
+        {
+            id = 0;
+            lock (chanGate)
+            {
+                if (channels.Count + prefetch.Count >= MAX_CHANNELS) return false;
+                id = nextChannelId++;
+                prefetch[id] = owner;
+                return true;
+            }
+        }
+
+        internal void ForgetPrefetchChannel(uint id)
+        {
+            lock (chanGate) { prefetch.Remove(id); }
+        }
+
+        private SftpReadAhead FindPrefetch(uint id)
+        {
+            lock (chanGate)
+            {
+                SftpReadAhead r;
+                if (prefetch.TryGetValue(id, out r)) return r;
+                return null;
+            }
+        }
+
         private void ForgetChannel(uint localId)
         {
             lock (chanGate) { channels.Remove(localId); }
@@ -1462,6 +1498,12 @@ namespace Pwssh
         // The agent addresses channels by our local id, so these are direct lookups.
         public void OnData(uint ch, byte[] buffer, int offset, int count, bool stderr)
         {
+            // Prefetch channels are checked first and never fall through: their data belongs to
+            // the read-ahead buffer, and writing any of it to ssh would corrupt the client's SFTP
+            // stream with replies to requests the client never made.
+            SftpReadAhead r = FindPrefetch(ch);
+            if (r != null) { r.OnPrefetchData(ch, buffer, offset, count, stderr); return; }
+
             SessionChannel c = Find(ch);
             if (c != null) c.OnAgentData(buffer, offset, count, stderr);
         }
@@ -1476,6 +1518,10 @@ namespace Pwssh
         {
             SessionChannel c = Find(ch);
             if (c != null) c.OnAgentClose();
+            // A prefetch channel's agent-side worker has finished. Nothing to tell ssh: it never
+            // knew this channel existed.
+            SftpReadAhead r = FindPrefetch(ch);
+            if (r != null) r.OnPrefetchClosed(ch);
         }
 
         // Completes a direct-tcpip open. Reason 2 is SSH_OPEN_CONNECT_FAILED, which is what
@@ -1706,7 +1752,10 @@ namespace Pwssh
             if (!BeginSending()) return false;
             // Also the only record that this channel is a subsystem, which the class otherwise
             // does not keep.
-            if (engine.SftpReadAheadEnabled) sftp = new SftpReadAhead();
+            if (engine.SftpReadAheadEnabled)
+            {
+                sftp = new SftpReadAhead(engine, agent, engine.SftpReadAheadChunks);
+            }
             agent.Subsystem(localId, name);
             return true;
         }
@@ -1868,6 +1917,7 @@ namespace Pwssh
             if (sftp != null)
             {
                 engine.LogInternal(sftp.Summary());
+                sftp.Dispose();          // drops any prefetch channel still open on the remote
                 sftp = null;
             }
             lock (windowGate) { Monitor.PulseAll(windowGate); }
