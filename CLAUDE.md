@@ -21,6 +21,20 @@ Not implemented: `shell`, PTY, port forwarding, SFTP, rekeying.
 
 **The host key is now purely ceremonial.** It authenticates this proxy, not the remote machine — nothing about it crosses the link. It still has to be stable, because the client pins it in `known_hosts`.
 
+## No remote configuration
+
+**pwssh must work with nothing but an ordinary WinRM session.** Anyone who can reconfigure the remote can install OpenSSH instead and get a better result in every respect — so a change that requires admin there does not trade off against anything, it removes the project's reason to exist.
+
+This rules out a class of otherwise reasonable optimisations permanently. `MaxEnvelopeSizekb`, WinRM service tuning, quota changes, installing runtimes or modules: all rejected regardless of how much they help. Treat any proposal that begins "just set X on the remote" as out of scope.
+
+What the remote currently needs, and all it may ever need:
+
+- a WinRM session the user can already open;
+- permission to start a process as that same user;
+- a local named pipe between two of the user's own processes (only when `-Streams` > 1).
+
+Nothing is written to the remote's disk, no service is reconfigured, no elevation is used, and the host key never leaves the client.
+
 ## Repository layout
 
 | Path | Role |
@@ -341,7 +355,9 @@ This only affects interactive `shell` responsiveness — bulk transfer already p
 
   **Striping across sessions was then implemented** (see above): 2.83× on incompressible data, but 0.83× on compressible, because it relieves the same bottleneck compression already does. It is opt-in via `-Streams`.
 
-  Remaining ideas: raising the remote's `MaxEnvelopeSizekb` from 500 to reduce fragment count (needs admin); and the allocation churn — a payload byte is still copied roughly eight times between the agent's read and ssh's stdout (`Frame.Make`, `Frame.Payload`, the `SendData` slice, `SshWriter` plus `ToArray`, packet assembly, `ByteChannel.Write`'s defensive copy, `TakeAll`'s concatenation), which is worth fixing for memory pressure even though it will not move throughput.
+  Raising the remote's `MaxEnvelopeSizekb` from 500 would cut fragment count, but it needs admin on the remote and is therefore **rejected on principle** — see *No remote configuration* below.
+
+  Remaining idea: the allocation churn — a payload byte is still copied roughly eight times between the agent's read and ssh's stdout (`Frame.Make`, `Frame.Payload`, the `SendData` slice, `SshWriter` plus `ToArray`, packet assembly, `ByteChannel.Write`'s defensive copy, `TakeAll`'s concatenation), which is worth fixing for memory pressure even though it will not move throughput.
 
   **Tooling note:** `dotnet-trace` from NuGet is 9.0 and produces an empty trace against pwsh 7.6, which runs on .NET 10 — 0 samples and a "potentially broken trace" warning. Version 10.0.731102 is not on NuGet (broken publish pipeline); get the signed binary from the [dotnet/diagnostics release](https://github.com/dotnet/diagnostics/releases/tag/v10.0.731102). Also make sure the traced process **outlives the trace duration**: if it exits mid-session the rundown never happens and stacks cannot be resolved. The speedscope output is *evented*, and hangs `CPU_TIME`/`UNMANAGED_CODE_TIME` pseudo-leaves under each real frame, so self time must be credited to the nearest real ancestor — and `UNMANAGED_CODE_TIME` is mostly blocked threads, not CPU.
 - **Encrypting before WinRM costs ~29× of throughput.** WinRM compression is enabled by default, and an SSH-encrypted payload is incompressible, so that compression is wasted. Measured downstream over 8 MiB, interleaved across 3 rounds: incompressible **0.36–0.39 MiB/s** versus compressible plaintext **6.3–11.3 MiB/s**. (The ratio is the reliable figure; absolute numbers vary between sessions — earlier runs on smaller payloads reached 3.5–4 MiB/s incompressible.) This is the strongest argument for terminating SSH in the client-side ProxyCommand rather than on the remote: it makes the WinRM payload plaintext, which also removes all crypto from the remote and turns the ~10 SSH handshake round trips into local ones.
