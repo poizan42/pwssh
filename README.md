@@ -20,23 +20,33 @@ remote agent ── starts a process, shuttles its output. No crypto, nothing on
 
 ## Status
 
-`exec` and `shell` both work end to end. `ssh myremote whoami` returns the remote account;
-`ssh myremote` gives an interactive `cmd.exe` session with a real terminal, including colour
-and `Ctrl+C`, where the remote supports ConPTY.
+`exec`, `shell`, port forwarding and file transfer all work end to end. `ssh myremote whoami`
+returns the remote account; `ssh myremote` gives an interactive `cmd.exe` session with a real
+terminal, including colour and `Ctrl+C`, where the remote supports ConPTY; and `sftp myremote`
+or `scp file myremote:` transfers files, with **no SFTP server on the remote** — pwssh
+implements the protocol itself.
 
 | | |
 |---|---|
-| Implemented | version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, session channels, `exec`, `shell`, `pty-req` (ConPTY), `window-change`, `signal`, port forwarding — `-L`, `-D`, `-W` and `-R`, IPv4 and IPv6 — exit status, separate stderr, flow control |
-| Not implemented | SFTP subsystem, rekeying |
+| Implemented | version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, session channels, `exec`, `shell`, `pty-req` (ConPTY), `window-change`, `signal`, port forwarding — `-L`, `-D`, `-W` and `-R`, IPv4 and IPv6 — **SFTP subsystem (and therefore `scp`)**, exit status, separate stderr, flow control |
+| Not implemented | rekeying, symlink creation |
 
 Tested against OpenSSH 9.5p2 on Windows, with a Windows PowerShell 5.1 / .NET Framework 4.8
-remote. The test suite drives the real `ssh` binary: 29 cases against each of WinRM and a
-loopback dev host.
+remote. The test suite drives the real `ssh`, `sftp` and `scp` binaries: 51 cases against each
+of WinRM and a loopback dev host.
 
-One wart worth knowing about `-R`: `ssh` kills its `ProxyCommand` when it exits, so pwssh gets
-no chance to tell the remote to unbind the listening port. The remote's own watchdog releases
-it about two minutes later, which means reconnecting with the *same* `-R` port inside that
-window fails.
+Two warts worth knowing:
+
+- **`-R` ports linger.** `ssh` kills its `ProxyCommand` when it exits, so pwssh gets no chance
+  to tell the remote to unbind the listening port. The remote's own watchdog releases it about
+  two minutes later, so reconnecting with the *same* `-R` port inside that window fails.
+- **SFTP downloads are round-trip-bound, not bandwidth-bound.** The `sftp` client raises its
+  request count one at a time from one, so a transfer pays roughly √(2 × chunks) round trips
+  before it is going full speed, plus four per file for its own stat/open/close. On a link
+  where a round trip is most of a second that is ~11 s of fixed cost per file, after which data
+  moves quickly. Measured 8 MiB at 0.49 MiB/s and 32 MiB at 2.22 MiB/s. Uploads, at
+  ~0.35 MiB/s, are already at the link's upstream ceiling. **Do not pass `sftp -B`** — it
+  suppresses the buffer negotiation that keeps this from being far worse.
 
 ## What it needs on the remote
 
@@ -106,18 +116,28 @@ The transport is high-latency and asymmetric, and that shapes everything.
 
 | | |
 |---|---|
-| Connection setup | ~5 s, dominated by opening the PSSession |
+| Connection setup | ~4–5 s, dominated by opening the PSSession |
 | Keystroke echo, interactive | ~250–900 ms — one WinRM round trip per keystroke |
-| Bulk download, compressible | ~7 MiB/s |
-| Bulk download, incompressible | ~0.4 MiB/s, or ~1 MiB/s with `-Streams 4` |
-| Upload | roughly 10× slower than download |
+| Bulk download via `exec`, compressible | ~7 MiB/s |
+| Bulk download via `exec`, incompressible | ~0.4 MiB/s, or ~1 MiB/s with `-Streams 4` |
+| Bulk download via `sftp`/`scp` | ~0.5 MiB/s at 8 MiB, ~2.2 MiB/s at 32 MiB |
+| Upload, any path | ~0.35–0.4 MiB/s — the link's upstream ceiling |
 
-Two notes on the numbers. Compressible output is much faster because WinRM compresses the
+Three notes on the numbers. Compressible output is much faster because WinRM compresses the
 link and pwssh sends plaintext through it — which is precisely why SSH terminates on the
-client rather than the remote. And `-Streams` only helps *incompressible* bulk data: it adds
+client rather than the remote. `-Streams` only helps *incompressible* bulk data: it adds
 parallel receive threads, so once compression has already relieved that bottleneck extra
 sessions merely cost setup time. It measured **2.8× on incompressible** data and **0.83×
 — slower — on compressible** data, hence opt-in.
+
+And SFTP is slower than `exec` for the same bytes because it is a request/response protocol
+whose pacing the *client* controls — see the wart above. If you are moving a directory tree,
+archiving it on the far side and transferring one file will beat `scp -r` by a wide margin:
+
+```bash
+ssh myremote "powershell -c Compress-Archive -Path C:/data -DestinationPath C:/data.zip"
+scp myremote:C:/data.zip .
+```
 
 Interactive use is usable but feels like a satellite link, and no amount of tuning changes
 that: a keystroke cannot be pipelined with anything.

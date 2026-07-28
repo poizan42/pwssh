@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns the remote's `DOMAIN\user`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite runs 29 cases against each transport and passes, with one environmental exception: loopback is **28/29**, the failure being the pty case that this client machine's ConPTY breaks (see *Running and testing*). The two runs differ in composition rather than count — WinRM has the graceful-degradation and IPv6 cases plus the gateway-ports check; loopback has the wrong-username check that the WinRM alias takes from `ssh_config`, along with the reverse-forward release and bind-failure cases that need the far side to be this machine.
+**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns the remote's `DOMAIN\user`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite runs 51 cases against each transport: **WinRM is 51/51**, loopback **50/51** with one environmental exception — the pty case that this client machine's ConPTY breaks (see *Running and testing*). The two runs differ in composition rather than count — WinRM has the graceful-degradation and IPv6 cases plus the gateway-ports check; loopback has the wrong-username check that the WinRM alias takes from `ssh_config`, along with the reverse-forward release and bind-failure cases that need the far side to be this machine.
 
 **A run that fails one case with `exit=255` is usually a flake, not a regression.** 255 is ssh's own error code for a connection that never came up, and it turns up after the remote has been hammered with dozens of sessions in a row. Re-run the case before believing it: the final WinRM run here failed "shell exit status propagates" that way and passed 3/3 immediately afterwards.
 
@@ -17,9 +17,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The throughput gain is WinRM's own compression, which an encrypted stream made useless. The same suite reports **0.31 MiB/s for an incompressible 8 MiB payload** — essentially identical to what the old architecture managed on *compressible* data, which is exactly what the mechanism predicts and a good confirmation of it.
 
-Implemented: version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, `none` auth with username matching, session channel, `exec`, `shell`, `pty-req` via ConPTY, `window-change`, `signal`, `direct-tcpip` forwarding (`-L`/`-D`/`-W`, IPv4 and IPv6), `tcpip-forward` + `forwarded-tcpip` reverse forwarding (`-R`, loopback by default, `-GatewayPorts` to widen), exit status, stderr as `CHANNEL_EXTENDED_DATA`, window management, credit-based flow control to the agent.
+Implemented: version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, `none` auth with username matching, session channel, `exec`, `shell`, `pty-req` via ConPTY, `window-change`, `signal`, `direct-tcpip` forwarding (`-L`/`-D`/`-W`, IPv4 and IPv6), `tcpip-forward` + `forwarded-tcpip` reverse forwarding (`-R`, loopback by default, `-GatewayPorts` to widen), the `sftp` subsystem (version 3, and therefore `scp`), exit status, stderr as `CHANNEL_EXTENDED_DATA`, window management, credit-based flow control to the agent.
 
-Not implemented: SFTP, rekeying.
+Not implemented: rekeying, symlink creation (needs elevation on Windows).
 
 **The host key is now purely ceremonial.** It authenticates this proxy, not the remote machine — nothing about it crosses the link. It still has to be stable, because the client pins it in `known_hosts`.
 
@@ -135,6 +135,49 @@ Measured: four concurrent forwarded connections complete in the time of about on
 
 Measured: 512 KiB through a reverse forward is bit-exact, in ~1.1 s on loopback.
 
+### SFTP subsystem
+
+`sftp` works, and so does **`scp`** — which had no working path at all before, because scp 9.x speaks SFTP and its `-O` fallback needs `scp.exe` on the remote, exactly what a pwssh target does not have. `scp`, `scp -r` and `scp -p` all work with no scp-specific code.
+
+The server is **version 3, implemented in the agent** (`AgentSftpChannel`), reached through a `subsystem` channel request and one new frame, `SUBSYSTEM` (0x0F). Everything else reuses the existing channel frames: an SFTP subsystem is exactly a bidirectional byte stream that ends in an exit status, which `DATA`/`OUT`/`EOF`/`CLOSE`/`WINDOW`/`EXIT`/`DONE` already carry.
+
+**The conventions were measured, not guessed.** Windows ships `C:\Windows\System32\OpenSSH\sftp-server.exe` even where no sshd runs, and `sftp -D <path>` drives it over a pipe with no SSH in the loop, which makes the reference implementation directly observable. That settled: version 3; paths as `/C:/Users/kb` (leading slash, drive *with* colon, forward slashes); `/` as a virtual root listing drive letters; ATTRS flags always `0x0f` with uid/gid 0; `realpath` **not** requiring the path to exist; and the `longname` shape. Worth re-running that probe before changing any of it.
+
+Four findings that shaped the implementation:
+
+- **`limits@openssh.com` is the highest-value part of the feature.** The client raises its transfer buffer to whatever we advertise — `server upload/download buffer sizes 65536 / 261120; using 65536 / 261120` — against a 32 KiB default. That is an 8× cut in round trips. **An explicit `sftp -B` suppresses the scaling**, so the advice is the counter-intuitive "do not pass `-B`".
+- **Never answer a `READ` short.** The reference answered a 261120-byte request with 102400 bytes; the client logged `Short data block, re-requesting` and then *permanently* dropped its request size for the rest of the session. `DoRead` loops until the request is satisfied or the file genuinely ends.
+- **Read and write limits are deliberately asymmetric** (255 KiB / 64 KiB). Upstream is byte-rate limited, so 64 × 64 KiB is already ~10× the bandwidth-delay product and bigger writes buy nothing; and the client's outbound frame queue is FIFO *across channels*, so a 16 MiB upload backlog would head-of-line-block keystrokes on a shell channel sharing the connection. It also keeps upload frames at 64 KiB, the largest payload the transport carried before this.
+- **`READDIR` cannot be pipelined** — the handle is a cursor, so the client issues them one at a time. The reference needed **58 sequential round trips** to list System32's 5,604 entries, i.e. ~40 s. `READDIR_BATCH_BYTES` packs each reply to ~200 KiB instead of the conventional ~100 entries, bringing the same listing down to a handful. 200 rather than 256 KiB because the client's cap is *inferred* from the reference's advertised max-packet, and overshooting it is a hard client abort rather than a degradation.
+
+Implementation points that are easy to get wrong:
+
+- **Reparse points are reported as `S_IFLNK` in `LSTAT`/`READDIR`, and the reference gets this wrong.** `C:\Users\All Users` is a junction to `C:\ProgramData` and `AppData\Local\Application Data` points at its own parent, so a client that sees them as plain directories recurses forever on `get -r`. `FileAttributes.ReparsePoint` is available on 4.8 even though link *resolution* is not, so `STAT` follows and `LSTAT` does not — they are **not** interchangeable, which is the opposite of what "we don't support symlinks" suggests. `READLINK`/`SYMLINK` return `OP_UNSUPPORTED`, the latter because creating one needs elevation.
+- **Deferred times.** `scp -p` sends `FSETSTAT` on a still-open handle, and NTFS updates last-write when the handle's dirty data flushes — after the timestamp was set. Windows is believed to suppress that for a handle whose time was set explicitly, but rather than depend on unverified filesystem behaviour the times are recorded on the handle and applied **by path after `Dispose()`**.
+- **`SETSTAT` must not fail on permissions.** The client sends the local file's mode in `OPEN` attrs on *every* `put`. Only the owner-write bit has anywhere to go (`FILE_ATTRIBUTE_READONLY`); the rest is accepted and dropped, and the reply is `OK`.
+- **`MoveFileEx`, not `File.Move`** — 4.8 has no overwrite overload. Plain `RENAME` uses `COPY_ALLOWED` only and reports failure when the target exists (the v3 semantic); `posix-rename@openssh.com` adds `REPLACE_EXISTING`.
+- **Every request produces exactly one reply**, enforced by a catch-all that turns any exception into a `STATUS`. A dropped reply is not an error the client can see: it waits until its own timeout, which on this link is indistinguishable from ordinary slowness. `SftpEnabled`-style staging exists for the same reason — during development, accepting the subsystem before it could answer produced exactly that hang.
+- **Modes are `0644`/`0755`**, not the reference's `0600`/`0700`, so that `scp -p` onto a Linux box does not land everything mode 600. A judgement call, and commented as one. Never derived from ACLs: a per-entry lookup during a 5,600-entry readdir is unaffordable.
+- **`SetErrorMode(SEM_FAILCRITICALERRORS)`** once per process, and the virtual root does not stat the drives it lists — the reference does not either. Reaching an empty card reader otherwise raises the "no disk" dialog, which in a session with no desktop means the call blocks.
+- **Handle ids are never reused**, so a stale handle gets `FAILURE` instead of silently addressing a different file. Handles are disposed in three places (`CLOSE`, the worker's `finally`, `Kill`) because a leaked `FileStream` holds an NTFS lock until `wsmprovhost` exits — worse than a leaked port, since the user's next attempt fails on their own file.
+
+#### Measured, and the one thing that is not fixable from here
+
+All bit-exact, including 0, 1, and ±1 around every chunk boundary. Same compressible payload over both paths, same session:
+
+| 8 MiB download | | 32 MiB download | |
+|---|---|---|---|
+| `exec` | 1.55 MiB/s | `exec` | 6.76 MiB/s |
+| `sftp` | 0.49 MiB/s | `sftp` | 2.22 MiB/s |
+
+Upload measured **0.35 MiB/s**, which is the transport's upstream ceiling — uploads are already optimal and no design change would help them.
+
+**The remote recompiles the agent on every connection**, so putting SFTP there is paid for by `ssh host whoami` as well: `Import-PwsshSource` has no cache (only the client caches to a DLL). Measured, because this was the strongest argument against the agent-side design: the agent grew 54% (2,356 → 3,627 lines) and connection setup went from a **3,663 ms** median to **3,875 ms** — about 210 ms, ~6%. Worth knowing the exchange rate before adding another 1,200 lines there, but not a reason to have avoided this one.
+
+Downloads are **round-trip-bound, not bandwidth-bound**, and the evidence is unambiguous: compressible and incompressible 8 MiB downloads measured 0.49 and 0.43 MiB/s, a 1.14× ratio where `exec` shows 4.5×; and 32 MiB costs only 2.7 s more than 2 MiB, i.e. 16× the data for a quarter more time. The cause is the client's request ramp — **`num_requests` starts at 1 and grows by one per reply**, so moving *C* chunks costs about √(2C) round trips before the window is deep enough to matter, plus a fixed ~4 round trips per file for the client's `LSTAT`, `STAT`, `OPEN` and `CLOSE`. At ~0.85 s per trip that is the ~11 s of fixed cost the table shows.
+
+**None of it can be fixed on the server side** — the pacing is inside the client. The remedy, if it ever matters enough, is the design deliberately not chosen: move `READ`/`READDIR` into the engine, where `OPEN_READ` becomes "stream this file back under the existing credit machinery" — literally the exec path — and the engine answers the client's `READ`s from a local buffer with a fallback to per-request reads when the access pattern stops being sequential. That trades a new RPC surface, per-request timeouts, and two bug classes the loopback host cannot catch (an engine that resolves a remote path against its own drives passes loopback and fails WinRM) for roughly a 3× on medium-file downloads.
+
 ### Striping across sessions (`-Streams N`, default 1)
 
 Each PSSession gets its own WSMan receive thread on the client, and that thread is the ceiling, so extra sessions multiply receive capacity. Sessions beyond the first are receive-only "mules": they run `src/Start-PwsshMule.ps1`, which connects to a local named pipe published by the agent and relays whatever arrives to its own pipeline output. Mules need no compilation — they never inspect a frame. Everything the client *sends* still goes to the primary session, so there is only one ordering problem, solved by `FrameResequencer`.
@@ -167,11 +210,21 @@ pwsh -NoProfile -File .\tests\Invoke-PwsshTests.ps1 -Target pwssh-test -Port 0 -
 
 A single manual call: `ssh -F tmp/ssh_config pwssh-test whoami`. Add `-Diagnostics` to the ProxyCommand for stderr progress, which is off by default because ssh shows a ProxyCommand's stderr in the user's terminal on every connection.
 
+**To compare against the reference SFTP server, no sshd required.** Windows ships `sftp-server.exe` even on machines with no SSH service, and `sftp -D` drives it over a pipe with SSH entirely out of the loop:
+
+```powershell
+'pwd' | sftp -b - -D "C:\Windows\System32\OpenSSH\sftp-server.exe" x
+```
+
+Add `-vvv` to see what the client negotiates (`server upload/download buffer sizes … using …` is the line that matters). This is how the path convention, the extension set, the `limits` values and the request-ramp behaviour were established rather than guessed, and it is the fastest way to settle any further question about what a real client expects. Note it does *not* mean pwssh could shell out to that binary instead: it arrives with the Server capability, i.e. on precisely the machines that do not need pwssh.
+
 The full WinRM run needs the optional targets too — `pwssh-nopty` for the ConPTY degradation cases and `pwssh-test-gw` (same block plus `-GatewayPorts`) for the reverse-forward gateway case:
 
 ```powershell
 pwsh -NoProfile -File .\tests\Invoke-PwsshTests.ps1 -Target pwssh-test -Port 0 -ConfigFile tmp/ssh_config -KnownHostsFile tmp/known_hosts_winrm -DegradedTarget pwssh-nopty -DegradedConfigFile tmp/ssh_config_nopty -ForwardTarget '127.0.0.1:5985' -ForwardTarget6 '[::1]:5985' -GatewayTarget pwssh-test-gw -GatewayConfigFile tmp/ssh_config
 ```
+
+The SFTP section needs no extra targets and has no transport-conditional skips, which makes it the best regression signal in the suite — but it is also the slowest part of a run, since every case is at least one full `sftp` connection. `-SkipSftp` drops it while iterating on something else.
 
 **ConPTY does not work on this client machine, only on the remote.** The loopback dev host therefore fails the pty case while the WinRM run passes it, and that difference is not a pwssh bug: reduced to a minimal, textbook-correct `CreatePseudoConsole` + `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` program with no pwssh code in it, the child still writes to the parent's inherited stdout instead of the pseudoconsole — the attribute is silently ignored. `FreeConsole()` in the parent first makes no difference. So `pty session produces output` failing on loopback and passing over WinRM is the expected shape here; investigate only if it starts failing over WinRM too.
 
@@ -401,7 +454,9 @@ This only affects interactive `shell` responsiveness — bulk transfer already p
 
 ## Known limits and open items
 
-- **No rekeying.** OpenSSH rekeys after ~1 GiB or 1 hour; on a post-established `KEXINIT` the server sends `SSH_MSG_DISCONNECT` rather than corrupt cipher state. Long or very large sessions will drop.
+- **No rekeying, and SFTP makes it reachable.** OpenSSH rekeys after ~1 GiB or 1 hour; on a post-established `KEXINIT` the server sends `SSH_MSG_DISCONNECT` rather than corrupt cipher state. Nobody hit that with `exec`, where a session is one command — but a single large `scp` can, so this moved from theoretical to something a user might actually see.
+- **Long paths fail.** .NET Framework 4.8 needs an app-config switch for long-path awareness that cannot be set on the remote, so a path beyond ~260 characters raises `PathTooLongException` and comes back as `SSH_FX_FAILURE` mid-walk. Windows' own `sftp-server.exe` is `longPathAware` in its manifest, so this is a genuine behavioural difference from OpenSSH rather than a shared limitation.
+- **The loopback dev host cannot catch a round-trip regression**, because its latency is ~0: the same SFTP download that runs at 0.49 MiB/s over WinRM measures 7.56 MiB/s there. A `-LatencyMs` knob on `PwsshLoopback`'s two shuttle threads would turn "wrong number of round trips" into a fast red test instead of something only the WinRM run reveals. Worth adding before any work that tries to reduce round trips.
 - **Not manually verified**, because they cannot be asserted from a script: colour rendering, `Ctrl+C` interrupting a running command, and `window-change` actually reflowing output. The code paths exist (`ResizePseudoConsole` is wired to `window-change`) and the automated tests confirm a pty session runs and emits VT sequences, but a human should sit at an interactive session once.
 - **A long-idle interactive session is probably dropped after 5 minutes, from the client side.** The engine's watchdog fires after `InactivityTimeoutSeconds` (300) without inbound SSH traffic, and ssh sends none while idle: `ServerAliveInterval` defaults to 0, and `TCPKeepAlive` operates below the SSH layer. The agent side no longer has this problem — the `PING` keepalive means its 120 s timeout only ever sees a genuinely dead client — but nothing sends the equivalent *towards* the client, so the asymmetry now sits here. Not directly verified (it needs a 5-minute idle session), and the workaround is `ServerAliveInterval 60` in the `Host` block. Worth fixing properly if interactive use becomes common.
 - **`signal` is implemented but effectively untested.** OpenSSH rarely sends `SSH_MSG_CHANNEL_REQUEST "signal"` — with a pty, `Ctrl+C` arrives as data and the console handles it — so there is no practical way to exercise it through the stock client. It maps to killing the child tree.

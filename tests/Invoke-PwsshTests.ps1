@@ -37,6 +37,9 @@ param(
     # gateway policy can be checked. Without it only the refusal is tested.
     [string]$GatewayTarget,
     [string]$GatewayConfigFile,
+    # SFTP needs nothing the other sections do not already assume, so unlike the forwarding
+    # cases it runs identically on both transports and has no conditional skips.
+    [switch]$SkipSftp,
     [switch]$SkipLarge
 )
 
@@ -96,6 +99,79 @@ function Invoke-Ssh {
         Stdout   = $outMs.ToArray()
         Stderr   = $errTask.Result
     }
+}
+
+# sftp and scp take -P for the port where ssh takes -p, and sftp reads a batch script from
+# stdin with '-b -', which keeps the suite's "nothing written to disk" property.
+#
+# The timeout names the phase it died in. sftp exits 1 for every kind of failure, so a bare
+# "timed out" would say nothing about whether the hang was the open, the read or the close --
+# and a hang is the failure mode this protocol produces when a reply goes missing.
+function Invoke-Sftp {
+    param([string]$Batch, [string]$Phase = 'sftp', [string[]]$Extra, [string]$UseTarget, [string]$UseConfig,
+          [int]$TimeoutMs = 240000)
+
+    $cfg = if ($UseConfig) { $UseConfig } else { $ConfigFile }
+    $tgt = if ($UseTarget) { $UseTarget } else { $Target }
+    $a = New-Object System.Collections.Generic.List[string]
+    if ($cfg) { $a.Add('-F'); $a.Add($cfg) }
+    if ($Port -gt 0) { $a.Add('-P'); $a.Add("$Port") }
+    $a.Add('-o'); $a.Add("UserKnownHostsFile=$KnownHostsFile")
+    $a.Add('-o'); $a.Add('StrictHostKeyChecking=accept-new')
+    $a.Add('-o'); $a.Add('BatchMode=yes')
+    if ($Extra) { foreach ($e in $Extra) { $a.Add($e) } }
+    $a.Add('-b'); $a.Add('-')
+    $a.Add($tgt)
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'sftp'
+    foreach ($x in $a) { $psi.ArgumentList.Add($x) }
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $o = $p.StandardOutput.ReadToEndAsync()
+    $e = $p.StandardError.ReadToEndAsync()
+    $p.StandardInput.Write($Batch)
+    $p.StandardInput.Close()
+    $hung = -not $p.WaitForExit($TimeoutMs)
+    if ($hung) { try { $p.Kill() } catch { } }
+
+    [pscustomobject]@{
+        ExitCode = $p.ExitCode
+        Out      = $o.Result
+        Err      = $e.Result
+        Hung     = $hung
+        Phase    = if ($hung) { "SFTP-HANG-$Phase" } else { '' }
+    }
+}
+
+function Invoke-Scp {
+    param([string[]]$ScpArgs, [int]$TimeoutMs = 240000)
+    $a = New-Object System.Collections.Generic.List[string]
+    if ($ConfigFile) { $a.Add('-F'); $a.Add($ConfigFile) }
+    if ($Port -gt 0) { $a.Add('-P'); $a.Add("$Port") }
+    $a.Add('-o'); $a.Add("UserKnownHostsFile=$KnownHostsFile")
+    $a.Add('-o'); $a.Add('StrictHostKeyChecking=accept-new')
+    $a.Add('-o'); $a.Add('BatchMode=yes')
+    foreach ($x in $ScpArgs) { $a.Add($x) }
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'scp'
+    foreach ($x in $a) { $psi.ArgumentList.Add($x) }
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $o = $p.StandardOutput.ReadToEndAsync()
+    $e = $p.StandardError.ReadToEndAsync()
+    $hung = -not $p.WaitForExit($TimeoutMs)
+    if ($hung) { try { $p.Kill() } catch { } }
+    [pscustomobject]@{ ExitCode = $p.ExitCode; Out = $o.Result; Err = $e.Result; Hung = $hung }
 }
 
 function Get-Sha([byte[]]$b) {
@@ -563,6 +639,201 @@ while (`$true) { `$n = `$s.Read(`$b, 0, `$b.Length); if (`$n -le 0) { break }; `
             "got '$($so -replace '\s+', ' ')' want LEN=$size SHA=$want"
         try { $bsvc.Stop(); $bsvc.Dispose() } catch { }
     }
+}
+
+# ------------------------------------------------------- 7e. SFTP subsystem (and scp)
+if (-not $SkipSftp) {
+    $bs = [char]92
+    $sftpTag = [guid]::NewGuid().ToString('N').Substring(0, 8)
+
+    # Far-side scratch directory, reported back so the tests need no knowledge of the remote's
+    # layout. Everything below lives in here and it is removed at the end -- the suite creates
+    # nothing persistent on the remote and this must not change that.
+    $mk = Invoke-Ssh -Command (New-FarSideCommand @"
+`$d = Join-Path `$env:TEMP 'pwssh-sftp-$sftpTag'
+New-Item -ItemType Directory -Path `$d -Force | Out-Null
+[Console]::Out.Write(`$d + '|' + `$env:USERPROFILE)
+"@)
+    $mkOut = ([System.Text.Encoding]::ASCII.GetString($mk.Stdout)).Trim()
+    $farDir = ($mkOut -split '\|')[0]
+    $farHome = ($mkOut -split '\|')[-1]
+    $farFwd = $farDir.Replace($bs, '/')
+
+    function Far-Sftp([string]$Script) {
+        $r = Invoke-Ssh -Command (New-FarSideCommand $Script)
+        return ([System.Text.Encoding]::ASCII.GetString($r.Stdout)).Trim()
+    }
+    # The far side hashes its own copy, so an upload is verified independently rather than by
+    # fetching it back -- which would hide corruption that is symmetric in both directions.
+    function Far-Hash([string]$farPath) {
+        return Far-Sftp @"
+if (Test-Path -LiteralPath '$farPath') {
+    [Console]::Out.Write([Convert]::ToBase64String([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.IO.File]::ReadAllBytes('$farPath'))))
+} else { [Console]::Out.Write('MISSING') }
+"@
+    }
+
+    Assert-That 'sftp scratch directory created on the far side' ($farDir -match '\S') "got '$mkOut'"
+
+    # ---- 1. the subsystem starts, and realpath answers in the documented shape
+    $r = Invoke-Sftp "pwd`nquit`n" 'realpath'
+    Assert-That 'sftp subsystem starts' (($r.ExitCode -eq 0) -and -not $r.Hung) `
+        "$($r.Phase) exit=$($r.ExitCode) err='$($r.Err -replace "`r?`n", ' | ')'"
+    Assert-That 'realpath returns a /X:/ path' ($r.Out -match 'Remote working directory: /[A-Za-z]:/') `
+        "out='$($r.Out -replace "`r?`n", ' | ')'"
+    # Compared against the REMOTE's profile, not the tester's: over WinRM they are different
+    # machines, and hardcoding the local one would pass loopback and fail WinRM.
+    $wantPwd = '/' + $farHome.Replace($bs, '/')
+    Assert-That 'realpath starts in the remote home' ($r.Out -match [regex]::Escape($wantPwd)) `
+        "want '$wantPwd' out='$($r.Out -replace "`r?`n", ' | ')'"
+
+    # ---- 2. the virtual root lists drives
+    $r = Invoke-Sftp "ls /`nquit`n" 'lsroot'
+    Assert-That 'ls / lists drive letters' ($r.Out -match '/[A-Za-z]:') `
+        "out='$($r.Out -replace "`r?`n", ' | ')'"
+
+    # ---- 3. upload, verified by the far side's own hash
+    $payload = New-Object byte[] (256 * 1024)
+    (New-Object System.Random 20260729).NextBytes($payload)
+    for ($i = 0; $i -lt 256; $i++) { $payload[$i] = [byte]$i }   # every byte value must survive
+    $wantHash = Get-Sha $payload
+    $localUp = Join-Path $repo "tmp/sftp-up-$sftpTag.bin"
+    [System.IO.File]::WriteAllBytes($localUp, $payload)
+
+    $r = Invoke-Sftp "put $($localUp.Replace($bs,'/')) $farFwd/up.bin`nquit`n" 'put'
+    Assert-That 'sftp put succeeds' (($r.ExitCode -eq 0) -and -not $r.Hung) `
+        "$($r.Phase) err='$($r.Err -replace "`r?`n", ' | ')'"
+    Assert-That 'sftp upload is bit-exact' ((Far-Hash "$farDir${bs}up.bin") -eq $wantHash) `
+        'far-side hash differs'
+
+    # ---- 4. download the same bytes back
+    $localDown = Join-Path $repo "tmp/sftp-down-$sftpTag.bin"
+    if (Test-Path $localDown) { [System.IO.File]::Delete($localDown) }
+    $r = Invoke-Sftp "get $farFwd/up.bin $($localDown.Replace($bs,'/'))`nquit`n" 'get'
+    $gotHash = if (Test-Path $localDown) { Get-Sha ([System.IO.File]::ReadAllBytes($localDown)) } else { 'MISSING' }
+    Assert-That 'sftp download is bit-exact' ($gotHash -eq $wantHash) `
+        "$($r.Phase) got $gotHash want $wantHash err='$($r.Err -replace "`r?`n", ' | ')'"
+
+    # ---- 5. sizes either side of the chunk boundaries.
+    # A server that answers a full-size READ with a short block silently loses the tail of every
+    # file whose size is not a multiple of the chunk, and the client then permanently shrinks
+    # its request size -- so the +/-1 cases matter more than they look.
+    $edges = @(0, 1, 32768, 261119, 261120, 261121)
+    $badEdges = @()
+    foreach ($n in $edges) {
+        $b = New-Object byte[] $n
+        if ($n -gt 0) { (New-Object System.Random $n).NextBytes($b) }
+        $lp = Join-Path $repo "tmp/sftp-e$n-$sftpTag.bin"
+        [System.IO.File]::WriteAllBytes($lp, $b)
+        $null = Invoke-Sftp "put $($lp.Replace($bs,'/')) $farFwd/e$n.bin`nquit`n" "put$n"
+        if ((Far-Hash "$farDir${bs}e$n.bin") -ne (Get-Sha $b)) { $badEdges += $n }
+    }
+    Assert-That 'chunk-boundary sizes transfer exactly' ($badEdges.Count -eq 0) `
+        "wrong at: $($badEdges -join ', ')"
+
+    # ---- 6. listings show what is there, and render a directory as a directory
+    $r = Invoke-Sftp "mkdir $farFwd/adir`nls -l $farFwd`nquit`n" 'lsl'
+    Assert-That 'ls shows an uploaded file' ($r.Out -match 'up\.bin') `
+        "out='$($r.Out -replace "`r?`n", ' | ')'"
+    Assert-That 'ls -l marks a directory with d' ($r.Out -match 'd[rwx-]{9}.*adir') `
+        "out='$($r.Out -replace "`r?`n", ' | ')'"
+
+    # ---- 7. mutating operations, each checked on the far side rather than by exit code.
+    # The rename lands on an existing name, which is the posix-rename path: plain v3 RENAME is
+    # required to fail there.
+    $r = Invoke-Sftp @"
+put $($localUp.Replace($bs,'/')) $farFwd/adir/a.bin
+put $($localUp.Replace($bs,'/')) $farFwd/adir/b.bin
+rename $farFwd/adir/a.bin $farFwd/adir/b.bin
+rm $farFwd/adir/b.bin
+rmdir $farFwd/adir
+quit
+"@ 'mutate'
+    $after = Far-Sftp @"
+[Console]::Out.Write((Test-Path -LiteralPath '$farDir${bs}adir').ToString())
+"@
+    Assert-That 'mkdir/put/rename-over/rm/rmdir all take effect' `
+        (($r.ExitCode -eq 0) -and ($after -eq 'False')) `
+        "$($r.Phase) exit=$($r.ExitCode) dirStillThere=$after err='$($r.Err -replace "`r?`n", ' | ')'"
+
+    # ---- 8. a failure is reported as itself, and does not poison the session.
+    # The '-' prefix is sftp's own "do not abort the batch here"; without it batch mode stops on
+    # the first error and the test would be measuring sftp rather than us.
+    $r = Invoke-Sftp "-get $farFwd/definitely-absent.bin $($repo.Replace($bs,'/'))/tmp/never.bin`npwd`nquit`n" 'missing'
+    Assert-That 'a missing file reports a real error' ($r.Err -match 'not found|No such file') `
+        "err='$($r.Err -replace "`r?`n", ' | ')'"
+    Assert-That 'the session survives a failed get' ($r.Out -match 'Remote working directory') `
+        "out='$($r.Out -replace "`r?`n", ' | ')'"
+
+    # ---- 9. an unknown subsystem is refused rather than left hanging
+    $r = Invoke-Ssh -Command 'definitely-not-a-subsystem' -Extra @('-s')
+    Assert-That 'an unknown subsystem is refused' `
+        (($r.ExitCode -ne 0) -and ($r.Stderr -match 'subsystem request failed')) `
+        "exit=$($r.ExitCode) stderr='$($r.Stderr -replace "`r?`n", ' | ')'"
+
+    # ---- 10. path forms: absolute, drive-prefixed without the leading slash, and home-relative
+    $r = Invoke-Sftp "get $farFwd/up.bin $($repo.Replace($bs,'/'))/tmp/p1-$sftpTag.bin`nquit`n" 'path1'
+    $r = Invoke-Sftp "get $($farFwd.TrimStart('/'))/up.bin $($repo.Replace($bs,'/'))/tmp/p2-$sftpTag.bin`nquit`n" 'path2'
+    $h1 = $(if (Test-Path (Join-Path $repo "tmp/p1-$sftpTag.bin")) { Get-Sha ([System.IO.File]::ReadAllBytes((Join-Path $repo "tmp/p1-$sftpTag.bin"))) } else { 'none' })
+    $h2 = $(if (Test-Path (Join-Path $repo "tmp/p2-$sftpTag.bin")) { Get-Sha ([System.IO.File]::ReadAllBytes((Join-Path $repo "tmp/p2-$sftpTag.bin"))) } else { 'none' })
+    Assert-That 'absolute and drive-prefixed paths reach the same file' `
+        (($h1 -eq $wantHash) -and ($h2 -eq $wantHash)) "withSlash=$h1 withoutSlash=$h2"
+
+    # ---- 11. scp, which speaks SFTP on OpenSSH 9.x and so comes free with the subsystem.
+    # -p additionally exercises SETSTAT/FSETSTAT: without them scp reports failure on a file it
+    # transferred perfectly well.
+    $stamp = [datetime]::SpecifyKind([datetime]'2019-02-03 04:05:06', 'Utc')
+    [System.IO.File]::SetLastWriteTimeUtc($localUp, $stamp)
+    $scpTgt = if ($Target -match '@') { $Target } else { $Target }
+    $r = Invoke-Scp @('-p', $localUp, "${scpTgt}:$farFwd/scp-up.bin")
+    Assert-That 'scp upload succeeds' (($r.ExitCode -eq 0) -and -not $r.Hung) `
+        "exit=$($r.ExitCode) err='$($r.Err -replace "`r?`n", ' | ')'"
+    Assert-That 'scp upload is bit-exact' ((Far-Hash "$farDir${bs}scp-up.bin") -eq $wantHash) 'far-side hash differs'
+    $farMtime = Far-Sftp @"
+[Console]::Out.Write([System.IO.File]::GetLastWriteTimeUtc('$farDir${bs}scp-up.bin').ToString('o'))
+"@
+    $farParsed = [datetime]::MinValue
+    $parsedOk = [datetime]::TryParse($farMtime, [ref]$farParsed)
+    Assert-That 'scp -p preserves mtime on upload' `
+        ($parsedOk -and ([math]::Abs(($farParsed.ToUniversalTime() - $stamp).TotalSeconds) -lt 2)) `
+        "far mtime '$farMtime' want '$($stamp.ToString('o'))'"
+
+    $scpDown = Join-Path $repo "tmp/sftp-scpdown-$sftpTag.bin"
+    if (Test-Path $scpDown) { [System.IO.File]::Delete($scpDown) }
+    $r = Invoke-Scp @('-p', "${scpTgt}:$farFwd/scp-up.bin", $scpDown)
+    $sh = if (Test-Path $scpDown) { Get-Sha ([System.IO.File]::ReadAllBytes($scpDown)) } else { 'MISSING' }
+    Assert-That 'scp download is bit-exact' ($sh -eq $wantHash) `
+        "got $sh err='$($r.Err -replace "`r?`n", ' | ')'"
+    if (Test-Path $scpDown) {
+        $dm = [System.IO.File]::GetLastWriteTimeUtc($scpDown)
+        Assert-That 'scp -p preserves mtime on download' ([math]::Abs(($dm - $stamp).TotalSeconds) -lt 2) `
+            "got $($dm.ToString('o')) want $($stamp.ToString('o'))"
+    }
+
+    # ---- 12. bulk, and the throughput number that keeps CLAUDE.md's table honest
+    if (-not $SkipLarge) {
+        $big = 8 * 1024 * 1024
+        $mkBig = Far-Sftp @"
+`$b = New-Object byte[] $big
+(New-Object System.Random 606).NextBytes(`$b)
+[System.IO.File]::WriteAllBytes('$farDir${bs}big.bin', `$b)
+[Console]::Out.Write([Convert]::ToBase64String([System.Security.Cryptography.SHA256]::Create().ComputeHash(`$b)))
+"@
+        $bigLocal = Join-Path $repo "tmp/sftp-big-$sftpTag.bin"
+        if (Test-Path $bigLocal) { [System.IO.File]::Delete($bigLocal) }
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $r = Invoke-Sftp "get $farFwd/big.bin $($bigLocal.Replace($bs,'/'))`nquit`n" 'bulk' @() '' '' 600000
+        $sw.Stop()
+        $bh = if (Test-Path $bigLocal) { Get-Sha ([System.IO.File]::ReadAllBytes($bigLocal)) } else { 'MISSING' }
+        Assert-That 'bulk sftp download is bit-exact (8 MiB)' ($bh -eq $mkBig) `
+            "$($r.Phase) got $bh want $mkBig"
+        Write-Host ("        sftp download: {0:N2} MiB/s (includes ~4-6 s of connect)" -f (8 / $sw.Elapsed.TotalSeconds)) -ForegroundColor DarkGray
+    }
+
+    # ---- teardown
+    $null = Far-Sftp "Remove-Item -LiteralPath '$farDir' -Recurse -Force -ErrorAction SilentlyContinue"
+    Get-ChildItem (Join-Path $repo 'tmp') -Filter "*$sftpTag*" -ErrorAction SilentlyContinue |
+        ForEach-Object { try { [System.IO.File]::Delete($_.FullName) } catch { } }
 }
 
 # --------------------------------------------------------- 8. username rejected

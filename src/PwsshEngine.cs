@@ -1414,11 +1414,16 @@ namespace Pwssh
                     channel.Signal(sig);
                     ok = true;
                 }
+                else if (req == "subsystem")
+                {
+                    string name = r.StrUtf8();
+                    ok = channel.StartSubsystem(name);
+                    Log(ok ? ("subsystem: " + name) : ("subsystem refused: " + name));
+                }
                 else if (req == "env")
                 {
                     ok = true;              // accepted and ignored
                 }
-                // subsystem: still unsupported -> failure
             }
 
             if (wantReply)
@@ -1486,10 +1491,23 @@ namespace Pwssh
             }
         }
 
-        public void OnAgentError(string message)
+        public void OnAgentError(uint ch, string message)
         {
-            Log("agent error: " + message);
+            Log("agent error on channel " + ch + ": " + message);
             lastError = "agent: " + message;
+
+            // Close the channel the agent named, reporting the reason on stderr first so the
+            // user sees why. Nothing else does this: the agent's FAIL was previously only
+            // logged, so a channel the remote could not start stayed open and ssh waited on it
+            // forever. Everything goes through the channel's own queue, so it stays ordered
+            // behind any output that did make it out.
+            SessionChannel c = Find(ch);
+            if (c == null) return;
+            byte[] text = Encoding.UTF8.GetBytes("pwssh: " + message + "\r\n");
+            c.OnAgentData(text, 0, text.Length, true);
+            c.OnAgentExit(1);
+            c.OnAgentClose();
+            ForgetChannel(ch);
         }
     }
 
@@ -1659,6 +1677,19 @@ namespace Pwssh
         {
             if (!BeginSending()) return false;
             agent.Shell(localId);
+            return true;
+        }
+
+        // The name is checked HERE rather than on the remote, because CHANNEL_REQUEST must be
+        // answered synchronously and there is no round trip to spend asking. That is sound:
+        // sftp is the only subsystem the agent implements, and the agent's source is pushed
+        // from this process on every connection, so the two halves cannot disagree. An unknown
+        // name therefore gets a clean CHANNEL_FAILURE instead of a hang.
+        public bool StartSubsystem(string name)
+        {
+            if (name != "sftp") return false;
+            if (!BeginSending()) return false;
+            agent.Subsystem(localId, name);
             return true;
         }
 
