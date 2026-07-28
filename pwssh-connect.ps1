@@ -45,6 +45,9 @@ param(
     [switch]$DisableConPty,
     # Testing hook: turn off output read coalescing on the agent.
     [switch]$DisableCoalescing,
+    # Honour a client-specified bind address for -R. Off by default, so a reverse forward
+    # binds loopback on the remote rather than exposing it to the remote's network.
+    [switch]$GatewayPorts,
     [string]$LogFile,
     # Progress messages on stderr. Off by default: ssh shows the ProxyCommand's stderr
     # directly in the user's terminal, so it would be noise on every connection.
@@ -104,6 +107,7 @@ try {
     $cfg = New-Object Pwssh.PwsshConfig
     $cfg.HostKey = $hostKey
     $cfg.Agent = $proxy          # ExpectedUser is left unset: resolved from the agent's HELLO
+    $cfg.AllowGatewayPorts = [bool]$GatewayPorts
 
     $engine = New-Object Pwssh.PwsshEngine $cfg
     $engine.Start()
@@ -120,9 +124,16 @@ try {
     if ($Port) { $sp['Port'] = $Port }
     if ($UseSSL) { $sp['UseSSL'] = $true }
     if ($ConfigurationName) { $sp['ConfigurationName'] = $ConfigurationName }
-    # Compression stays enabled -- it is the whole point of sending plaintext. IdleTimeout
-    # bounds orphan cleanup if this client dies before closing the link.
-    $sp['SessionOption'] = New-PSSessionOption -IdleTimeout 180000
+    # Compression stays enabled -- it is the whole point of sending plaintext.
+    #
+    # IdleTimeout reclaims the shell, and it is not a theoretical case: ssh TerminateProcesses
+    # its ProxyCommand on exit, so this script never gets to complete the remote pipeline or
+    # remove the session, and every connection leaves an orphan behind. What releases the
+    # remote's own resources -- child processes, -R listeners -- is the agent's inactivity
+    # watchdog; this only cleans up the shell afterwards. 60 s rather than the 180 s used
+    # before: a live client keeps a WSMan receive outstanding at all times, so it is never idle
+    # and nothing here shortens a real session.
+    $sp['SessionOption'] = New-PSSessionOption -IdleTimeout 60000
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $session = New-PSSession @sp

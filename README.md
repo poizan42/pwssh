@@ -26,12 +26,17 @@ and `Ctrl+C`, where the remote supports ConPTY.
 
 | | |
 |---|---|
-| Implemented | version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, session channels, `exec`, `shell`, `pty-req` (ConPTY), `window-change`, `signal`, `direct-tcpip` forwarding (`-L`, `-D`, `-W`; IPv4 and IPv6), exit status, separate stderr, flow control |
-| Not implemented | remote forwarding (`-R`), SFTP subsystem, rekeying |
+| Implemented | version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, session channels, `exec`, `shell`, `pty-req` (ConPTY), `window-change`, `signal`, port forwarding — `-L`, `-D`, `-W` and `-R`, IPv4 and IPv6 — exit status, separate stderr, flow control |
+| Not implemented | SFTP subsystem, rekeying |
 
 Tested against OpenSSH 9.5p2 on Windows, with a Windows PowerShell 5.1 / .NET Framework 4.8
-remote. The test suite drives the real `ssh` binary: 24 cases over WinRM, 22 against a
+remote. The test suite drives the real `ssh` binary: 29 cases against each of WinRM and a
 loopback dev host.
+
+One wart worth knowing about `-R`: `ssh` kills its `ProxyCommand` when it exits, so pwssh gets
+no chance to tell the remote to unbind the listening port. The remote's own watchdog releases
+it about two minutes later, which means reconnecting with the *same* `-R` port inside that
+window fails.
 
 ## What it needs on the remote
 
@@ -92,6 +97,7 @@ Useful options on `pwssh-connect.ps1`:
 | `-Authentication` | WinRM auth mode, default `Negotiate` |
 | `-CreditMiB` | bulk transfer window, default 32. Larger means fewer round trips on big transfers, at the cost of how much the agent may buffer client-side |
 | `-Streams N` | extra receive sessions for bulk **incompressible** transfers (see below), default 1 |
+| `-GatewayPorts` | let `ssh -R` bind a non-loopback address on the remote. Off by default, matching OpenSSH's `GatewayPorts no`; a request for a wider address is refused rather than quietly narrowed |
 | `-Diagnostics` | progress to stderr. Off by default, since ssh shows a ProxyCommand's stderr on every connection |
 
 ## Performance, honestly

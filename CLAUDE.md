@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns the remote's `DOMAIN\user`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite passes against both transports (22/22 loopback, 24/24 WinRM; the WinRM run has the two extra graceful-degradation cases, the loopback run has the wrong-username check that the WinRM alias takes from `ssh_config`).
+**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns the remote's `DOMAIN\user`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite runs 29 cases against each transport and passes, with one environmental exception: loopback is **28/29**, the failure being the pty case that this client machine's ConPTY breaks (see *Running and testing*). The two runs differ in composition rather than count — WinRM has the graceful-degradation and IPv6 cases plus the gateway-ports check; loopback has the wrong-username check that the WinRM alias takes from `ssh_config`, along with the reverse-forward release and bind-failure cases that need the far side to be this machine.
+
+**A run that fails one case with `exit=255` is usually a flake, not a regression.** 255 is ssh's own error code for a connection that never came up, and it turns up after the remote has been hammered with dozens of sessions in a row. Re-run the case before believing it: the final WinRM run here failed "shell exit status propagates" that way and passed 3/3 immediately afterwards.
 
 **SSH terminates in the client.** `pwssh-connect.ps1` runs the whole SSH engine locally and only plaintext agent frames cross the WinRM link. The remote does no cryptography at all. This was a deliberate change from an earlier design that ran the engine on the remote, and it bought:
 
@@ -15,9 +17,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The throughput gain is WinRM's own compression, which an encrypted stream made useless. The same suite reports **0.31 MiB/s for an incompressible 8 MiB payload** — essentially identical to what the old architecture managed on *compressible* data, which is exactly what the mechanism predicts and a good confirmation of it.
 
-Implemented: version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, `none` auth with username matching, session channel, `exec`, `shell`, `pty-req` via ConPTY, `window-change`, `signal`, `direct-tcpip` forwarding (`-L`/`-D`/`-W`, IPv4 and IPv6), exit status, stderr as `CHANNEL_EXTENDED_DATA`, window management, credit-based flow control to the agent.
+Implemented: version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, `none` auth with username matching, session channel, `exec`, `shell`, `pty-req` via ConPTY, `window-change`, `signal`, `direct-tcpip` forwarding (`-L`/`-D`/`-W`, IPv4 and IPv6), `tcpip-forward` + `forwarded-tcpip` reverse forwarding (`-R`, loopback by default, `-GatewayPorts` to widen), exit status, stderr as `CHANNEL_EXTENDED_DATA`, window management, credit-based flow control to the agent.
 
-Not implemented: remote port forwarding (`-R`), SFTP, rekeying.
+Not implemented: SFTP, rekeying.
 
 **The host key is now purely ceremonial.** It authenticates this proxy, not the remote machine — nothing about it crosses the link. It still has to be stable, because the client pins it in `known_hosts`.
 
@@ -95,7 +97,7 @@ Note also that reading `FileStream.SafeFileHandle` flushes the stream, which a p
 
 ### Port forwarding (`direct-tcpip`)
 
-`ssh -L`, `ssh -D` (SOCKS) and `ssh -W` all work, because the client does the listening and the SOCKS parsing itself and only asks us to open outbound connections — one channel type covers all three. `-R` is not implemented.
+`ssh -L`, `ssh -D` (SOCKS) and `ssh -W` all work, because the client does the listening and the SOCKS parsing itself and only asks us to open outbound connections — one channel type covers all three. `-R` is a separate mechanism; see below.
 
 - **Channels are multiplexed.** The engine keys them by *our* local id, allocated monotonically. Client channel numbers are recycled after close, so keying remote state on them risks a close/open collision; the channel object holds both identities.
 - **`CHANNEL_CLOSE` closes one channel, not the session.** The connection ends only on `DISCONNECT` or transport EOF. `ssh -N` therefore works with no session channel at all.
@@ -109,6 +111,29 @@ Note also that reading `FileStream.SafeFileHandle` flushes the stream, which a p
 **`-D` against a remote without IPv6 logs benign failures.** Confirmed with Firefox: a SOCKS client hands over a literal address, so there is one candidate and no fallback inside pwssh, and every AAAA attempt ends as `channel N: open failed: connect failed: ...` once the connect times out. Nothing is wrong — browsers race the families in parallel, so pages load over IPv4 with no user-visible delay. `ssh -q` (or `LogLevel QUIET`) silences the messages and does not change the exit code; disabling IPv6 in the browser removes the attempts altogether. A per-connect timeout knob was considered and rejected: with the parallel racing there is nothing to gain.
 
 Measured: four concurrent forwarded connections complete in the time of about one (1.6 s), so opens pipeline rather than serialising. Bulk through a forward is bit-exact over 8 MiB.
+
+### Remote forwarding (`-R`, `forwarded-tcpip`)
+
+`ssh -R` works. It is the mirror image of `-L` and needed machinery the engine had never had: the remote binds the listening port, and **we** initiate the channel open when a connection arrives there. Frames: `LISTEN` / `UNLISTEN` / `ACCEPT_OK` outbound, `LISTEN_OK` / `LISTEN_FAIL` / `ACCEPTED` inbound.
+
+- **`CHANNEL_OPEN_CONFIRMATION` and `CHANNEL_OPEN_FAILURE` are now handled.** They previously fell into `default` and drew an `UNIMPLEMENTED` reply, which was harmless only because nothing ever opened a channel from this side. A confirmation for an unknown id is ignored rather than fatal.
+- **The channel id space is partitioned.** The engine allocates upward from 0; the agent allocates ids for connections *it* accepts from `0x80000000`. Without that split the two allocators would eventually collide, and the symptom would be data surfacing on the wrong channel.
+- **A `SessionChannel` can now exist before its peer is known.** `ConfirmOpened(peer, window, maxPacket)` fills in the identity and limits from the client's confirmation and only then starts the sender thread — nothing may be written to the client before the channel is confirmed.
+- **The wire convention for the bind address is the opposite way round from how it reads.** OpenSSH's `channel_rfwd_bind_host` sends `"localhost"` for a plain `-R port:...` and an **empty string** for `-R *:port:...`. So empty means *wildcard*, and only an explicitly-loopback address is safe without `-GatewayPorts`. Reading it the intuitive way silently binds loopback when the user asked for the world, which is the one failure mode worth being careful about here.
+- **The address quoted back in `forwarded-tcpip` must be the one the client asked for**, not the one actually bound: ssh matches an incoming forwarded channel against its own forward list by (address, port). Hence `ACCEPTED` carries the *forward id* and the engine looks the address up in `forwardAddresses` — sending the agent's real bind address would leave ssh reporting `forwarding for unknown listen_port`.
+- **Loopback and wildcard both mean two sockets**, one per address family, exactly as `-L` needed. A socket bound to `127.0.0.1` does not accept `::1`, and a dual-mode socket bound to a *specific* v6 address does not accept mapped v4 either — so a program on the remote reaching `localhost` works whichever family it resolves to. **A partial bind counts as success**, which is what sshd does and what an IPv6-less remote needs. Consequence for testing: occupying only one family does not make a bind fail.
+- **The accepted socket is not read until `ACCEPT_OK`.** Reading earlier would produce data for a channel the client has not yet acknowledged.
+- **Listeners are closed in three places**, because a leaked one keeps a port bound on the remote: `UNLISTEN`, `PwsshAgentHost.Stop()`, and `KillAllChannels()` on the engine side, which unlistens every active forward when the SSH connection ends. Relying on the remote process exiting is slower and less certain, and the leak is invisible without an explicit test — hence the "released on exit" case in the suite. **Ordering is load-bearing there:** `KillAllChannels()` queues those `UNLISTEN` frames and the client's frame loop completes the remote pipeline as soon as it sees `Finished`, so the flag is now set *after* the kill, not before.
+- **Over WinRM the port survives the disconnect, because the client is killed before it can say anything.** `ssh` *TerminateProcesses* its ProxyCommand on exit (`ssh_kill_proxy_command`), so `pwssh-connect.ps1` never reaches its cleanup: the `UNLISTEN` is never delivered, `$inColl.Complete()` never runs, and the remote pipeline never ends. Verified directly — with `-LogFile` on the ProxyCommand the log stops at "session established" and never reaches "engine finished". So **every** connection leaves an orphaned shell, which is why 16 of them had accumulated on the test remote. Measured: both listener sockets still bound 30 s later, owned by a surviving `wsmprovhost`.
+
+  What actually releases them is the **agent's own inactivity watchdog**, and that is why it now runs at 120 s with the client sending a `PING` frame every 30 s (`PwsshAgentProxy.StartKeepAlive`). The keepalive is what makes silence *mean* something: before it, silence was indistinguishable from an idle interactive session, so the timeout had to be generous — and at 300 s the watchdog would have killed a session where the user simply stopped typing for five minutes. The session's WinRM `IdleTimeout` then reclaims the shell afterwards, shortened from 180 s to 60 s for the same reason; a live client always has a WSMan receive outstanding, so it is never idle and a real session is untouched.
+
+  Two practical consequences. Reconnecting with the same `-R` port inside that window still fails — the clean-shutdown paths (`ssh -N` killed locally, `DISCONNECT`, an engine error) release immediately, which is what the dev-host test asserts, but the ordinary `ssh host cmd` exit cannot. And **clear orphaned shells before testing `-R`**, or a leak from a previous run looks like a bug in the current one: that cost a debugging cycle when the "released on exit" probe hung for its full 180 s timeout against a listener with nothing behind it and the failure was reported as "ssh timed out". The probe now bounds every wait and reports `STILLBOUND` instead.
+- **`cancel-tcpip-forward` is answered immediately**, not after a round trip: a failure to unbind is not something the client can act on.
+- **Global request replies are order-matched, not tagged.** RFC 4254 pairs them with requests in order, so `pendingForwards` is a FIFO and a result that arrives for a request behind the head waits its turn. ssh normally keeps one outstanding, but replying out of order would desynchronise every reply after it.
+- **Windows has no privileged-port concept.** A normal user can bind port 80 if it is free, so low ports are not a failure case to design around; real bind failures are "already in use" or an excluded range (`netsh interface ipv4 show excludedportrange` — Hyper-V reserves large parts of the dynamic range). This makes loopback-by-default *more* valuable, not less: `-R 80:...` from an unprivileged remote account can genuinely succeed.
+
+Measured: 512 KiB through a reverse forward is bit-exact, in ~1.1 s on loopback.
 
 ### Striping across sessions (`-Streams N`, default 1)
 
@@ -142,6 +167,14 @@ pwsh -NoProfile -File .\tests\Invoke-PwsshTests.ps1 -Target pwssh-test -Port 0 -
 
 A single manual call: `ssh -F tmp/ssh_config pwssh-test whoami`. Add `-Diagnostics` to the ProxyCommand for stderr progress, which is off by default because ssh shows a ProxyCommand's stderr in the user's terminal on every connection.
 
+The full WinRM run needs the optional targets too — `pwssh-nopty` for the ConPTY degradation cases and `pwssh-test-gw` (same block plus `-GatewayPorts`) for the reverse-forward gateway case:
+
+```powershell
+pwsh -NoProfile -File .\tests\Invoke-PwsshTests.ps1 -Target pwssh-test -Port 0 -ConfigFile tmp/ssh_config -KnownHostsFile tmp/known_hosts_winrm -DegradedTarget pwssh-nopty -DegradedConfigFile tmp/ssh_config_nopty -ForwardTarget '127.0.0.1:5985' -ForwardTarget6 '[::1]:5985' -GatewayTarget pwssh-test-gw -GatewayConfigFile tmp/ssh_config
+```
+
+**ConPTY does not work on this client machine, only on the remote.** The loopback dev host therefore fails the pty case while the WinRM run passes it, and that difference is not a pwssh bug: reduced to a minimal, textbook-correct `CreatePseudoConsole` + `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` program with no pwssh code in it, the child still writes to the parent's inherited stdout instead of the pseudoconsole — the attribute is silently ignored. `FreeConsole()` in the parent first makes no difference. So `pty session produces output` failing on loopback and passing over WinRM is the expected shape here; investigate only if it starts failing over WinRM too.
+
 **Clean up orphaned WinRM shells** after interrupted runs. A killed client leaves the remote pump blocked, and `Remove-PSSession` cannot remove a Busy shell — the WSMan API can:
 
 ```powershell
@@ -150,7 +183,7 @@ Get-WSManInstance -ConnectionURI $uri -ResourceURI shell -Enumerate -Credential 
     ForEach-Object { Remove-WSManInstance -ConnectionURI $uri -ResourceURI shell -SelectorSet @{ShellId = $_.ShellId } -Credential $cred -Authentication Negotiate }
 ```
 
-The engine also has an inactivity watchdog (`PwsshConfig.InactivityTimeoutSeconds`, default 300) so orphans self-terminate rather than waiting out WinRM's 2-hour timeout.
+Both ends have an inactivity watchdog so orphans self-terminate rather than waiting out WinRM's 2-hour timeout: `PwsshConfig.InactivityTimeoutSeconds` (default 300) on the client, and `PwsshAgentHost.InactivityTimeoutSeconds` (default 120) on the remote, the latter backed by a 30 s `PING` from the client so that silence reliably means the client is gone. The remote one is what releases child processes and `-R` listeners after an abrupt disconnect, which is every disconnect — see the `-R` section.
 
 ## Implementation traps
 
@@ -370,6 +403,7 @@ This only affects interactive `shell` responsiveness — bulk transfer already p
 
 - **No rekeying.** OpenSSH rekeys after ~1 GiB or 1 hour; on a post-established `KEXINIT` the server sends `SSH_MSG_DISCONNECT` rather than corrupt cipher state. Long or very large sessions will drop.
 - **Not manually verified**, because they cannot be asserted from a script: colour rendering, `Ctrl+C` interrupting a running command, and `window-change` actually reflowing output. The code paths exist (`ResizePseudoConsole` is wired to `window-change`) and the automated tests confirm a pty session runs and emits VT sequences, but a human should sit at an interactive session once.
+- **A long-idle interactive session is probably dropped after 5 minutes, from the client side.** The engine's watchdog fires after `InactivityTimeoutSeconds` (300) without inbound SSH traffic, and ssh sends none while idle: `ServerAliveInterval` defaults to 0, and `TCPKeepAlive` operates below the SSH layer. The agent side no longer has this problem — the `PING` keepalive means its 120 s timeout only ever sees a genuinely dead client — but nothing sends the equivalent *towards* the client, so the asymmetry now sits here. Not directly verified (it needs a 5-minute idle session), and the workaround is `ServerAliveInterval 60` in the `Host` block. Worth fixing properly if interactive use becomes common.
 - **`signal` is implemented but effectively untested.** OpenSSH rarely sends `SSH_MSG_CHANNEL_REQUEST "signal"` — with a pty, `Ctrl+C` arrives as data and the console handles it — so there is no practical way to exercise it through the stock client. It maps to killing the child tree.
 - **Throughput is well below the channel's capability and not yet explained.** Measured on an 8 MiB `exec` payload: **0.25 MiB/s over WinRM**, against ~3.5–4 MiB/s for the raw transport — roughly 14× down. Two hypotheses have been tested and largely ruled out:
   - *AES-CTR cost.* The keystream is now generated 4 KiB at a time instead of per 16-byte block (`TransformBlock` per block costs a CNG transition). This did not move the WinRM figure (0.18 → 0.18) and slightly *reduced* loopback (1.35 → 1.04 MiB/s), so the cipher is not the constraint. The batching is kept because it is strictly less work.

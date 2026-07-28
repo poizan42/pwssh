@@ -28,6 +28,10 @@ namespace Pwssh
         // Where channels actually run. Never null in practice.
         public IPwsshAgent Agent;
 
+        // Whether a client-specified -R bind address is honoured. Off by default, matching
+        // OpenSSH's GatewayPorts no, which means loopback only.
+        public bool AllowGatewayPorts;
+
         // If the client vanishes without closing the session, the remote pipeline would
         // otherwise block forever and hold a WinRM shell until WinRM's own (2 hour)
         // timeout. Bounded here instead. 0 disables.
@@ -552,13 +556,25 @@ namespace Pwssh
         private void KillAllChannels()
         {
             SessionChannel[] all;
+            uint[] forwards;
             lock (chanGate)
             {
                 all = new SessionChannel[channels.Count];
                 channels.Values.CopyTo(all, 0);
                 channels.Clear();
+                forwards = new uint[activeForwards.Count];
+                activeForwards.Keys.CopyTo(forwards, 0);
+                activeForwards.Clear();
+                forwardAddresses.Clear();
             }
             for (int i = 0; i < all.Length; i++) { try { all[i].Kill(); } catch { } }
+            // -R listeners are not channels, and a surviving one keeps a port bound on the
+            // remote. The agent also drops them when the link closes, but that relies on the
+            // remote process going away, which is a slower and less certain thing.
+            for (int i = 0; i < forwards.Length; i++)
+            {
+                try { if (cfg.Agent != null) cfg.Agent.Unlisten(forwards[i]); } catch { }
+            }
         }
 
         // Diagnostics are queued rather than delivered by callback: the engine logs from
@@ -609,8 +625,11 @@ namespace Pwssh
             }
             finally
             {
-                finished = true;
+                // Order matters: KillAllChannels queues UNLISTEN frames for the agent, and the
+                // client's frame loop completes the remote pipeline as soon as it sees Finished.
+                // Setting the flag first would let that happen before the frames were drained.
                 KillAllChannels();
+                finished = true;
                 // let the transport drain whatever is already queued
                 outbound.Close();
             }
@@ -929,16 +948,40 @@ namespace Pwssh
                         break;
 
                     case Msg.GLOBAL_REQUEST:
+                        HandleGlobalRequest(payload);
+                        break;
+
+                    // Answers to channels WE opened, which only happens for -R's
+                    // forwarded-tcpip. Previously these fell through to UNIMPLEMENTED.
+                    case Msg.CHANNEL_OPEN_CONFIRMATION:
                         {
                             SshReader r = new SshReader(payload);
                             r.Byte();
-                            r.StrUtf8();
-                            bool wantReply = r.Bool();
-                            if (wantReply)
+                            uint mine = r.UInt32();
+                            uint theirs = r.UInt32();
+                            uint window = r.UInt32();
+                            uint maxPacket = r.UInt32();
+                            SessionChannel oc = Find(mine);
+                            if (oc != null)
                             {
-                                SshWriter w = new SshWriter();
-                                w.Byte(Msg.REQUEST_FAILURE);
-                                pkt.WritePacket(w.ToArray());
+                                oc.ConfirmOpened(theirs, window, maxPacket);
+                                Log("forwarded channel " + mine + " confirmed by client");
+                            }
+                            else Log("confirmation for unknown channel " + mine + "; ignoring");
+                        }
+                        break;
+
+                    case Msg.CHANNEL_OPEN_FAILURE:
+                        {
+                            SshReader r = new SshReader(payload);
+                            r.Byte();
+                            uint mine = r.UInt32();
+                            SessionChannel fc = Find(mine);
+                            if (fc != null)
+                            {
+                                Log("client refused forwarded channel " + mine);
+                                fc.Kill();
+                                ForgetChannel(mine);
                             }
                         }
                         break;
@@ -1121,6 +1164,193 @@ namespace Pwssh
             w.UInt32(INITIAL_WINDOW);
             w.UInt32(MAX_PACKET);
             pkt.WritePacket(w.ToArray());
+        }
+
+        // ---- remote forwarding (-R) ----
+        //
+        // RFC 4254 matches global request replies to requests *in order*, not by any tag, so a
+        // result that arrives for a request behind the head has to wait its turn. ssh normally
+        // keeps one outstanding, but replying out of order would desynchronise every reply
+        // after it.
+        private sealed class PendingForward
+        {
+            public uint ForwardId;
+            public bool WantReply;
+            public bool Done;
+            public bool Ok;
+            public int BoundPort;
+            public bool RequestedDynamicPort;
+        }
+
+        private readonly List<PendingForward> pendingForwards = new List<PendingForward>();
+        private readonly Dictionary<uint, int> activeForwards = new Dictionary<uint, int>();  // id -> bound port
+        // id -> the address string the CLIENT sent. ssh matches an incoming forwarded-tcpip
+        // against its own forward list by (address, port), and its stored address is the one it
+        // asked for -- not the one we actually bound -- so this is what has to be quoted back.
+        private readonly Dictionary<uint, string> forwardAddresses = new Dictionary<uint, string>();
+        private uint nextForwardId = 1;
+
+        private void HandleGlobalRequest(byte[] payload)
+        {
+            SshReader r = new SshReader(payload);
+            r.Byte();
+            string name = r.StrUtf8();
+            bool wantReply = r.Bool();
+
+            if (name == "tcpip-forward")
+            {
+                string bindAddr = r.StrUtf8();
+                uint bindPort = r.UInt32();
+
+                // Careful with the wire convention, which is the opposite way round from what
+                // it looks like: OpenSSH's channel_rfwd_bind_host sends "localhost" for a plain
+                // `-R port:...` and an EMPTY string for `-R *:port:...`. So empty means
+                // wildcard, and only loopback is safe without -GatewayPorts. Refusing outright
+                // beats silently binding somewhere narrower than the client asked for.
+                bool loopbackOnly = bindAddr == "localhost" || bindAddr == "127.0.0.1"
+                                    || bindAddr == "::1";
+                if (!loopbackOnly && !cfg.AllowGatewayPorts)
+                {
+                    Log("refusing tcpip-forward on '" + bindAddr + "': needs -GatewayPorts");
+                    if (wantReply) ReplyGlobal(false, 0);
+                    return;
+                }
+                // The agent treats an empty address as wildcard, matching the wire convention.
+                string effective = loopbackOnly ? "127.0.0.1" : bindAddr;
+
+                uint id;
+                lock (chanGate)
+                {
+                    id = nextForwardId++;
+                    forwardAddresses[id] = bindAddr;
+                }
+
+                PendingForward pf = new PendingForward();
+                pf.ForwardId = id;
+                pf.WantReply = wantReply;
+                pf.RequestedDynamicPort = (bindPort == 0);
+                lock (pendingForwards) { pendingForwards.Add(pf); }
+
+                Log("tcpip-forward '" + bindAddr + "' -> bind " + effective + ":" + bindPort);
+                cfg.Agent.Listen(id, effective, (int)bindPort);
+                return;                        // reply comes from OnListenResult
+            }
+
+            if (name == "cancel-tcpip-forward")
+            {
+                r.StrUtf8();                   // bind address
+                uint port = r.UInt32();
+                uint found = 0;
+                lock (chanGate)
+                {
+                    foreach (KeyValuePair<uint, int> kv in activeForwards)
+                    {
+                        if (kv.Value == (int)port) { found = kv.Key; break; }
+                    }
+                    if (found != 0) { activeForwards.Remove(found); forwardAddresses.Remove(found); }
+                }
+                if (found != 0) cfg.Agent.Unlisten(found);
+                // Replied immediately: a failure to unbind is not something the client can act
+                // on, so waiting a round trip for confirmation buys nothing.
+                if (wantReply) ReplyGlobal(found != 0, 0);
+                return;
+            }
+
+            if (wantReply) ReplyGlobal(false, 0);
+        }
+
+        private void ReplyGlobal(bool ok, uint boundPort)
+        {
+            SshWriter w = new SshWriter();
+            if (ok)
+            {
+                w.Byte(Msg.REQUEST_SUCCESS);
+                if (boundPort != 0) w.UInt32(boundPort);   // only when the client asked for 0
+            }
+            else
+            {
+                w.Byte(Msg.REQUEST_FAILURE);
+            }
+            pkt.WritePacket(w.ToArray());
+        }
+
+        public void OnListenResult(uint forwardId, bool ok, int boundPort, string message)
+        {
+            if (ok)
+            {
+                lock (chanGate) { activeForwards[forwardId] = boundPort; }
+                Log("forward " + forwardId + " bound to port " + boundPort);
+            }
+            else
+            {
+                lock (chanGate) { forwardAddresses.Remove(forwardId); }
+                Log("forward " + forwardId + " failed: " + message);
+            }
+
+            // Mark this one done, then flush replies from the head while they are ready.
+            lock (pendingForwards)
+            {
+                for (int i = 0; i < pendingForwards.Count; i++)
+                {
+                    if (pendingForwards[i].ForwardId == forwardId)
+                    {
+                        pendingForwards[i].Done = true;
+                        pendingForwards[i].Ok = ok;
+                        pendingForwards[i].BoundPort = boundPort;
+                        break;
+                    }
+                }
+                while (pendingForwards.Count > 0 && pendingForwards[0].Done)
+                {
+                    PendingForward head = pendingForwards[0];
+                    pendingForwards.RemoveAt(0);
+                    if (head.WantReply)
+                    {
+                        ReplyGlobal(head.Ok, head.RequestedDynamicPort ? (uint)head.BoundPort : 0);
+                    }
+                }
+            }
+        }
+
+        // A connection arrived on a remote listener: open a forwarded-tcpip channel to the
+        // client. This is the only place the engine initiates a channel.
+        public void OnAccepted(uint ch, uint forwardId, int boundPort, string originAddress, int originPort)
+        {
+            SessionChannel c;
+            string boundAddress;
+            lock (chanGate)
+            {
+                if (!forwardAddresses.TryGetValue(forwardId, out boundAddress))
+                {
+                    // Raced a cancel-tcpip-forward, or the agent accepted on a listener we no
+                    // longer know about. Either way ssh would refuse the open.
+                    Log("accepted connection for unknown forward " + forwardId + "; dropping");
+                    cfg.Agent.CloseChannel(ch);
+                    return;
+                }
+                if (channels.Count >= MAX_CHANNELS)
+                {
+                    Log("too many channels; dropping accepted forward " + ch);
+                    cfg.Agent.CloseChannel(ch);
+                    return;
+                }
+                // Keyed by the id the agent chose, which comes from a disjoint range.
+                c = new SessionChannel(this, pkt, cfg.Agent, ch, 0, 0, MAX_PACKET);
+                channels[ch] = c;
+            }
+
+            SshWriter w = new SshWriter();
+            w.Byte(Msg.CHANNEL_OPEN);
+            w.Str("forwarded-tcpip");
+            w.UInt32(ch);                  // our channel id
+            w.UInt32(INITIAL_WINDOW);
+            w.UInt32(MAX_PACKET);
+            w.Str(boundAddress);
+            w.UInt32((uint)boundPort);
+            w.Str(originAddress);
+            w.UInt32((uint)originPort);
+            pkt.WritePacket(w.ToArray());
+            Log("opening forwarded-tcpip " + ch + " from " + originAddress + ":" + originPort);
         }
 
         private void RejectChannelOpen(uint peerChannel, uint reason, string text)
@@ -1371,9 +1601,12 @@ namespace Pwssh
         private readonly IPwsshAgent agent;
         // Two identities: peerChannel addresses ssh, localId addresses the agent. They are
         // different numbers because the client reuses its channel ids and we never do.
+        //
+        // peerChannel and peerMaxPacket are not readonly because a channel WE open (-R's
+        // forwarded-tcpip) exists before the client's confirmation tells us either.
         private readonly uint localId;
-        private readonly uint peerChannel;
-        private readonly uint peerMaxPacket;
+        private uint peerChannel;
+        private uint peerMaxPacket;
 
         private readonly object windowGate = new object();
         private long remoteWindow;                 // credit the ssh client has granted us
@@ -1435,6 +1668,17 @@ namespace Pwssh
         public void StartConnect(string host, int port) { agent.Connect(localId, host, port); }
 
         public void BeginForwarding() { BeginSending(); }
+
+        // Server-initiated channel (-R): the client's confirmation supplies the identity and
+        // limits we did not have when the channel was created.
+        public void ConfirmOpened(uint peer, uint window, uint maxPacket)
+        {
+            peerChannel = peer;
+            peerMaxPacket = maxPacket == 0 ? 32768 : maxPacket;
+            lock (windowGate) { remoteWindow = window; Monitor.PulseAll(windowGate); }
+            agent.AcceptOk(localId);
+            BeginSending();
+        }
 
         private bool BeginSending()
         {

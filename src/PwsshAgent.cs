@@ -55,6 +55,15 @@ namespace Pwssh
         public const byte RESIZE = 0x08;  // payload: uint32 cols, uint32 rows
         public const byte SIGNAL = 0x09;  // payload: UTF-8 signal name
         public const byte CONNECT = 0x0A; // payload: UTF-8 host, uint32 port (direct-tcpip)
+        // Remote forwarding (-R). The channel field carries a forward id for LISTEN/UNLISTEN,
+        // and an accepted-channel id for ACCEPT_OK.
+        public const byte LISTEN = 0x0B;    // payload: UTF-8 bind address, uint32 port
+        public const byte UNLISTEN = 0x0C;  // no payload
+        public const byte ACCEPT_OK = 0x0D; // no payload: the client confirmed, start pumping
+        // Keepalive. Carries nothing and is discarded on arrival; its only purpose is to prove
+        // the client is still there, so the agent's watchdog can tell an idle session from a
+        // dead one. See PwsshAgentHost.Watchdog for why that distinction has to be made.
+        public const byte PING = 0x0E;
 
         // agent -> client
         public const byte OUT = 0x81;     // payload: stdout bytes
@@ -65,6 +74,13 @@ namespace Pwssh
         public const byte FAIL = 0x86;    // payload: UTF-8 message
         public const byte CONNECT_OK = 0x87;   // no payload: the outbound socket is up
         public const byte CONNECT_FAIL = 0x88; // payload: UTF-8 reason
+        public const byte LISTEN_OK = 0x89;    // payload: uint32 actually bound port
+        public const byte LISTEN_FAIL = 0x8A;  // payload: UTF-8 reason
+        // payload: uint32 forward id, uint32 bound port, UTF-8 origin address, uint32 origin port.
+        // The channel field is the accepted channel's id. The bound *address* is deliberately
+        // not sent: the client has to quote back the address string it asked for, not the one
+        // we actually bound, or ssh will not match the channel to its forward.
+        public const byte ACCEPTED = 0x8B;
 
         // Flag bit: the payload is raw-deflate compressed. None of the types above use
         // 0x40, so it composes with any of them.
@@ -574,6 +590,10 @@ namespace Pwssh
         // direct-tcpip: the result arrives asynchronously via IPwsshChannelSink, because
         // blocking the protocol loop on a remote connect would stall every other channel.
         void Connect(uint channel, string host, int port);
+        // Remote forwarding. Results arrive asynchronously via IPwsshChannelSink.
+        void Listen(uint forwardId, string bindAddress, int port);
+        void Unlisten(uint forwardId);
+        void AcceptOk(uint channel);
         void RequestPty(uint channel, uint cols, uint rows, string term);
         void Resize(uint channel, uint cols, uint rows);
         void Signal(uint channel, string name);
@@ -598,6 +618,8 @@ namespace Pwssh
         void OnExit(uint channel, uint status);
         void OnClose(uint channel);
         void OnConnectResult(uint channel, bool ok, string message);
+        void OnListenResult(uint forwardId, bool ok, int boundPort, string message);
+        void OnAccepted(uint channel, uint forwardId, int boundPort, string originAddress, int originPort);
         void OnAgentError(string message);
     }
 
@@ -614,9 +636,41 @@ namespace Pwssh
 
         public bool RemoteSupportsPty { get { return remotePty; } }
 
-        public void Attach(IPwsshChannelSink s) { sink = s; }
+        public void Attach(IPwsshChannelSink s)
+        {
+            sink = s;
+            StartKeepAlive();
+        }
 
         public bool InboundClosed { get { return inboundClosed; } }
+
+        // Keepalive interval. The agent times out at four times this, so a couple of lost or
+        // delayed pings are harmless.
+        public static int KeepAliveMs = 30000;
+        private int keepAliveStarted;
+
+        // ssh TerminateProcesses its ProxyCommand on exit, so this process usually dies without
+        // a chance to tell the remote anything. The agent therefore cannot distinguish an idle
+        // client from a dead one by silence alone -- hence a ping while we are alive, and the
+        // absence of one being what lets the agent give up and release its resources.
+        private void StartKeepAlive()
+        {
+            if (KeepAliveMs <= 0) return;
+            if (Interlocked.CompareExchange(ref keepAliveStarted, 1, 0) != 0) return;
+            Thread t = new Thread(new ThreadStart(delegate
+            {
+                while (!inboundClosed)
+                {
+                    Thread.Sleep(KeepAliveMs);
+                    if (inboundClosed) return;
+                    try { outbound.Enqueue(Frame.Make(FrameType.PING, 0, null)); }
+                    catch (Exception) { return; }
+                }
+            }));
+            t.IsBackground = true;
+            t.Name = "pwssh-keepalive";
+            t.Start();
+        }
 
         // Transport side: drain frames to send to the remote.
         public byte[] TakeOutboundFrame(int timeoutMs) { return outbound.Take(timeoutMs); }
@@ -677,6 +731,23 @@ namespace Pwssh
                 case FrameType.CONNECT_FAIL:
                     if (sink != null) sink.OnConnectResult(ch, false, Frame.PayloadText(frame));
                     break;
+                case FrameType.LISTEN_OK:
+                    if (sink != null) sink.OnListenResult(ch, true, (int)Frame.PayloadUInt32(frame), null);
+                    break;
+                case FrameType.LISTEN_FAIL:
+                    if (sink != null) sink.OnListenResult(ch, false, 0, Frame.PayloadText(frame));
+                    break;
+                case FrameType.ACCEPTED:
+                    if (sink != null)
+                    {
+                        SshLikeReader ar = new SshLikeReader(frame, Frame.HEADER);
+                        uint fwd = ar.UInt32();
+                        int bPort = (int)ar.UInt32();
+                        string oAddr = ar.Text();
+                        int oPort = (int)ar.UInt32();
+                        sink.OnAccepted(ch, fwd, bPort, oAddr, oPort);
+                    }
+                    break;
                 case FrameType.FAIL:
                     if (sink != null) sink.OnAgentError(Frame.PayloadText(frame));
                     break;
@@ -720,6 +791,23 @@ namespace Pwssh
             SshLikeWriter w = new SshLikeWriter();
             w.Text(host); w.UInt32((uint)port);
             outbound.Enqueue(Frame.Make(FrameType.CONNECT, channel, w.ToArray()));
+        }
+
+        public void Listen(uint forwardId, string bindAddress, int port)
+        {
+            SshLikeWriter w = new SshLikeWriter();
+            w.Text(bindAddress); w.UInt32((uint)port);
+            outbound.Enqueue(Frame.Make(FrameType.LISTEN, forwardId, w.ToArray()));
+        }
+
+        public void Unlisten(uint forwardId)
+        {
+            outbound.Enqueue(Frame.Make(FrameType.UNLISTEN, forwardId, null));
+        }
+
+        public void AcceptOk(uint channel)
+        {
+            outbound.Enqueue(Frame.Make(FrameType.ACCEPT_OK, channel, null));
         }
 
         public void RequestPty(uint channel, uint cols, uint rows, string term)
@@ -782,7 +870,17 @@ namespace Pwssh
 
         // If the client vanishes without closing the session the pipeline would otherwise
         // block forever and hold a WinRM shell until WinRM's own 2-hour timeout. 0 disables.
-        public int InactivityTimeoutSeconds = 300;
+        // How long silence from the client is tolerated before giving up and releasing
+        // everything. This is the only thing that ends an orphaned agent: ssh
+        // TerminateProcesses its ProxyCommand, so the client normally dies without completing
+        // the pipeline, and the remote would otherwise hold its child processes and any -R
+        // listener until WinRM reclaimed the shell.
+        //
+        // It can be this short only because the client sends PING frames (see
+        // PwsshAgentProxy.StartKeepAlive): before that, silence could equally mean an idle
+        // interactive session, and a timeout of 120 s would have killed one after two minutes
+        // of the user not typing.
+        public int InactivityTimeoutSeconds = 120;
 
         // Testing hook: forces the no-ConPTY path on a remote that does have it, so the
         // graceful-degradation behaviour can be exercised rather than assumed.
@@ -809,6 +907,13 @@ namespace Pwssh
         public static uint InitialTcpCredit = 2 * 1024 * 1024;
 
         private readonly Dictionary<uint, AgentTcpChannel> tcpChannels = new Dictionary<uint, AgentTcpChannel>();
+        private readonly Dictionary<uint, AgentListener> listeners = new Dictionary<uint, AgentListener>();
+
+        // Channel ids for connections WE accept come from the top of the space; the engine
+        // allocates upward from 0. Two allocators sharing one space would eventually collide,
+        // and the symptom would be data surfacing on the wrong channel.
+        private const uint ACCEPTED_ID_BASE = 0x80000000;
+        private uint nextAccepted = ACCEPTED_ID_BASE;
 
         private AgentTcpChannel FindTcp(uint ch)
         {
@@ -954,8 +1059,13 @@ namespace Pwssh
                         {
                             SshLikeReader r = new SshLikeReader(frame, Frame.HEADER);
                             PtyRequest req = new PtyRequest();
-                            req.Cols = r.UInt32();
-                            req.Rows = r.UInt32();
+                            // A client with no local terminal of its own sends 0x0 -- ssh -tt
+                            // with redirected stdin does exactly that -- and a pseudoconsole
+                            // with no cells has nothing to render. ConPtySession substitutes a
+                            // default of its own, but do it here too so the size the agent
+                            // reports and the size it uses cannot disagree.
+                            req.Cols = PtyRequest.Clamp(r.UInt32(), 80);
+                            req.Rows = PtyRequest.Clamp(r.UInt32(), 24);
                             req.Term = r.Text();
                             lock (chanGate) { pendingPty[ch] = req; }
                             Log("pty requested on channel " + ch + ": " + req.Cols + "x" + req.Rows + " " + req.Term);
@@ -965,8 +1075,8 @@ namespace Pwssh
                     case FrameType.RESIZE:
                         {
                             SshLikeReader r = new SshLikeReader(frame, Frame.HEADER);
-                            uint cols = r.UInt32();
-                            uint rows = r.UInt32();
+                            uint cols = PtyRequest.Clamp(r.UInt32(), 80);
+                            uint rows = PtyRequest.Clamp(r.UInt32(), 24);
                             AgentChannel c = Find(ch);
                             if (c != null) c.Resize(cols, rows);
                         }
@@ -980,6 +1090,11 @@ namespace Pwssh
                         }
                         break;
 
+                    // Nothing to do: arriving at all is the whole message, and the inbound
+                    // timestamp that keeps the watchdog quiet has already been refreshed.
+                    case FrameType.PING:
+                        break;
+
                     case FrameType.CONNECT:
                         {
                             SshLikeReader r = new SshLikeReader(frame, Frame.HEADER);
@@ -988,6 +1103,45 @@ namespace Pwssh
                             AgentTcpChannel c = new AgentTcpChannel(this, ch);
                             lock (chanGate) { tcpChannels[ch] = c; }
                             c.BeginConnect(target, port);
+                        }
+                        break;
+
+                    case FrameType.LISTEN:
+                        {
+                            SshLikeReader r = new SshLikeReader(frame, Frame.HEADER);
+                            string addr = r.Text();
+                            int port = (int)r.UInt32();
+                            AgentListener l = new AgentListener(this, ch);
+                            string err = l.Bind(addr, port);
+                            if (err == null)
+                            {
+                                lock (chanGate) { listeners[ch] = l; }
+                                Log("listening on " + addr + ":" + l.BoundPort + " (forward " + ch + ")");
+                                Send(Frame.MakeUInt32(FrameType.LISTEN_OK, ch, (uint)l.BoundPort));
+                            }
+                            else
+                            {
+                                Log("bind " + addr + ":" + port + " failed: " + err);
+                                Send(Frame.MakeText(FrameType.LISTEN_FAIL, ch, err));
+                            }
+                        }
+                        break;
+
+                    case FrameType.UNLISTEN:
+                        {
+                            AgentListener l = null;
+                            lock (chanGate)
+                            {
+                                if (listeners.TryGetValue(ch, out l)) listeners.Remove(ch);
+                            }
+                            if (l != null) { l.Stop(); Log("forward " + ch + " cancelled"); }
+                        }
+                        break;
+
+                    case FrameType.ACCEPT_OK:
+                        {
+                            AgentTcpChannel t = FindTcp(ch);
+                            if (t != null) t.StartPumping();
                         }
                         break;
 
@@ -1016,7 +1170,9 @@ namespace Pwssh
                             AgentChannel c = Find(ch);
                             if (c != null) { c.Kill(); break; }
                             AgentTcpChannel t = FindTcp(ch);
-                            if (t != null) t.Kill();
+                            // Forget explicitly: an accepted -R channel the client refused was
+                            // never pumping, so nothing else would ever drop it.
+                            if (t != null) { t.Kill(); Forget(ch); }
                         }
                         break;
 
@@ -1055,6 +1211,10 @@ namespace Pwssh
             {
                 foreach (AgentChannel c in channels.Values) { try { c.Kill(); } catch { } }
                 foreach (AgentTcpChannel t in tcpChannels.Values) { try { t.Kill(); } catch { } }
+                // Must happen here: a surviving listener keeps the port bound on the remote
+                // until wsmprovhost exits, which the inactivity watchdog only bounds loosely.
+                foreach (AgentListener l in listeners.Values) { try { l.Stop(); } catch { } }
+                listeners.Clear();
             }
             foreach (PipeSink p in stripes) { try { p.Close(); } catch { } }
             outbound.Close();
@@ -1100,6 +1260,40 @@ namespace Pwssh
         {
             lock (chanGate) { channels.Remove(ch); tcpChannels.Remove(ch); }
         }
+
+        // A connection arrived on a -R listener. Park it against a fresh channel id and tell
+        // the client, which opens a forwarded-tcpip channel back to us; pumping starts only
+        // once that channel is confirmed via ACCEPT_OK.
+        internal void OnAccepted(AgentListener l, Socket accepted)
+        {
+            uint id;
+            AgentTcpChannel c;
+            lock (chanGate)
+            {
+                id = nextAccepted++;
+                c = new AgentTcpChannel(this, id);
+                tcpChannels[id] = c;
+            }
+            c.Adopt(accepted);
+
+            string origAddr = "unknown";
+            int origPort = 0;
+            try
+            {
+                IPEndPoint rep = accepted.RemoteEndPoint as IPEndPoint;
+                if (rep != null) { origAddr = rep.Address.ToString(); origPort = rep.Port; }
+            }
+            catch { }
+
+            Log("accepted " + origAddr + ":" + origPort + " on forward port " + l.BoundPort + " as channel " + id);
+
+            SshLikeWriter w = new SshLikeWriter();
+            w.UInt32(l.ForwardId);
+            w.UInt32((uint)l.BoundPort);
+            w.Text(origAddr);
+            w.UInt32((uint)origPort);
+            Send(Frame.Make(FrameType.ACCEPTED, id, w.ToArray()));
+        }
     }
 
     // ------------------------------------------------------------------- ConPTY
@@ -1117,6 +1311,13 @@ namespace Pwssh
         public uint Cols;
         public uint Rows;
         public string Term;
+
+        // 0 means "the client does not know"; anything absurd would be a bad resize too.
+        public static uint Clamp(uint value, uint fallback)
+        {
+            if (value == 0) return fallback;
+            return value > 9999 ? 9999 : value;
+        }
     }
 
     // Kills the whole process tree when closed. A shell spawns children, and
@@ -1731,6 +1932,25 @@ namespace Pwssh
             lock (creditGate) { credit += add; Monitor.PulseAll(creditGate); }
         }
 
+        // Remote forwarding: the socket already exists, having been accepted by an
+        // AgentListener. It is deliberately NOT read until the client confirms the channel,
+        // or we would produce data for a channel that does not exist yet.
+        public void Adopt(Socket accepted)
+        {
+            sock = accepted;
+            try { sock.NoDelay = true; } catch { }
+            stream = new NetworkStream(accepted, false);
+        }
+
+        public void StartPumping()
+        {
+            if (stream == null) return;
+            Thread pump = new Thread(new ThreadStart(Pump));
+            pump.IsBackground = true;
+            pump.Name = "pwssh-tcp-pump";
+            pump.Start();
+        }
+
         // Connects on its own thread: this is called from the frame dispatch path, and a
         // blocking connect there would stall every other channel.
         public void BeginConnect(string hostName, int port)
@@ -1914,6 +2134,134 @@ namespace Pwssh
             killed = true;
             lock (creditGate) { Monitor.PulseAll(creditGate); }
             try { if (sock != null) sock.Close(); } catch { }
+        }
+    }
+
+    // ------------------------------------------------------------ remote forwarding (-R)
+    //
+    // Binds a port on the remote and reports each accepted connection to the client, which
+    // then opens a forwarded-tcpip channel back to us. The accepted socket is parked until
+    // that channel is confirmed.
+
+    internal sealed class AgentListener
+    {
+        private readonly PwsshAgentHost host;
+        private readonly uint forwardId;
+        private readonly List<TcpListener> listeners = new List<TcpListener>();
+        private volatile bool stopped;
+
+        public AgentListener(PwsshAgentHost h, uint id) { host = h; forwardId = id; }
+
+        public uint ForwardId { get { return forwardId; } }
+        public int BoundPort { get; private set; }
+
+        // Returns null on success, or the reason it could not bind.
+        //
+        // Note there is no privileged-port rule on Windows: a normal user can bind port 80 if
+        // it is free. Binds fail because the port is already in use, or because it falls in an
+        // excluded range (netsh interface ipv4 show excludedportrange).
+        //
+        // Runs on the frame dispatch thread, which binding is quick enough for. The exception is
+        // a named bind address, which costs a DNS lookup and so briefly stalls every channel --
+        // only reachable with -GatewayPorts, and only when the client names a host rather than
+        // an address.
+        public string Bind(string address, int port)
+        {
+            // One socket per address family, for the same reason -L needed it: a socket bound
+            // to 127.0.0.1 does not accept ::1, and a dual-mode socket bound to a *specific*
+            // v6 address does not accept mapped v4 either. So loopback and wildcard both mean
+            // two sockets, and a program on the remote reaching "localhost" works whichever
+            // family it resolves to.
+            IPAddress[] addrs;
+            try { addrs = ParseBindAddresses(address); }
+            catch (Exception ex) { return ex.Message; }
+            string firstError = null;
+            int chosen = port;
+
+            foreach (IPAddress addr in addrs)
+            {
+                TcpListener l = null;
+                try
+                {
+                    l = new TcpListener(addr, chosen);
+                    l.Start();
+                    if (chosen == 0) chosen = ((IPEndPoint)l.LocalEndpoint).Port;
+                    listeners.Add(l);
+                }
+                catch (Exception ex)
+                {
+                    try { if (l != null) l.Stop(); } catch { }
+                    if (firstError == null) firstError = ex.Message;
+                }
+            }
+
+            // Partial success is success: an IPv6-less remote must not fail an ordinary -R.
+            if (listeners.Count == 0)
+            {
+                return firstError == null ? "no address to bind" : firstError;
+            }
+
+            BoundPort = chosen;
+            foreach (TcpListener l in listeners)
+            {
+                TcpListener captured = l;
+                Thread t = new Thread(delegate() { AcceptLoop(captured); });
+                t.IsBackground = true;
+                t.Name = "pwssh-listen-" + BoundPort;
+                t.Start();
+            }
+            return null;
+        }
+
+        // An EMPTY address means wildcard, not loopback: that is what OpenSSH puts on the wire
+        // for `-R *:port:...` (see the note in PwsshEngine.HandleGlobalRequest).
+        private static IPAddress[] ParseBindAddresses(string address)
+        {
+            if (string.IsNullOrEmpty(address) || address == "*" || address == "0.0.0.0")
+                return new IPAddress[] { IPAddress.Any, IPAddress.IPv6Any };
+            if (address == "::" || address == "[::]")
+                return new IPAddress[] { IPAddress.IPv6Any };
+            if (address == "localhost")
+                return new IPAddress[] { IPAddress.Loopback, IPAddress.IPv6Loopback };
+            IPAddress parsed;
+            if (IPAddress.TryParse(address.Trim('[', ']'), out parsed))
+            {
+                // 127.0.0.1 is how the engine spells "loopback only", so widen it to both
+                // families; any other literal is taken exactly as given.
+                if (IPAddress.Loopback.Equals(parsed))
+                    return new IPAddress[] { IPAddress.Loopback, IPAddress.IPv6Loopback };
+                return new IPAddress[] { parsed };
+            }
+            IPAddress[] resolved = Dns.GetHostAddresses(address);
+            if (resolved.Length == 0) throw new Exception("cannot resolve bind address " + address);
+            return resolved;
+        }
+
+        private void AcceptLoop(TcpListener listener)
+        {
+            while (!stopped)
+            {
+                Socket s;
+                try { s = listener.AcceptSocket(); }
+                catch (Exception)
+                {
+                    break;                        // listener stopped
+                }
+                if (stopped) { try { s.Close(); } catch { } break; }
+
+                try { host.OnAccepted(this, s); }
+                catch (Exception ex)
+                {
+                    host.Log("accept handling failed: " + ex.Message);
+                    try { s.Close(); } catch { }
+                }
+            }
+        }
+
+        public void Stop()
+        {
+            stopped = true;
+            foreach (TcpListener l in listeners) { try { l.Stop(); } catch { } }
         }
     }
 

@@ -12,6 +12,8 @@
 param(
     [int]$Port = 2222,
     [string]$HostKeyPath,
+    # Honour a client-specified bind address for -R, as pwssh-connect.ps1's -GatewayPorts does.
+    [switch]$GatewayPorts,
     [switch]$Quiet
 )
 
@@ -33,4 +35,4 @@ Import-PwsshFiles -Path @(
 $key = Get-PwsshHostKey -Path $HostKeyPath
 
 Write-Host "pwssh dev host: 127.0.0.1:$Port  hostkey=$HostKeyPath"
-[Pwssh.Dev.TcpHost]::Run($Port, $key, (-not $Quiet))
+[Pwssh.Dev.TcpHost]::Run($Port, $key, (-not $Quiet), [bool]$GatewayPorts)

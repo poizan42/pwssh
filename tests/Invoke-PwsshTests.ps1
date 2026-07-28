@@ -29,6 +29,14 @@ param(
     # 0 picks a free port at run time. A fixed one collides with leftovers from a previous
     # run and then the failure looks like a forwarding bug rather than a bind conflict.
     [int]$ForwardLocalPort = 0,
+    # Reverse forwarding (-R). Requires the far side to be able to run powershell.exe, which
+    # every target here already does. 0 picks free ports at run time.
+    [switch]$SkipReverse,
+    [int]$ReversePort = 0,
+    # Optional third target whose ProxyCommand passes -GatewayPorts, so the accept side of the
+    # gateway policy can be checked. Without it only the refusal is tested.
+    [string]$GatewayTarget,
+    [string]$GatewayConfigFile,
     [switch]$SkipLarge
 )
 
@@ -236,7 +244,10 @@ Assert-That 'shell channel runs piped commands' ($so -match 'hello-from-shell') 
     "stdout='$($so -replace '\s+', ' ')' stderr='$($r.Stderr)'"
 
 $r = Invoke-Ssh -Command '' -StdinBytes ([System.Text.Encoding]::ASCII.GetBytes("exit 3`r`n"))
-Assert-That 'shell exit status propagates' ($r.ExitCode -eq 3) "exit=$($r.ExitCode)"
+# exit 255 is ssh's own failure code rather than the shell's, so stderr is what distinguishes
+# a broken status path from a connection that never came up.
+Assert-That 'shell exit status propagates' ($r.ExitCode -eq 3) `
+    "exit=$($r.ExitCode) stderr='$($r.Stderr -replace "`r?`n", ' | ')'"
 
 # -tt forces pty allocation, so this proves pty-req was accepted and ConPTY drove a real
 # console. The output carries VT sequences, hence a substring match.
@@ -370,6 +381,188 @@ if ($ForwardTarget) {
     # Safe to read now that ssh has exited.
     $lStderr = ($lErr.Result -split "`r?`n" | Where-Object { $_ -and $_ -notmatch 'Killed by' }) -join ' | '
     if ($lStderr) { Write-Host ("        forward ssh stderr: {0}" -f $lStderr) -ForegroundColor DarkGray }
+}
+
+# --------------------------------------------------- 7d. reverse forwarding (-R)
+if (-not $SkipReverse) {
+    # Free ports are picked by binding and releasing. The remote-side port has to be free on
+    # the far side, which for the WinRM target is a different machine -- but a port in the
+    # ephemeral range that is free here is overwhelmingly likely to be free there too, and a
+    # collision surfaces as an explicit bind failure rather than a confusing hang.
+    function Get-FreePort {
+        $l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+        $l.Start(); $p = $l.LocalEndpoint.Port; $l.Stop(); return $p
+    }
+    if ($ReversePort -le 0) { $ReversePort = Get-FreePort }
+
+    # Probe run on the far side: connect to the forwarded port and report what came back.
+    #
+    # Every wait is bounded. A leaked listener accepts and then never sends anything, so an
+    # unbounded ReadToEnd here would hang until ssh's own timeout and report the failure as
+    # "ssh timed out" rather than as the leak it is.
+    function New-ReverseProbe([int]$port) {
+        New-FarSideCommand @"
+try {
+    `$c = New-Object System.Net.Sockets.TcpClient
+    `$ar = `$c.BeginConnect('127.0.0.1', $port, `$null, `$null)
+    if (-not `$ar.AsyncWaitHandle.WaitOne(8000)) { [Console]::Out.Write('NOCONNECT'); exit }
+    `$c.EndConnect(`$ar)
+    `$s = `$c.GetStream()
+    `$s.ReadTimeout = 20000
+    `$ms = New-Object System.IO.MemoryStream
+    `$b = New-Object byte[] 65536
+    try { while (`$true) { `$n = `$s.Read(`$b, 0, `$b.Length); if (`$n -le 0) { break }; `$ms.Write(`$b, 0, `$n) } }
+    catch { [Console]::Out.Write('STILLBOUND:' + `$ms.Length); `$c.Close(); exit }
+    `$c.Close()
+    if (`$ms.Length -eq 0) { [Console]::Out.Write('STILLBOUND:0') }
+    else { [Console]::Out.Write('GOT:' + [System.Text.Encoding]::ASCII.GetString(`$ms.ToArray())) }
+} catch { [Console]::Out.Write('REFUSED') }
+"@
+    }
+
+    # A one-shot local service for the forward to point at, in its own runspace so ssh can run
+    # in the foreground. The port is chosen here rather than by the listener, because the
+    # runspace cannot hand a value back before ssh needs it.
+    $marker = "PWSSH-R-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $servicePort = Get-FreePort
+    $svc = [powershell]::Create().AddScript({
+            param($port, $text)
+            $l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $port)
+            $l.Start()
+            try {
+                $c = $l.AcceptTcpClient()
+                $s = $c.GetStream()
+                $b = [System.Text.Encoding]::ASCII.GetBytes($text)
+                $s.Write($b, 0, $b.Length); $s.Flush()
+                # Half-close so the far side's read loop sees EOF instead of waiting for us.
+                $c.Client.Shutdown('Send')
+                Start-Sleep -Milliseconds 1000
+                $c.Close()
+            }
+            finally { $l.Stop() }
+        }).AddArgument($servicePort).AddArgument($marker)
+    $null = $svc.BeginInvoke()
+    Start-Sleep -Milliseconds 400
+
+    # One ssh invocation proves the whole path: global request accepted, port bound on the far
+    # side, connection accepted there, forwarded-tcpip opened by us, confirmed, bytes flowing.
+    $r = Invoke-Ssh -Command (New-ReverseProbe $ReversePort) `
+        -Extra @('-R', "${ReversePort}:127.0.0.1:$servicePort")
+    $so = [System.Text.Encoding]::ASCII.GetString($r.Stdout)
+    Assert-That 'reverse forward (-R) round trip' ($so -match "GOT:$marker") `
+        "port $ReversePort -> 127.0.0.1:$servicePort got '$($so -replace '\s+', ' ')' stderr='$($r.Stderr -replace "`r?`n", ' | ')'"
+    try { $svc.Stop(); $svc.Dispose() } catch { }
+
+    # The listener must go away when the SSH connection ends. A leak is invisible without this
+    # check and keeps a port bound on the far side.
+    #
+    # Only assertable against the dev host. Over WinRM ssh TerminateProcesses its ProxyCommand
+    # on exit, so the engine's UNLISTEN never reaches the remote and the port stays bound until
+    # WinRM reclaims the orphaned shell (IdleTimeout, 60 s). Waiting that out here would add a
+    # minute to the run to test WinRM's reclamation rather than any of our code.
+    if ($Port -gt 0) {
+        $r = Invoke-Ssh -Command (New-ReverseProbe $ReversePort)
+        $so = [System.Text.Encoding]::ASCII.GetString($r.Stdout)
+        Assert-That 'reverse forward is released on exit' ($so -match 'REFUSED|NOCONNECT') `
+            "port $ReversePort still answers: '$($so -replace '\s+', ' ')'"
+    }
+    else {
+        Write-Host '  SKIP  reverse forward is released on exit (WinRM: ssh kills the ProxyCommand; see CLAUDE.md)' -ForegroundColor DarkGray
+    }
+
+    # Port 0 asks the far side to choose, and the chosen port comes back in the reply.
+    $r = Invoke-Ssh -Command 'echo dyn' -Extra @('-v', '-R', '0:127.0.0.1:9')
+    Assert-That 'reverse forward with a dynamic port reports it' `
+        ($r.Stderr -match 'Allocated port \d+ for remote forward') `
+        "stderr='$(($r.Stderr -split "`r?`n" | Where-Object { $_ -match 'forward|Allocated' }) -join ' | ')'"
+
+    # A bind that cannot succeed must be reported, and must not poison the session. Both
+    # loopback families have to be occupied: we bind 127.0.0.1 and ::1, and -- as sshd does --
+    # count a partial bind as success, so occupying one leaves the other free.
+    $busyPort = Get-FreePort
+    $busy4 = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $busyPort)
+    $busy6 = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::IPv6Loopback, $busyPort)
+    $bothBusy = $true
+    try { $busy4.Start(); $busy6.Start() } catch { $bothBusy = $false }
+    # $Port > 0 means the loopback dev host, i.e. the far side is this machine. Against a real
+    # remote the port we occupied here is free there, so the bind would simply succeed.
+    if ($bothBusy -and $Port -gt 0) {
+        $r = Invoke-Ssh -Command 'echo after-fail' -Extra @('-R', "${busyPort}:127.0.0.1:9")
+        $so = [System.Text.Encoding]::ASCII.GetString($r.Stdout)
+        Assert-That 'reverse forward reports a bind failure' `
+            ($r.Stderr -match 'remote port forwarding failed') `
+            "port $busyPort stderr='$($r.Stderr -replace "`r?`n", ' | ')'"
+        Assert-That 'session survives a failed reverse bind' ($so -match 'after-fail') `
+            "stdout='$($so -replace '\s+', ' ')'"
+    }
+    try { $busy4.Stop(); $busy6.Stop() } catch { }
+
+    # Gateway policy. Note the wire convention is the opposite way round from how it reads:
+    # OpenSSH sends "localhost" for a plain -R and an EMPTY address for -R *:...
+    $wildPort = Get-FreePort
+    $r = Invoke-Ssh -Command 'echo wild' -Extra @('-R', "*:${wildPort}:127.0.0.1:9")
+    Assert-That 'wildcard reverse bind is refused by default' `
+        ($r.Stderr -match 'remote port forwarding failed') `
+        "stderr='$($r.Stderr -replace "`r?`n", ' | ')'"
+
+    if ($GatewayTarget) {
+        $wildPort = Get-FreePort
+        $r = Invoke-Ssh -Command (New-ReverseProbe $wildPort) `
+            -Extra @('-R', "*:${wildPort}:127.0.0.1:9") `
+            -UseTarget $GatewayTarget -UseConfig $GatewayConfigFile
+        $so = [System.Text.Encoding]::ASCII.GetString($r.Stdout)
+        # The target is port 9 (discard), so the connection is refused *after* the bind
+        # succeeded; what matters here is that the bind was allowed at all.
+        Assert-That 'wildcard reverse bind is allowed with -GatewayPorts' `
+            ($r.Stderr -notmatch 'remote port forwarding failed') `
+            "stdout='$($so -replace '\s+', ' ')' stderr='$($r.Stderr -replace "`r?`n", ' | ')'"
+    }
+
+    # Bulk through a reverse forward, bit-exact. Same shape as the round trip above but with a
+    # payload big enough to cross window and compression boundaries.
+    if (-not $SkipLarge) {
+        $size = 512 * 1024
+        $payload = New-Object byte[] $size
+        (New-Object System.Random 20260728).NextBytes($payload)
+        $want = Get-Sha $payload
+
+        $bulkPort = Get-FreePort
+        $bulkService = Get-FreePort
+        $bsvc = [powershell]::Create().AddScript({
+                param($port, $bytes)
+                $l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $port)
+                $l.Start()
+                try {
+                    $c = $l.AcceptTcpClient()
+                    $s = $c.GetStream()
+                    $s.Write($bytes, 0, $bytes.Length); $s.Flush()
+                    $c.Client.Shutdown('Send')
+                    Start-Sleep -Milliseconds 2000
+                    $c.Close()
+                }
+                finally { $l.Stop() }
+            }).AddArgument($bulkService).AddArgument($payload)
+        $null = $bsvc.BeginInvoke()
+        Start-Sleep -Milliseconds 400
+
+        $bulkProbe = New-FarSideCommand @"
+`$c = New-Object System.Net.Sockets.TcpClient
+`$c.Connect('127.0.0.1', $bulkPort)
+`$s = `$c.GetStream()
+`$ms = New-Object System.IO.MemoryStream
+`$b = New-Object byte[] 65536
+while (`$true) { `$n = `$s.Read(`$b, 0, `$b.Length); if (`$n -le 0) { break }; `$ms.Write(`$b, 0, `$n) }
+`$c.Close()
+`$h = [System.Security.Cryptography.SHA256]::Create().ComputeHash(`$ms.ToArray())
+[Console]::Out.Write('LEN=' + `$ms.Length + ' SHA=' + [Convert]::ToBase64String(`$h))
+"@
+        $r = Invoke-Ssh -Command $bulkProbe -Extra @('-R', "${bulkPort}:127.0.0.1:$bulkService")
+        $so = [System.Text.Encoding]::ASCII.GetString($r.Stdout)
+        Assert-That 'bulk through a reverse forward is bit-exact' `
+            ($so -match ("LEN=$size SHA=" + [regex]::Escape($want))) `
+            "got '$($so -replace '\s+', ' ')' want LEN=$size SHA=$want"
+        try { $bsvc.Stop(); $bsvc.Dispose() } catch { }
+    }
 }
 
 # --------------------------------------------------------- 8. username rejected
