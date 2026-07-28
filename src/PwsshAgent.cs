@@ -66,11 +66,16 @@ namespace Pwssh
         public const byte COMPRESSED = 0x40;
     }
 
+    // Compressed payloads carry their uncompressed length in the first four bytes, so the
+    // receiver allocates the output exactly once instead of growing a MemoryStream and then
+    // copying it out with ToArray.
     internal static class Zip
     {
         public static byte[] Deflate(byte[] data, int offset, int count)
         {
             MemoryStream ms = new MemoryStream();
+            ms.WriteByte((byte)(count >> 24)); ms.WriteByte((byte)(count >> 16));
+            ms.WriteByte((byte)(count >> 8)); ms.WriteByte((byte)count);
             using (DeflateStream ds = new DeflateStream(ms, CompressionMode.Compress, true))
             {
                 ds.Write(data, offset, count);
@@ -80,19 +85,25 @@ namespace Pwssh
 
         public static byte[] Inflate(byte[] data, int offset, int count)
         {
-            MemoryStream src = new MemoryStream(data, offset, count, false);
-            MemoryStream dst = new MemoryStream();
+            if (count < 4) throw new InvalidDataException("compressed payload too short");
+            int outLen = ((int)data[offset] << 24) | ((int)data[offset + 1] << 16)
+                       | ((int)data[offset + 2] << 8) | data[offset + 3];
+            if (outLen < 0 || outLen > (64 << 20)) throw new InvalidDataException("implausible inflated length " + outLen);
+
+            byte[] result = new byte[outLen];
+            MemoryStream src = new MemoryStream(data, offset + 4, count - 4, false);
             using (DeflateStream ds = new DeflateStream(src, CompressionMode.Decompress))
             {
-                byte[] buf = new byte[65536];
-                while (true)
+                int got = 0;
+                while (got < outLen)
                 {
-                    int n = ds.Read(buf, 0, buf.Length);
+                    int n = ds.Read(result, got, outLen - got);
                     if (n <= 0) break;
-                    dst.Write(buf, 0, n);
+                    got += n;
                 }
+                if (got != outLen) throw new InvalidDataException("short inflate: " + got + " of " + outLen);
             }
-            return dst.ToArray();
+            return result;
         }
     }
 
@@ -210,6 +221,19 @@ namespace Pwssh
 
         public void Write(byte[] data) { Write(data, 0, data.Length); }
 
+        // Hand over a buffer without copying it. The caller must never touch it again.
+        // Used by the packet layer, which builds each frame fresh and immediately releases it.
+        public void WriteOwned(byte[] data)
+        {
+            if (data == null || data.Length == 0) return;
+            lock (gate)
+            {
+                if (closed) return;
+                q.Enqueue(data);
+                Monitor.PulseAll(gate);
+            }
+        }
+
         public void Close() { lock (gate) { closed = true; Monitor.PulseAll(gate); } }
         public bool IsClosed { get { lock (gate) { return closed; } } }
 
@@ -257,6 +281,14 @@ namespace Pwssh
                     if (closed) return null;
                     Monitor.Wait(gate, timeoutMs);
                     if (!HasBufferedNoLock()) return null;
+                }
+                // Fast path: one whole buffer pending, so hand it straight over. This is the
+                // common case when the consumer keeps up, and it avoids copying every byte
+                // through a MemoryStream on the way out.
+                if ((cur == null || curPos >= cur.Length) && q.Count == 1)
+                {
+                    cur = null; curPos = 0;
+                    return q.Dequeue();
                 }
                 MemoryStream ms = new MemoryStream();
                 if (cur != null && curPos < cur.Length)
@@ -491,7 +523,9 @@ namespace Pwssh
 
     public interface IPwsshChannelSink
     {
-        void OnData(uint channel, byte[] data, bool stderr);
+        // Takes a range rather than an array so the frame buffer can be passed straight
+        // through: the client owns it exclusively, so copying the payload out is waste.
+        void OnData(uint channel, byte[] buffer, int offset, int count, bool stderr);
         void OnExit(uint channel, uint status);
         void OnClose(uint channel);
         void OnAgentError(string message);
@@ -525,10 +559,21 @@ namespace Pwssh
             switch (type)
             {
                 case FrameType.OUT:
-                    if (sink != null) sink.OnData(ch, Unpack(frame, compressed), false);
-                    break;
                 case FrameType.ERR:
-                    if (sink != null) sink.OnData(ch, Unpack(frame, compressed), true);
+                    if (sink != null)
+                    {
+                        bool isErr = (type == FrameType.ERR);
+                        if (compressed)
+                        {
+                            byte[] u = Zip.Inflate(frame, Frame.HEADER, Frame.PayloadLength(frame));
+                            sink.OnData(ch, u, 0, u.Length, isErr);
+                        }
+                        else
+                        {
+                            // No copy: hand the frame buffer through as a range.
+                            sink.OnData(ch, frame, Frame.HEADER, Frame.PayloadLength(frame), isErr);
+                        }
+                    }
                     break;
                 case FrameType.EXIT:
                     if (sink != null) sink.OnExit(ch, Frame.PayloadUInt32(frame));
@@ -547,12 +592,6 @@ namespace Pwssh
                     if (sink != null) sink.OnAgentError(Frame.PayloadText(frame));
                     break;
             }
-        }
-
-        private static byte[] Unpack(byte[] frame, bool compressed)
-        {
-            if (!compressed) return Frame.Payload(frame);
-            return Zip.Inflate(frame, Frame.HEADER, Frame.PayloadLength(frame));
         }
 
         public void CloseInbound()

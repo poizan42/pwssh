@@ -287,12 +287,15 @@ namespace Pwssh
                 byte[] mac = new byte[32];
                 inb.ReadExact(mac, 0, 32);
 
-                byte[] macData = new byte[8 + ct.Length];
-                PutBE(macData, 0, seqIn);
-                Array.Copy(lenb, 0, macData, 4, 4);
-                Array.Copy(ct, 0, macData, 8, ct.Length);
-                byte[] expect = macIn.ComputeHash(macData);
-                if (!ConstantTimeEquals(expect, mac)) throw new Exception("MAC verification failed");
+                // Hashed incrementally: the previous version copied the whole ciphertext into
+                // a scratch buffer for every packet purely to compute the MAC.
+                byte[] pre = new byte[8];
+                PutBE(pre, 0, seqIn);
+                Array.Copy(lenb, 0, pre, 4, 4);
+                macIn.Initialize();
+                macIn.TransformBlock(pre, 0, 8, null, 0);
+                macIn.TransformFinalBlock(ct, 0, ct.Length);
+                if (!ConstantTimeEquals(macIn.Hash, mac)) throw new Exception("MAC verification failed");
 
                 decIn.Xor(ct, 0, ct.Length);
                 seqIn++;
@@ -331,30 +334,83 @@ namespace Pwssh
                     int padLen = blk - ((1 + payload.Length) % blk);
                     if (padLen < 4) padLen += blk;
                     int encLen = 1 + payload.Length + padLen;
-                    byte[] ct = new byte[encLen];
-                    ct[0] = (byte)padLen;
-                    Array.Copy(payload, 0, ct, 1, payload.Length);
-                    byte[] pad = new byte[padLen];
-                    rng.GetBytes(pad);
-                    Array.Copy(pad, 0, ct, 1 + payload.Length, padLen);
 
-                    byte[] lenb = new byte[4];
-                    PutBE(lenb, 0, (uint)encLen);
-                    encOut.Xor(ct, 0, ct.Length);
+                    // Assembled straight into the final buffer: length, padding count,
+                    // payload, random padding, then encrypt and MAC in place.
+                    byte[] frame = new byte[4 + encLen + 32];
+                    PutBE(frame, 0, (uint)encLen);
+                    frame[4] = (byte)padLen;
+                    Array.Copy(payload, 0, frame, 5, payload.Length);
+                    rng.GetBytes(frame, 5 + payload.Length, padLen);
 
-                    byte[] macData = new byte[8 + ct.Length];
-                    PutBE(macData, 0, seqOut);
-                    Array.Copy(lenb, 0, macData, 4, 4);
-                    Array.Copy(ct, 0, macData, 8, ct.Length);
-                    byte[] mac = macOut.ComputeHash(macData);
-
-                    byte[] frame = new byte[4 + ct.Length + 32];
-                    Array.Copy(lenb, 0, frame, 0, 4);
-                    Array.Copy(ct, 0, frame, 4, ct.Length);
-                    Array.Copy(mac, 0, frame, 4 + ct.Length, 32);
+                    encOut.Xor(frame, 4, encLen);
+                    AppendMac(frame, encLen);
                     seqOut++;
-                    outb.Write(frame);
+                    outb.WriteOwned(frame);
                 }
+            }
+        }
+
+        // MAC over seq || length || ciphertext, written into the tail of the frame.
+        private void AppendMac(byte[] frame, int encLen)
+        {
+            byte[] pre = new byte[8];
+            PutBE(pre, 0, seqOut);
+            Array.Copy(frame, 0, pre, 4, 4);
+            macOut.Initialize();
+            macOut.TransformBlock(pre, 0, 8, null, 0);
+            macOut.TransformFinalBlock(frame, 4, encLen);
+            Array.Copy(macOut.Hash, 0, frame, 4 + encLen, 32);
+        }
+
+        // Channel data is the bulk path, so it gets a dedicated assembler: one copy of the
+        // payload, versus four in the generic path (caller's slice, SshWriter's buffer,
+        // ToArray, and packet assembly).
+        public void WriteChannelData(uint channel, byte[] data, int offset, int count, bool stderr)
+        {
+            lock (writeGate)
+            {
+                if (!encrypted)
+                {
+                    // Channel data only flows after NEWKEYS; correct fallback regardless.
+                    SshWriter w = new SshWriter();
+                    if (stderr)
+                    {
+                        w.Byte(Msg.CHANNEL_EXTENDED_DATA); w.UInt32(channel); w.UInt32(1);
+                    }
+                    else
+                    {
+                        w.Byte(Msg.CHANNEL_DATA); w.UInt32(channel);
+                    }
+                    byte[] slice = new byte[count];
+                    Array.Copy(data, offset, slice, 0, count);
+                    w.Str(slice);
+                    WritePacket(w.ToArray());
+                    return;
+                }
+
+                int hdr = stderr ? 13 : 9;          // msg + channel [+ data type] + length
+                int payloadLen = hdr + count;
+                int blk = 16;
+                int padLen = blk - ((1 + payloadLen) % blk);
+                if (padLen < 4) padLen += blk;
+                int encLen = 1 + payloadLen + padLen;
+
+                byte[] frame = new byte[4 + encLen + 32];
+                PutBE(frame, 0, (uint)encLen);
+                int p = 4;
+                frame[p++] = (byte)padLen;
+                frame[p++] = stderr ? Msg.CHANNEL_EXTENDED_DATA : Msg.CHANNEL_DATA;
+                PutBE(frame, p, channel); p += 4;
+                if (stderr) { PutBE(frame, p, 1); p += 4; }   // SSH_EXTENDED_DATA_STDERR
+                PutBE(frame, p, (uint)count); p += 4;
+                Array.Copy(data, offset, frame, p, count); p += count;
+                rng.GetBytes(frame, p, padLen);
+
+                encOut.Xor(frame, 4, encLen);
+                AppendMac(frame, encLen);
+                seqOut++;
+                outb.WriteOwned(frame);
             }
         }
 
@@ -1028,10 +1084,10 @@ namespace Pwssh
 
         // ---- IPwsshChannelSink: called from the agent side, must not block ----
 
-        public void OnData(uint ch, byte[] data, bool stderr)
+        public void OnData(uint ch, byte[] buffer, int offset, int count, bool stderr)
         {
             SessionChannel c = channel;
-            if (c != null && c.PeerChannel == ch) c.OnAgentData(data, stderr);
+            if (c != null && c.PeerChannel == ch) c.OnAgentData(buffer, offset, count, stderr);
         }
 
         public void OnExit(uint ch, uint status)
@@ -1149,7 +1205,9 @@ namespace Pwssh
         {
             public const int DATA = 0, EXIT = 1, DONE = 2;
             public int Kind;
-            public byte[] Data;
+            public byte[] Data;      // may be a whole frame buffer; Offset/Count select the payload
+            public int Offset;
+            public int Count;
             public bool Stderr;
             public uint Status;
         }
@@ -1208,10 +1266,10 @@ namespace Pwssh
 
         // ---- called from the agent side (must not block) ----
 
-        public void OnAgentData(byte[] data, bool stderr)
+        public void OnAgentData(byte[] buffer, int offset, int count, bool stderr)
         {
             Chunk c = new Chunk();
-            c.Kind = Chunk.DATA; c.Data = data; c.Stderr = stderr;
+            c.Kind = Chunk.DATA; c.Data = buffer; c.Offset = offset; c.Count = count; c.Stderr = stderr;
             Enqueue(c);
         }
 
@@ -1275,7 +1333,7 @@ namespace Pwssh
                         c = outQ.Dequeue();
                     }
 
-                    if (c.Kind == Chunk.DATA) { SendData(c.Data, c.Stderr); }
+                    if (c.Kind == Chunk.DATA) { SendData(c.Data, c.Offset, c.Count, c.Stderr); }
                     else if (c.Kind == Chunk.EXIT) { SendExitStatus(c.Status); }
                     else { SendEofAndClose(); return; }
                 }
@@ -1286,12 +1344,13 @@ namespace Pwssh
             }
         }
 
-        private void SendData(byte[] data, bool stderr)
+        private void SendData(byte[] data, int offset, int count, bool stderr)
         {
-            int off = 0;
-            while (off < data.Length && !killed)
+            int off = offset;
+            int end = offset + count;
+            while (off < end && !killed)
             {
-                int want = Math.Min(data.Length - off, (int)peerMaxPacket);
+                int want = Math.Min(end - off, (int)peerMaxPacket);
                 int allowed;
                 lock (windowGate)
                 {
@@ -1302,23 +1361,8 @@ namespace Pwssh
                 }
                 if (allowed <= 0) continue;
 
-                byte[] slice = new byte[allowed];
-                Array.Copy(data, off, slice, 0, allowed);
-
-                SshWriter w = new SshWriter();
-                if (stderr)
-                {
-                    w.Byte(Msg.CHANNEL_EXTENDED_DATA);
-                    w.UInt32(peerChannel);
-                    w.UInt32(1);                    // SSH_EXTENDED_DATA_STDERR
-                }
-                else
-                {
-                    w.Byte(Msg.CHANNEL_DATA);
-                    w.UInt32(peerChannel);
-                }
-                w.Str(slice);
-                pkt.WritePacket(w.ToArray());
+                // Written straight from the source range into the packet buffer.
+                pkt.WriteChannelData(peerChannel, data, off, allowed, stderr);
                 off += allowed;
 
                 // Return credit in batches, so the agent's in-flight output stays bounded by
