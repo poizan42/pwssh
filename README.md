@@ -22,9 +22,10 @@ remote agent ── starts a process, shuttles its output. No crypto, nothing on
 
 `exec`, `shell`, port forwarding and file transfer all work end to end. `ssh myremote whoami`
 returns the remote account; `ssh myremote` gives an interactive `cmd.exe` session with a real
-terminal, including colour and `Ctrl+C`, where the remote supports ConPTY; and `sftp myremote`
-or `scp file myremote:` transfers files, with **no SFTP server on the remote** — pwssh
-implements the protocol itself.
+terminal, including colour, `Ctrl+C` and terminal resizing, where the remote supports ConPTY —
+full-screen applications such as `vim` work, slowly but correctly. `sftp myremote` or
+`scp file myremote:` transfers files, with **no SFTP server on the remote** — pwssh implements
+the protocol itself.
 
 | | |
 |---|---|
