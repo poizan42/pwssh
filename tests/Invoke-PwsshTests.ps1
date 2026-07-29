@@ -274,6 +274,29 @@ for (`$k = 0; `$k -lt $($big / 65536); `$k++) { `$o.Write(`$chunk, 0, `$chunk.Le
         "got $($r.Stdout.Length) expected $big stderr=$($r.Stderr)"
     Assert-That '8 MiB content bit-exact' ((Get-Sha $r.Stdout) -eq (Get-Sha $exp.ToArray())) 'sha mismatch'
     Write-Host ("        throughput: {0:N2} MiB/s" -f (8 / $sw.Elapsed.TotalSeconds)) -ForegroundColor DarkGray
+
+    # ---- 6a. the same transfer across repeated rekeys.
+    #
+    # OpenSSH rekeys after ~1 GiB on AES-CTR, so before this worked a single large scp died part
+    # way through with "pwssh does not support rekeying" -- the one known failure that turned a
+    # slow transfer into a broken one. RekeyLimit=256K (OpenSSH's documented minimum) forces
+    # ~11 rekeys into 8 MiB, so a once-per-gigabyte path is exercised in a few seconds.
+    #
+    # What this really tests is the send gate: between the client's KEXINIT and its NEWKEYS we may
+    # send only transport-layer messages, and OpenSSH errors on a CHANNEL_DATA that arrives
+    # mid-KEX. The failure is loud rather than subtle, which is why bit-exactness is enough.
+    $r = Invoke-Ssh -Command (New-FarSideCommand $genBig) -Extra @('-o', 'RekeyLimit=256K', '-vv')
+    Assert-That '8 MiB bit-exact across forced rekeys' `
+        (($r.Stdout.Length -eq $big) -and ((Get-Sha $r.Stdout) -eq (Get-Sha $exp.ToArray()))) `
+        "got $($r.Stdout.Length) expected $big"
+    Assert-That 'exit status survives a rekey' ($r.ExitCode -eq 0) "exit=$($r.ExitCode)"
+
+    # Without this the case above could pass by never rekeying at all. ssh logs one
+    # "SSH2_MSG_KEXINIT sent" per exchange, so more than one means a rekey really happened.
+    $kexSent = (($r.Stderr -split "`r?`n") | Where-Object { $_ -match 'SSH2_MSG_KEXINIT sent' }).Count
+    Assert-That 'the client really did rekey' ($kexSent -ge 2) `
+        "saw $kexSent KEXINIT sent; expected the initial one plus at least one rekey"
+    Write-Host ("        rekeys observed: {0}" -f ($kexSent - 1)) -ForegroundColor DarkGray
 }
 
 # ------------------------------- 6b. incompressible payload (worst-case throughput)
@@ -954,6 +977,21 @@ quit
         Assert-That 'bulk sftp download is bit-exact (8 MiB)' ($bh -eq $mkBig) `
             "$($r.Phase) got $bh want $mkBig"
         Write-Host ("        sftp download: {0:N2} MiB/s (includes ~4-6 s of connect)" -f (8 / $sw.Elapsed.TotalSeconds)) -ForegroundColor DarkGray
+
+        # ---- 12a. the same bulk download across repeated rekeys.
+        #
+        # The most valuable rekey case, and the reason it lives here rather than beside the exec
+        # one: an SFTP download has the read-ahead synthesising CHANNEL_DATA from its own thread
+        # while the protocol thread drives the rekey. Serialising those two is exactly what the
+        # send gate is for, so this is where a gate bug shows up. valveTrips would also have to
+        # stay 0, which the engine log shows when -Diagnostics is on.
+        $rkLocal = Join-Path $repo "tmp/sftp-rekey-$sftpTag.bin"
+        if (Test-Path $rkLocal) { [System.IO.File]::Delete($rkLocal) }
+        $r = Invoke-Sftp "get $farFwd/big.bin $($rkLocal.Replace($bs,'/'))`nquit`n" 'rekey' `
+             @('-o', 'RekeyLimit=256K') '' '' 600000
+        $rkh = if (Test-Path $rkLocal) { Get-Sha ([System.IO.File]::ReadAllBytes($rkLocal)) } else { 'MISSING' }
+        Assert-That 'sftp download is bit-exact across forced rekeys' ($rkh -eq $mkBig) `
+            "$($r.Phase) got $rkh want $mkBig err='$($r.Err -replace "`r?`n", ' | ')'"
 
         # ---- 12b. the read-ahead's safety valve, exercised rather than claimed. It degrades to
         # verbatim forwarding on any anomaly, and the whole argument for the private-channel design

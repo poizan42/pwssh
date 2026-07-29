@@ -187,7 +187,7 @@ namespace Pwssh
 
     // ------------------------------------------------------------------ AES-256-CTR
 
-    internal sealed class AesCtr
+    internal sealed class AesCtr : IDisposable
     {
         // The keystream is produced in bulk. Calling TransformBlock once per 16-byte block
         // costs a CNG transition per block and measured ~0.16 MiB/s end to end; batching
@@ -201,6 +201,8 @@ namespace Pwssh
         private readonly byte[] ks = new byte[BATCH];
         private int ksPos = BATCH;
 
+        private readonly SymmetricAlgorithm alg;
+
         public AesCtr(byte[] key, byte[] iv)
         {
             SymmetricAlgorithm aes = Aes.Create();
@@ -209,7 +211,17 @@ namespace Pwssh
             aes.Key = key;
             aes.IV = new byte[16];
             ecb = aes.CreateEncryptor();
+            alg = aes;
             Array.Copy(iv, 0, counter, 0, 16);
+        }
+
+        // Only worth having because of rekeying: each one supersedes a cipher, and both the
+        // transform and the algorithm hold unmanaged CSP state on .NET Framework. Before rekeying
+        // existed there was exactly one of these per direction per connection.
+        public void Dispose()
+        {
+            try { ecb.Dispose(); } catch (Exception) { }
+            try { alg.Clear(); } catch (Exception) { }
         }
 
         private void Refill()
@@ -261,16 +273,76 @@ namespace Pwssh
             inb = inbound; outb = outbound;
         }
 
+        // Both directions switch together, on receipt of the client's NEWKEYS. A split switch --
+        // outgoing at our NEWKEYS, incoming at theirs -- is what the RFC describes and what a
+        // reader will expect, so why it is not needed: the rekey gate means we send NOTHING
+        // between our NEWKEYS and processing theirs, which makes our NEWKEYS the last packet of
+        // the old epoch either way. The two are indistinguishable on the wire.
+        //
+        // That equivalence rests entirely on the gate holding. If the engine is ever changed to
+        // INITIATE a rekey, it no longer holds and this must be split.
         public void EnableEncryption(byte[] ivC2S, byte[] keyC2S, byte[] macC2S,
                                     byte[] ivS2C, byte[] keyS2C, byte[] macS2C)
         {
             lock (writeGate)
             {
+                // Superseded on a rekey rather than at the end of the connection. One leak per
+                // gigabyte would not matter; a RekeyLimit=256K test run makes thousands.
+                AesCtr oldIn = decIn, oldOut = encOut;
+                HMACSHA256 oldMacIn = macIn, oldMacOut = macOut;
+
                 decIn = new AesCtr(keyC2S, ivC2S);
                 macIn = new HMACSHA256(macC2S);
                 encOut = new AesCtr(keyS2C, ivS2C);
                 macOut = new HMACSHA256(macS2C);
                 encrypted = true;
+
+                if (oldIn != null) oldIn.Dispose();
+                if (oldOut != null) oldOut.Dispose();
+                if (oldMacIn != null) oldMacIn.Clear();
+                if (oldMacOut != null) oldMacOut.Clear();
+            }
+        }
+
+        // ---- rekey ----
+        //
+        // Only ever entered because the CLIENT asked. That is what makes the gate below provably
+        // deadlock-free: it closes when we RECEIVE a KEXINIT, and since the input stream is in
+        // order, everything the client sent before that has already been processed and the client
+        // -- now mid-rekey itself -- sends no more channel data. So at the instant the gate closes
+        // the protocol thread has no non-transport write pending.
+
+        private bool rekeying;
+
+        // Long enough that a legitimate rekey (two modexps and a signature, all local -- no WinRM
+        // round trip is involved) never comes close, short enough that a logic error ends the
+        // connection instead of hanging it, as everything else here does.
+        private const int REKEY_WAIT_MS = 10000;
+
+        public void BeginRekey()
+        {
+            lock (writeGate) { rekeying = true; }
+        }
+
+        public void EndRekey()
+        {
+            lock (writeGate)
+            {
+                rekeying = false;
+                Monitor.PulseAll(writeGate);
+            }
+        }
+
+        private void WaitForSendable()
+        {
+            int start = Environment.TickCount;
+            while (rekeying)
+            {
+                int left = REKEY_WAIT_MS - unchecked(Environment.TickCount - start);
+                if (left <= 0) throw new Exception("rekey did not complete within "
+                                                   + REKEY_WAIT_MS + " ms; abandoning connection");
+                // Releases writeGate while blocked, which the rekey needs for its own writes.
+                Monitor.Wait(writeGate, left);
             }
         }
 
@@ -341,6 +413,22 @@ namespace Pwssh
         {
             lock (writeGate)
             {
+                // Gated by message number rather than by a flag threaded through every call site.
+                // RFC 4253 7.1 allows only transport-layer messages (1-49) between KEXINIT and
+                // NEWKEYS, so the number IS the rule and a call site added later cannot get it
+                // wrong. It also keeps the protocol thread able to send the two things it must
+                // still be able to send mid-rekey -- UNIMPLEMENTED from Loop's default case, and
+                // DISCONNECT. Blocking those would deadlock outright: the thread that has to
+                // receive the client's NEWKEYS would be parked waiting to send.
+                if (payload.Length > 0 && payload[0] >= 50) WaitForSendable();
+                WritePacketLocked(payload);
+            }
+        }
+
+        // Assumes writeGate is held and the gate has already been cleared.
+        private void WritePacketLocked(byte[] payload)
+        {
+            {
                 if (!encrypted)
                 {
                     int blk = 8;
@@ -399,6 +487,11 @@ namespace Pwssh
         {
             lock (writeGate)
             {
+                // Always gated: this writes CHANNEL_DATA/CHANNEL_EXTENDED_DATA, which are exactly
+                // what must not appear between the client's KEXINIT and its NEWKEYS. OpenSSH
+                // errors on receiving one mid-KEX, so this is interop, not tidiness.
+                WaitForSendable();
+
                 if (!encrypted)
                 {
                     // Channel data only flows after NEWKEYS; correct fallback regardless.
@@ -414,7 +507,9 @@ namespace Pwssh
                     byte[] slice = new byte[count];
                     Array.Copy(data, offset, slice, 0, count);
                     w.Str(slice);
-                    WritePacket(w.ToArray());
+                    // The unguarded body: the gate was cleared above, and re-entering WritePacket
+                    // would wait on the same monitor a second time for no reason.
+                    WritePacketLocked(w.ToArray());
                     return;
                 }
 
@@ -486,6 +581,7 @@ namespace Pwssh
 
         private RSACryptoServiceProvider hostKey;
         private byte[] sessionId;
+        private int rekeys;              // client-initiated rekeys completed, for the log and tests
         private string clientIdent;
         private byte[] clientKexInit, serverKexInit;
         private bool authenticated;
@@ -947,13 +1043,21 @@ namespace Pwssh
                 switch (type)
                 {
                     case Msg.KEXINIT:
+                        // A KEXINIT after the handshake is the client rekeying, which OpenSSH does
+                        // at its RekeyLimit -- ~1 GiB for AES-CTR by default, so any single large
+                        // transfer reaches it. We answer; we never initiate (see BeginRekey).
                         if (sessionId != null)
                         {
-                            // Rekey is not implemented; disconnect rather than corrupt state.
-                            Disconnect(2, "pwssh does not support rekeying");
-                            return;
+                            rekeys++;
+                            Log("client initiated rekey " + rekeys);
+                            // Closed before we reply, so no channel data can slip out behind the
+                            // KEXINIT we are about to send.
+                            pkt.BeginRekey();
                         }
                         HandleKexInit(payload);
+                        // The reply. Also re-stores serverKexInit, which the new exchange hash
+                        // needs -- HandleKexDhInit reads it and requires no rekey-specific change.
+                        if (sessionId != null) SendKexInit();
                         break;
 
                     case Msg.KEXDH_INIT:
@@ -963,7 +1067,11 @@ namespace Pwssh
                     case Msg.NEWKEYS:
                         pkt.EnableEncryption(pendingIvC2S, pendingKeyC2S, pendingMacC2S,
                                              pendingIvS2C, pendingKeyS2C, pendingMacS2C);
-                        Log("encryption active");
+                        // Unconditional: on the initial handshake nothing is gated, so EndRekey
+                        // just clears a flag that was never set.
+                        pkt.EndRekey();
+                        if (rekeys > 0) Log("rekey " + rekeys + " complete");
+                        else Log("encryption active");
                         break;
 
                     case Msg.SERVICE_REQUEST:
