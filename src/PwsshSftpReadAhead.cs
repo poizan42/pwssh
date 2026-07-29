@@ -35,6 +35,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 
 namespace Pwssh
 {
@@ -163,9 +164,19 @@ namespace Pwssh
         public const byte OPEN = 3;
         public const byte CLOSE = 4;
         public const byte READ = 5;
+        // The two metadata requests the client makes for every file. Verified with sftp -vvv
+        // rather than assumed: per file it sends LSTAT (T:7), then STAT (T:17), then OPEN, then
+        // the reads, then CLOSE -- and it does so for a single-file get as well as a globbed one.
+        public const byte LSTAT = 7;
+        public const byte FSTAT = 8;
+        public const byte OPENDIR = 11;
+        public const byte READDIR = 12;
+        public const byte REALPATH = 16;
+        public const byte STAT = 17;
         public const byte STATUS = 101;
         public const byte HANDLE = 102;
         public const byte DATA = 103;
+        public const byte ATTRS = 105;
 
         public const uint STATUS_OK = 0;
         public const uint STATUS_EOF = 1;
@@ -247,7 +258,10 @@ namespace Pwssh
         public bool IsPassthrough { get { return mode == Mode.Passthrough; } }
 
         // True when the counters have something to say that no CLOSE has reported yet.
-        public bool ShouldReport { get { lock (gate) { return !reported && prefetchIssued > 0; } } }
+        public bool ShouldReport
+        {
+            get { lock (gate) { return !reported && (prefetchIssued > 0 || metaSpeculated > 0); } }
+        }
 
         // Reported once at teardown rather than per event: a per-read log line on a 32 MiB
         // transfer would be 128 lines of noise, and the ratio is the only interesting part.
@@ -263,6 +277,9 @@ namespace Pwssh
                          + " prefetched=" + prefetchIssued
                          + " prefetchKiB=" + (prefetchBytes / 1024)
                          + " nonSeq=" + nonSequential
+                         + " metaAnswered=" + metaAnswered
+                         + " metaForwarded=" + metaForwarded
+                         + " metaSpeculated=" + metaSpeculated
                          + " valveTrips=" + valveTrips;
                 if (valveReason != null) s += " (" + valveReason + ")";
                 return s;
@@ -435,8 +452,53 @@ namespace Pwssh
             if (m.Count < 1) { Trip("empty SFTP message"); return true; }
             byte type = m.Buffer[m.Offset];
 
+            // Held metadata is invalidated here, and how coarsely matters. A request that names one
+            // path drops only that path, because a globbed get's own per-file OPEN and CLOSE would
+            // otherwise wipe the answers prepared for every file after it -- which is the whole
+            // benefit. Anything else drops everything.
             switch (type)
             {
+                // Read-only requests, enumerated explicitly. A glob uses OPENDIR/READDIR and a
+                // session starts with REALPATH, and none of them can change a file's attributes,
+                // so wiping on them would throw away the answers the glob phase just prepared.
+                case SftpMsg.LSTAT:
+                case SftpMsg.STAT:
+                case SftpMsg.FSTAT:
+                case SftpMsg.READ:
+                case SftpMsg.OPENDIR:
+                case SftpMsg.READDIR:
+                case SftpMsg.REALPATH:
+                    break;
+
+                case SftpMsg.OPEN:
+                    InvalidatePath(PeekPath(m));         // may truncate or create
+                    NoteClientOpen(m);
+                    break;
+
+                case SftpMsg.CLOSE:
+                    {
+                        // Only this file: a globbed get closes each file in turn, and wiping
+                        // everything here would undo the preparation for all the later ones.
+                        string h = PeekHandle(m);
+                        string hp = PathForHandle(h);
+                        if (hp != null) InvalidatePath(hp);   // a write handle finalises size and mtime
+                        if (h != null) handlePath.Remove(h);
+                    }
+                    break;
+
+                // Everything else, known or not: assume it changed something.
+                default:
+                    InvalidateSpeculation();
+                    break;
+            }
+
+            switch (type)
+            {
+                case SftpMsg.LSTAT:
+                case SftpMsg.STAT:
+                    if (OnClientStat(m, type)) return false;   // answered locally; do not forward
+                    break;
+
                 case SftpMsg.READ:
                     clientReads++;
                     if (TryServeRead(m)) return false;    // answered locally; do not forward
@@ -468,9 +530,11 @@ namespace Pwssh
         // strings chosen independently by the remote.
         private void InspectReply(SftpFramer.Msg m)
         {
+            if (m.Count < 1) return;
+            NoteHandleReply(m);
+
             Prefetch p = active;
             if (p == null || !p.AwaitingClientHandle) return;
-            if (m.Count < 1) return;
             byte type = m.Buffer[m.Offset];
 
             if (type == SftpMsg.HANDLE)
@@ -492,6 +556,28 @@ namespace Pwssh
                 p.AwaitingClientHandle = false;
                 AbandonPrefetch("client open failed");
             }
+        }
+
+        // Ties a HANDLE reply back to the path its OPEN named, so a CLOSE can later invalidate just
+        // that file. Runs for every reply, independently of whether a prefetch is in progress.
+        private void NoteHandleReply(SftpFramer.Msg m)
+        {
+            try
+            {
+                byte type = m.Buffer[m.Offset];
+                if (type != SftpMsg.HANDLE && type != SftpMsg.STATUS) return;
+                SshLikeReader r = new SshLikeReader(m.Buffer, m.Offset + 1);
+                uint id = r.UInt32();
+                string path;
+                if (!openIdPath.TryGetValue(id, out path)) return;
+                openIdPath.Remove(id);
+                if (type != SftpMsg.HANDLE) return;      // the open failed; nothing to remember
+                string handle = r.Text();
+                if (handle.Length == 0) return;
+                if (handlePath.Count >= 256) handlePath.Clear();
+                handlePath[handle] = path;
+            }
+            catch (Exception) { }
         }
 
         // ---- serving a client READ ----
@@ -890,6 +976,243 @@ namespace Pwssh
             prefetchIssued += issued;
         }
 
+        // ------------------------------------------------------ speculative metadata
+        //
+        // The client asks LSTAT then STAT for every file, serially, so two of the ~5 round trips
+        // per file are spent learning the same file's attributes twice. On seeing the first of
+        // them we forward it untouched AND ask the remote the OTHER question on a channel of our
+        // own, so that by the time the client asks it we already hold the answer.
+        //
+        // This is a PARALLEL FETCH, NOT A CACHE, and the distinction is the whole safety argument:
+        // the speculative request goes out at essentially the same moment the client's own would
+        // have, so the answer is at most one round trip staler than what the client would have got.
+        // Nothing is ever held across an operation that could change it.
+        //
+        // And metadata is never synthesised. What the client receives is the remote's own answer
+        // to a byte-identical request, with only the 4-byte request id patched. Re-encoding the
+        // ATTRS payload could corrupt it; patching four bytes cannot.
+        //
+        // LSTAT and STAT are NOT interchangeable -- STAT follows a reparse point and LSTAT does
+        // not (AgentSftpChannel.DoStat's followLinks) -- so an LSTAT reply must never answer a
+        // STAT. That is precisely why this issues a real second request instead of reusing the
+        // first reply, and why a junction has its own test.
+        //
+        // A channel of its own rather than the prefetch channel: the agent's worker is serial per
+        // channel, which is the whole reason the prefetch channel exists, so a speculative STAT
+        // must not queue behind a 255 KiB READ.
+
+        private bool metaStarted;
+        private uint metaChannel;
+        private readonly SftpFramer fromMeta = new SftpFramer();
+        private uint metaNextId = 1;
+
+        // A MAP, not a single slot, and the reason is measured rather than assumed. A globbed
+        // `get dir/*` does not interleave one file's requests with the next: it LSTATs every match
+        // up front to expand the glob, and only then walks the files doing STAT, OPEN, reads,
+        // CLOSE one at a time. With one slot each LSTAT overwrote the last speculation, so by the
+        // time STAT(first) arrived we were holding STAT(last) and the hit rate was exactly zero --
+        // observed, 80 speculations and 0 answers. Holding them all turns the glob phase, which
+        // the client pays for anyway, into preparation that makes every per-file STAT free.
+        private readonly Dictionary<string, byte[]> metaHeld = new Dictionary<string, byte[]>();
+        private readonly Dictionary<uint, string> metaPending = new Dictionary<uint, string>();
+
+        // Bounded so a client that stats thousands of paths without opening them cannot grow this
+        // without limit. Past the cap we simply stop speculating; the honest round trip is always
+        // available and is what the unoptimised path does anyway.
+        private const int META_MAX_HELD = 512;
+
+        private int metaAnswered;             // client metadata requests answered from a speculation
+        private int metaForwarded;
+        private int metaSpeculated;
+
+        private static string MetaKey(byte type, string path)
+        {
+            return type.ToString(CultureInfo.InvariantCulture) + "|" + path;
+        }
+
+        // The first string after the request id, which for OPEN is the path and for CLOSE is the
+        // handle. Defensive because a truncated payload must invalidate rather than throw.
+        private static string PeekFirstString(SftpFramer.Msg m)
+        {
+            try
+            {
+                SshLikeReader r = new SshLikeReader(m.Buffer, m.Offset + 1);
+                r.UInt32();
+                return r.Text();
+            }
+            catch (Exception) { return null; }
+        }
+
+        private static string PeekPath(SftpFramer.Msg m) { return PeekFirstString(m); }
+        private static string PeekHandle(SftpFramer.Msg m) { return PeekFirstString(m); }
+
+        // Which path a client handle refers to, learned from its OPEN and the HANDLE that answered
+        // it. Needed so a CLOSE can invalidate just that file rather than everything.
+        private readonly Dictionary<uint, string> openIdPath = new Dictionary<uint, string>();
+        private readonly Dictionary<string, string> handlePath = new Dictionary<string, string>();
+
+        private string PathForHandle(string handle)
+        {
+            if (handle == null) return null;
+            string path;
+            if (handlePath.TryGetValue(handle, out path)) return path;
+            return null;
+        }
+
+        // Called for every client OPEN, so a later HANDLE reply can be tied back to a path. The
+        // agent caps itself at 256 handles, but an OPEN that fails never produces one, so this is
+        // bounded here too rather than trusting the far side to bound it for us.
+        private void NoteClientOpen(SftpFramer.Msg m)
+        {
+            try
+            {
+                SshLikeReader r = new SshLikeReader(m.Buffer, m.Offset + 1);
+                uint id = r.UInt32();
+                string path = r.Text();
+                if (path.Length == 0) return;
+                if (openIdPath.Count >= 256) openIdPath.Clear();
+                openIdPath[id] = path;
+            }
+            catch (Exception) { }
+        }
+
+        // Returns true if the client's request was answered locally and must not be forwarded.
+        private bool OnClientStat(SftpFramer.Msg m, byte type)
+        {
+            SshLikeReader r = new SshLikeReader(m.Buffer, m.Offset + 1);
+            uint id = r.UInt32();
+            string path = r.Text();
+            if (path.Length == 0) return false;
+
+            string key = MetaKey(type, path);
+            byte[] held;
+            if (metaHeld.TryGetValue(key, out held))
+            {
+                metaHeld.Remove(key);                     // single use, always
+                if (AnswerFromSpeculation(held, id)) { metaAnswered++; return true; }
+            }
+
+            if (engine.SftpMetaTrace)
+            {
+                engine.LogInternal("meta miss: t=" + type + " '" + path + "' held=" + metaHeld.Count
+                                   + " pending=" + metaPending.Count);
+            }
+            metaForwarded++;
+
+            // Speculate the other question about this same path. Deliberately not conditioned on
+            // which of the two arrived first: the observed order is LSTAT then STAT, and nothing
+            // here depends on that continuing to hold.
+            Speculate(path, type == SftpMsg.LSTAT ? SftpMsg.STAT : SftpMsg.LSTAT);
+            return false;
+        }
+
+        // Wipes every held answer. Used for requests that could change a file we know nothing
+        // else about -- a blacklist of things known to be safe rather than a whitelist of things
+        // known to be dangerous, so a SETSTAT, RENAME, REMOVE or vendor extension nobody here
+        // enumerated discards rather than being quietly trusted.
+        private void InvalidateSpeculation()
+        {
+            if (metaHeld.Count > 0) metaHeld.Clear();
+            if (metaPending.Count > 0) metaPending.Clear();
+        }
+
+        // Drops what we hold about one path, for a request that names its target. Keeping the rest
+        // is what makes a globbed get fast: its per-file OPEN and CLOSE would otherwise wipe the
+        // answers prepared for every file after this one.
+        private void InvalidatePath(string path)
+        {
+            if (path == null) { InvalidateSpeculation(); return; }   // unknown target: assume the worst
+            metaHeld.Remove(MetaKey(SftpMsg.LSTAT, path));
+            metaHeld.Remove(MetaKey(SftpMsg.STAT, path));
+        }
+
+        private void Speculate(string path, byte type)
+        {
+            string key = MetaKey(type, path);
+            if (metaHeld.ContainsKey(key)) return;
+            if (metaHeld.Count + metaPending.Count >= META_MAX_HELD) return;
+            if (metaPending.ContainsValue(key)) return;
+
+            SshLikeWriter w = new SshLikeWriter();
+            if (!metaStarted)
+            {
+                uint ch;
+                if (!engine.TryRegisterPrefetchChannel(this, out ch)) return;
+                metaChannel = ch;
+                metaStarted = true;
+                agent.Subsystem(ch, "sftp");
+                AppendInit(w);                            // same frame as the request below
+                engine.LogInternal("sftp metadata channel " + ch);
+            }
+
+            uint reqId = metaNextId++;
+            SshLikeWriter body = new SshLikeWriter();
+            body.Byte(type);
+            body.UInt32(reqId);
+            body.Text(path);                              // copied through; never interpreted here
+            AppendFramed(w, body);
+            try { agent.SendStdin(metaChannel, w.ToArray()); }
+            catch (Exception) { return; }
+            metaPending[reqId] = key;
+            metaSpeculated++;
+        }
+
+        // Patches the request id and sends the reply on verbatim. Layout is
+        // [4 length][1 type][4 id][payload], so the id is bytes 5..8 of the framed message.
+        private bool AnswerFromSpeculation(byte[] framed, uint clientId)
+        {
+            if (framed.Length < 9) return false;
+            byte[] copy = new byte[framed.Length];
+            Array.Copy(framed, copy, framed.Length);
+            copy[5] = (byte)(clientId >> 24);
+            copy[6] = (byte)(clientId >> 16);
+            copy[7] = (byte)(clientId >> 8);
+            copy[8] = (byte)clientId;
+            owner.SendSynthetic(copy, null);
+            return true;
+        }
+
+        // Replies on the metadata channel. A desync here is NOT a valve trip: this channel is ours
+        // alone and the client has never seen a byte of it, so the worst case is that speculation
+        // stops working. Credit is granted in full on receipt because the reply is copied out --
+        // nothing of the agent's window is retained.
+        private void OnMetaData(uint ch, byte[] buffer, int offset, int count)
+        {
+            try
+            {
+                List<SftpFramer.Msg> msgs = fromMeta.Feed(buffer, offset, count);
+                if (fromMeta.Error == null)
+                {
+                    for (int i = 0; i < msgs.Count; i++)
+                    {
+                        SftpFramer.Msg m = msgs[i];
+                        if (m.Count < 5) continue;
+                        byte type = m.Buffer[m.Offset];
+                        if (type != SftpMsg.ATTRS && type != SftpMsg.STATUS) continue;
+                        SshLikeReader r = new SshLikeReader(m.Buffer, m.Offset + 1);
+                        // Matched strictly on id, which is what makes a reply for a speculation
+                        // that has since been invalidated harmless rather than something to track.
+                        uint replyId = r.UInt32();
+                        string key;
+                        if (!metaPending.TryGetValue(replyId, out key)) continue;
+                        metaPending.Remove(replyId);
+                        byte[] framed = new byte[4 + m.Count];
+                        Array.Copy(m.Buffer, m.Offset - 4, framed, 0, 4 + m.Count);
+                        metaHeld[key] = framed;
+                    }
+                }
+                else
+                {
+                    InvalidateSpeculation();
+                }
+            }
+            catch (Exception)
+            {
+                InvalidateSpeculation();
+            }
+            try { agent.GrantWindow(ch, (uint)count); } catch (Exception) { }
+        }
+
         // ---- replies on our private channel ----
 
         public void OnPrefetchData(uint ch, byte[] buffer, int offset, int count, bool stderr)
@@ -897,6 +1220,7 @@ namespace Pwssh
             lock (gate)
             {
                 if (stderr) return;                       // the agent's diagnostics, not protocol
+                if (metaStarted && ch == metaChannel) { OnMetaData(ch, buffer, offset, count); return; }
                 Prefetch p = active;
                 if (p == null || p.Channel != ch)
                 {
@@ -1132,6 +1456,13 @@ namespace Pwssh
             {
                 engine.ForgetPrefetchChannel(ch);
                 if (active != null && active.Channel == ch) active = null;
+                if (metaStarted && ch == metaChannel)
+                {
+                    // Speculation stops rather than being retried on a fresh channel: if the
+                    // remote dropped this one, the honest round trip is the right answer.
+                    metaStarted = false;
+                    InvalidateSpeculation();
+                }
             }
         }
 
@@ -1141,6 +1472,17 @@ namespace Pwssh
         {
             lock (gate)
             {
+                // The metadata channel lives for the whole session rather than per file, so it is
+                // this method's job to take it down. Leaking it would leave an idle sftp worker on
+                // the remote until its own watchdog noticed.
+                if (metaStarted)
+                {
+                    try { agent.CloseChannel(metaChannel); } catch (Exception) { }
+                    engine.ForgetPrefetchChannel(metaChannel);
+                    metaStarted = false;
+                    InvalidateSpeculation();
+                }
+
                 Prefetch p = active;
                 if (p == null) return;
                 try { agent.CloseChannel(p.Channel); } catch (Exception) { }

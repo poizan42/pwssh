@@ -76,6 +76,10 @@ namespace Pwssh.Dev
                 cfg.AllowGatewayPorts = gatewayPorts;
                 if (readAheadChunks >= 0) cfg.SftpReadAheadChunks = readAheadChunks;
                 cfg.SftpFaultAfterKiB = faultAfterKiB;
+                // Dev-only: the metadata-speculation miss trace is what turns "the hit count is
+                // zero" into "and here is why", which is how the glob-first request order was
+                // found. Tied to the host's own verbose flag rather than a knob of its own.
+                cfg.SftpMetaTrace = verbose;
                 // In-process agent wired through the real frame protocol, so this harness
                 // exercises everything except the WinRM hop. ExpectedUser is deliberately left
                 // unset so the HELLO round trip is exercised too.
@@ -277,3 +281,4 @@ namespace Pwssh.Dev
         }
     }
 }
+

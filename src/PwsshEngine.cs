@@ -57,6 +57,9 @@ namespace Pwssh
         // parked reads, which would have hung the client outright.
         public int SftpFaultAfterKiB;
 
+        // Debug-only tracing of metadata speculation misses.
+        public bool SftpMetaTrace;
+
         // If the client vanishes without closing the session, the remote pipeline would
         // otherwise block forever and hold a WinRM shell until WinRM's own (2 hour)
         // timeout. Bounded here instead. 0 disables.
@@ -1643,6 +1646,9 @@ namespace Pwssh
         internal bool SftpReadAheadEnabled { get { return cfg.SftpReadAheadChunks > 0; } }
         internal int SftpReadAheadChunks { get { return cfg.SftpReadAheadChunks; } }
         internal int SftpFaultAfterKiB { get { return cfg.SftpFaultAfterKiB; } }
+        // Debug-only: one log line per metadata speculation miss, which is the only way to see
+        // WHY a miss happened rather than just that the hit count is zero.
+        internal bool SftpMetaTrace { get { return cfg.SftpMetaTrace; } }
 
         // ---- IPwsshChannelSink: called from the agent side, must not block ----
 
