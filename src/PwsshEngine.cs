@@ -1974,12 +1974,31 @@ namespace Pwssh
         {
             // Gated on !stderr deliberately: OnAgentError synthesises human-readable text through
             // this same method, and parsing that as SFTP would be nonsense.
-            if (sftp != null && !stderr) sftp.FromAgent(buffer, offset, count);
+            byte[] send = buffer;
+            int sendOff = offset, sendLen = count;
+            if (sftp != null && !stderr)
+            {
+                // May remove the remote's reply to a CLOSE the read-ahead already answered. Two
+                // replies for one request id is fatal to the client, so this is a suppression and
+                // not merely an optimisation. Nothing is ever ADDED here: synthesised replies go
+                // through SendSynthetic instead.
+                send = sftp.FromAgent(buffer, offset, count, out sendOff, out sendLen);
+            }
 
-            Chunk c = new Chunk();
-            c.Kind = Chunk.DATA; c.Data = buffer; c.Offset = offset; c.Count = count; c.Stderr = stderr;
-            c.Credit = count;
-            Enqueue(c);
+            // Credit is the RECEIVED count, never the forwarded one. They differ whenever a reply
+            // is suppressed, and accounting the smaller number would withhold the agent's window a
+            // few bytes at a time until it stalled for good.
+            if (send != null && sendLen > 0)
+            {
+                Chunk c = new Chunk();
+                c.Kind = Chunk.DATA; c.Data = send; c.Offset = sendOff; c.Count = sendLen; c.Stderr = stderr;
+                c.Credit = count;
+                Enqueue(c);
+            }
+            else
+            {
+                ReleaseCredit(count);        // nothing to forward, but the window still moves
+            }
             AccrueCredit(count);
         }
 

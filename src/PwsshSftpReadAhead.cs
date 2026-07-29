@@ -280,6 +280,7 @@ namespace Pwssh
                          + " metaAnswered=" + metaAnswered
                          + " metaForwarded=" + metaForwarded
                          + " metaSpeculated=" + metaSpeculated
+                         + " closesEarly=" + closesAnsweredEarly
                          + " valveTrips=" + valveTrips;
                 if (valveReason != null) s += " (" + valveReason + ")";
                 return s;
@@ -418,26 +419,77 @@ namespace Pwssh
 
         // ---- agent -> client ----
         //
-        // Only observes for now. Replies on the client's own channel always belong to the client
-        // and are always forwarded; the read-ahead's own replies arrive on its private channel
-        // and never pass through here at all.
-        public bool FromAgent(byte[] data, int offset, int count)
+        // Mostly observes. The one thing it removes is the remote's reply to a CLOSE we already
+        // answered ourselves: two replies for one request id is fatal to the client, which says so
+        // in as many words ("Can't find request for ID %u", in sftp.exe).
+        //
+        // Structured so the bulk download path keeps its zero-copy fast path. A feed is normally
+        // exactly one SFTP message, because the agent sends one frame per reply, so the common case
+        // returns the caller's own buffer untouched.
+        public byte[] FromAgent(byte[] data, int offset, int count, out int outOffset, out int outCount)
         {
+            outOffset = offset;
+            outCount = count;
             lock (gate)
             {
-                if (mode == Mode.Passthrough) return true;
+                if (mode == Mode.Passthrough) return data;
                 try
                 {
+                    // Once anything is owed a suppression we stay in rebuild mode until it is done,
+                    // and we only ever ENTER that mode on a message boundary (see OnClientClose).
+                    // Mixing raw forwarding with rebuilt forwarding across a half-received message
+                    // would either duplicate or lose the bytes it straddles.
+                    bool owed = closeAnswered.Count > 0;
+
                     List<SftpFramer.Msg> msgs = fromAgent.Feed(data, offset, count);
-                    if (fromAgent.Error != null) { Trip("agent stream: " + fromAgent.Error); return true; }
-                    for (int i = 0; i < msgs.Count; i++) InspectReply(msgs[i]);
+                    if (fromAgent.Error != null)
+                    {
+                        Trip("agent stream: " + fromAgent.Error);
+                        return FlushHeld(msgs, out outOffset, out outCount);
+                    }
+
+                    bool dropped = false;
+                    List<SftpFramer.Msg> keep = new List<SftpFramer.Msg>();
+                    for (int i = 0; i < msgs.Count; i++)
+                    {
+                        InspectReply(msgs[i]);
+                        if (IsAnsweredClose(msgs[i])) { dropped = true; continue; }
+                        keep.Add(msgs[i]);
+                    }
+
+                    if (!dropped && !owed && !fromAgent.HasResidue && msgs.Count > 0
+                        && msgs[0].Buffer == data && msgs[0].Offset == offset + 4)
+                    {
+                        return data;
+                    }
+                    if (!dropped && !owed && msgs.Count == 0 && !fromAgent.HasResidue) return data;
+
+                    return Rebuild(keep, out outOffset, out outCount);
                 }
                 catch (Exception ex)
                 {
                     Trip("agent parse: " + ex.Message);
+                    return data;
                 }
+            }
+        }
+
+        // The remote's answer to a CLOSE the client has already been told succeeded. Consumed here
+        // so a lost reply cannot leave the set growing.
+        private bool IsAnsweredClose(SftpFramer.Msg m)
+        {
+            if (closeAnswered.Count == 0 || m.Count < 5) return false;
+            if (m.Buffer[m.Offset] != SftpMsg.STATUS) return false;
+            try
+            {
+                SshLikeReader r = new SshLikeReader(m.Buffer, m.Offset + 1);
+                uint id = r.UInt32();
+                if (!closeAnswered.ContainsKey(id)) return false;
+                closeAnswered.Remove(id);
+                closesAnsweredEarly++;
                 return true;
             }
+            catch (Exception) { return false; }
         }
 
         // Classifies one client message. An unrecognised type is not an anomaly -- the client
@@ -482,7 +534,8 @@ namespace Pwssh
                         string h = PeekHandle(m);
                         string hp = PathForHandle(h);
                         if (hp != null) InvalidatePath(hp);   // a write handle finalises size and mtime
-                        if (h != null) handlePath.Remove(h);
+                        TryAnswerCloseEarly(m, h);
+                        if (h != null) { handlePath.Remove(h); readHandles.Remove(h); }
                     }
                     break;
 
@@ -558,6 +611,46 @@ namespace Pwssh
             }
         }
 
+        // Answers a read handle's CLOSE at once, while still forwarding it so the remote frees the
+        // FileStream -- a leaked one holds an NTFS lock until wsmprovhost exits, which is worse than
+        // a leaked port because the user's next attempt fails on their own file.
+        //
+        // Nothing meaningful can fail when closing a read handle: a failure would mean the handle
+        // was already gone, and the bytes the client received were still correct. A WRITE handle is
+        // a different matter entirely -- its close is where an upload commits -- which is why only
+        // handles seen to be opened read-only qualify.
+        //
+        // Ordering against a later write-open of the same path is safe on this channel, because the
+        // agent's worker is FIFO per channel and so processes the forwarded CLOSE first.
+        private void TryAnswerCloseEarly(SftpFramer.Msg m, string handle)
+        {
+            if (handle == null || !readHandles.ContainsKey(handle)) return;
+            // Only ever entered on a message boundary in the reply direction: FromAgent switches
+            // to rebuilding while anything is owed, and that switch must not happen part way
+            // through a message it would then either duplicate or drop.
+            if (fromAgent.HasResidue) return;
+            if (closeAnswered.Count >= 64) return;         // bounded; the honest round trip still works
+
+            uint id;
+            try
+            {
+                SshLikeReader r = new SshLikeReader(m.Buffer, m.Offset + 1);
+                id = r.UInt32();
+            }
+            catch (Exception) { return; }
+
+            SshLikeWriter w = new SshLikeWriter();
+            SshLikeWriter body = new SshLikeWriter();
+            body.Byte(SftpMsg.STATUS);
+            body.UInt32(id);
+            body.UInt32(SftpMsg.STATUS_OK);
+            body.Text("");
+            body.Text("");
+            AppendFramed(w, body);
+            closeAnswered[id] = true;
+            owner.SendSynthetic(w.ToArray(), null);
+        }
+
         // Ties a HANDLE reply back to the path its OPEN named, so a CLOSE can later invalidate just
         // that file. Runs for every reply, independently of whether a prefetch is in progress.
         private void NoteHandleReply(SftpFramer.Msg m)
@@ -570,12 +663,16 @@ namespace Pwssh
                 uint id = r.UInt32();
                 string path;
                 if (!openIdPath.TryGetValue(id, out path)) return;
+                bool readOnly;
+                openIdReadOnly.TryGetValue(id, out readOnly);
                 openIdPath.Remove(id);
+                openIdReadOnly.Remove(id);
                 if (type != SftpMsg.HANDLE) return;      // the open failed; nothing to remember
                 string handle = r.Text();
                 if (handle.Length == 0) return;
-                if (handlePath.Count >= 256) handlePath.Clear();
+                if (handlePath.Count >= 256) { handlePath.Clear(); readHandles.Clear(); }
                 handlePath[handle] = path;
+                if (readOnly) readHandles[handle] = true;
             }
             catch (Exception) { }
         }
@@ -1051,6 +1148,18 @@ namespace Pwssh
         private readonly Dictionary<uint, string> openIdPath = new Dictionary<uint, string>();
         private readonly Dictionary<string, string> handlePath = new Dictionary<string, string>();
 
+        // Handles the client opened read-only, which are the only ones whose CLOSE may be answered
+        // before the remote confirms it. A write handle's close is where an upload's data is
+        // finally committed, so reporting success early there could tell the client a transfer
+        // worked when it did not.
+        private readonly Dictionary<uint, bool> openIdReadOnly = new Dictionary<uint, bool>();
+        private readonly Dictionary<string, bool> readHandles = new Dictionary<string, bool>();
+
+        // Client request ids for CLOSEs we answered ourselves, so the remote's own reply to each
+        // can be dropped on the way back.
+        private readonly Dictionary<uint, bool> closeAnswered = new Dictionary<uint, bool>();
+        private int closesAnsweredEarly;
+
         private string PathForHandle(string handle)
         {
             if (handle == null) return null;
@@ -1069,9 +1178,12 @@ namespace Pwssh
                 SshLikeReader r = new SshLikeReader(m.Buffer, m.Offset + 1);
                 uint id = r.UInt32();
                 string path = r.Text();
+                uint pflags = r.UInt32();
                 if (path.Length == 0) return;
-                if (openIdPath.Count >= 256) openIdPath.Clear();
+                if (openIdPath.Count >= 256) { openIdPath.Clear(); openIdReadOnly.Clear(); }
                 openIdPath[id] = path;
+                openIdReadOnly[id] = (pflags & SftpMsg.PFLAG_WRITE) == 0
+                                     && (pflags & SftpMsg.PFLAG_READ) != 0;
             }
             catch (Exception) { }
         }

@@ -32,22 +32,24 @@ implements the protocol itself.
 | Not implemented | symlink creation (needs elevation on Windows) |
 
 Tested against OpenSSH 9.5p2 on Windows, with a Windows PowerShell 5.1 / .NET Framework 4.8
-remote. The test suite drives the real `ssh`, `sftp` and `scp` binaries: 65 cases over WinRM and
-57 against a loopback dev host.
+remote. The test suite drives the real `ssh`, `sftp` and `scp` binaries: 69 cases over WinRM and
+62 against a loopback dev host.
 
 Two warts worth knowing:
 
 - **`-R` ports linger.** `ssh` kills its `ProxyCommand` when it exits, so pwssh gets no chance
   to tell the remote to unbind the listening port. The remote's own watchdog releases it about
   two minutes later, so reconnecting with the *same* `-R` port inside that window fails.
-- **SFTP pays four round trips per file, and that dominates anything but one large file.** The
-  client stats, opens and closes each file separately, so on a link where a round trip is most
-  of a second a small file costs ~3 s however few bytes it holds: 40 files of 900 bytes measured
-  **~150 s**. One large file is fine — pwssh reads ahead on a private channel and downloads
-  measured 3.29 MiB/s at 32 MiB (1.42× over forwarding the client's requests one at a time), and
-  0.76 MiB/s at 8 MiB, where the fixed cost is most of the transfer. Uploads, at ~0.35 MiB/s,
-  are already at the link's upstream ceiling. **Do not pass `sftp -B`** — it suppresses the
-  buffer negotiation that keeps this from being far worse.
+- **SFTP pays round trips per file, and that dominates anything but one large file.** The client
+  stats, opens and closes each file separately, so on a link where a round trip is most of a
+  second a small file costs a couple of seconds however few bytes it holds: 40 files of 900 bytes
+  measured **~150 s**, now **~94 s** — pwssh answers the second of the client's two metadata
+  requests from a parallel fetch of its own and acknowledges a read-only close without waiting.
+  Roughly three round trips per file remain. One large file is fine: pwssh reads ahead on a
+  private channel and downloads measured 3.29 MiB/s at 32 MiB (1.42× over forwarding the client's
+  requests one at a time), and 0.76 MiB/s at 8 MiB, where fixed cost is most of the transfer.
+  Uploads, at ~0.35 MiB/s, are already at the link's upstream ceiling. **Do not pass `sftp -B`**
+  — it suppresses the buffer negotiation that keeps this from being far worse.
 
 ## What it needs on the remote
 
@@ -140,7 +142,7 @@ The transport is high-latency and asymmetric, and that shapes everything.
 | Bulk download via `exec`, compressible | ~7 MiB/s |
 | Bulk download via `exec`, incompressible | ~0.4 MiB/s, or ~1 MiB/s with `-Streams 4` |
 | Bulk download via `sftp`/`scp` | ~0.76 MiB/s at 8 MiB, ~3.3 MiB/s at 32 MiB |
-| Many small files via `sftp`/`scp` | ~3 s each, whatever their size — four round trips per file |
+| Many small files via `sftp`/`scp` | ~2 s each, whatever their size — round trips per file, not bytes |
 | Upload, any path | ~0.35–0.4 MiB/s — the link's upstream ceiling |
 
 Three notes on the numbers. Compressible output is much faster because WinRM compresses the

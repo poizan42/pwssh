@@ -880,6 +880,68 @@ quit
         Write-Host '  SKIP  a download with read-ahead disabled is bit-exact (dev host: use -SftpReadAheadChunks 0)' -ForegroundColor DarkGray
     }
 
+    # ---- 5h. a globbed get of several files, which is what the metadata speculation is for.
+    #
+    # The client expands a glob by LSTATing every match up front, and only then walks the files
+    # doing STAT, OPEN, reads, CLOSE. The engine speculates each STAT during that glob phase and
+    # answers a read handle's CLOSE without waiting, so this exercises both mechanisms per file.
+    #
+    # Run with -vvv and asserted on the client's OWN complaints, because the way either mechanism
+    # fails is by producing a reply the client did not ask for -- "Can't find request for ID" or
+    # "Unexpected reply". Those are the tell, and bit-exactness alone would not catch them.
+    $globN = 6
+    $mkGlob = New-Object System.Text.StringBuilder
+    [void]$mkGlob.AppendLine("New-Item -ItemType Directory -Path '$farDir${bs}glob' -Force | Out-Null")
+    for ($i = 1; $i -le $globN; $i++) {
+        [void]$mkGlob.AppendLine("[System.IO.File]::WriteAllText('$farDir${bs}glob${bs}g$i.txt', ('g' * (100 * $i)))")
+    }
+    [void]$mkGlob.AppendLine("[Console]::Out.Write('ok')")
+    $null = Far-Sftp $mkGlob.ToString()
+
+    $globDir = Join-Path $repo "tmp/sftp-glob-$sftpTag"
+    if (-not (Test-Path $globDir)) { $null = New-Item -ItemType Directory -Path $globDir }
+    $star = [string][char]42
+    $r = Invoke-Sftp "get $farFwd/glob/$star $($globDir.Replace($bs,'/'))/`nquit`n" 'glob' @('-vvv')
+    $globBad = @()
+    for ($i = 1; $i -le $globN; $i++) {
+        $lp = Join-Path $globDir "g$i.txt"
+        $want = 'g' * (100 * $i)
+        $got = if (Test-Path $lp) { [System.IO.File]::ReadAllText($lp) } else { 'MISSING' }
+        if ($got -ne $want) { $globBad += "g$i" }
+    }
+    Assert-That 'a globbed get of several files is bit-exact' ($globBad.Count -eq 0) `
+        "$($r.Phase) wrong at: $($globBad -join ', ')"
+    Assert-That 'the client never sees a reply it did not ask for' `
+        ($r.Err -notmatch "Can't find request for ID|Unexpected reply|ID mismatch") `
+        "stderr: $(($r.Err -split "`r?`n" | Where-Object { $_ -match 'find request|Unexpected reply|mismatch' }) -join ' | ')"
+
+    # ---- 5i. download a file then immediately overwrite it, twice.
+    #
+    # The read-ahead's own read handle is closed on a different channel from the one the client's
+    # write-open arrives on, and the agent opens write handles FileShare.None, so these two are not
+    # ordered against each other. Answering the CLOSE early makes the put arrive sooner still.
+    # Checked before this work existed as well, so a failure here is a regression and not a
+    # discovery.
+    $rpLocal = Join-Path $repo "tmp/sftp-rp-$sftpTag.bin"
+    $r = Invoke-Sftp @"
+get $farFwd/d522240.bin $($rpLocal.Replace($bs,'/'))
+put $($localUp.Replace($bs,'/')) $farFwd/replace.bin
+put $($localUp.Replace($bs,'/')) $farFwd/replace.bin
+quit
+"@ 'replace'
+    $rpFar = Far-Sftp "[Console]::Out.Write([Convert]::ToBase64String([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.IO.File]::ReadAllBytes('$farDir${bs}replace.bin'))))"
+    Assert-That 'get then overwrite the same path leaves the upload intact' `
+        ($rpFar -eq (Get-Sha ([System.IO.File]::ReadAllBytes($localUp)))) `
+        "$($r.Phase) far=$rpFar want=$(Get-Sha ([System.IO.File]::ReadAllBytes($localUp))) err='$($r.Err -replace "`r?`n", ' | ')'"
+
+    # ---- 5j. the attributes the client is given must be the right file's.
+    # A speculation answered from the wrong path or the wrong request type would show up as a
+    # wrong size here, which no hash comparison would ever notice.
+    $r = Invoke-Sftp "ls -l $farFwd/glob`nquit`n" 'lsattrs'
+    Assert-That 'listed sizes are the real ones' `
+        (($r.Out -match "\s$(100 * $globN)\s") -and ($r.Out -match '\s100\s')) `
+        "out='$($r.Out -replace "`r?`n", ' | ')'"
+
     # ---- 6. listings show what is there, and render a directory as a directory
     $r = Invoke-Sftp "mkdir $farFwd/adir`nls -l $farFwd`nquit`n" 'lsl'
     Assert-That 'ls shows an uploaded file' ($r.Out -match 'up\.bin') `

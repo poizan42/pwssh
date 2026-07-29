@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns the remote's `DOMAIN\user`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite runs 57–65 cases per transport: **WinRM is 65/65**, loopback **57/58** with one environmental exception — the pty case that this client machine's ConPTY breaks (see *Running and testing*). The two runs differ in composition rather than count — WinRM has the graceful-degradation and IPv6 cases plus the gateway-ports check; loopback has the wrong-username check that the WinRM alias takes from `ssh_config`, along with the reverse-forward release and bind-failure cases that need the far side to be this machine.
+**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns the remote's `DOMAIN\user`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite runs 62–69 cases per transport: **WinRM is 69/69**, loopback **61/62** with one environmental exception — the pty case that this client machine's ConPTY breaks (see *Running and testing*). The two runs differ in composition rather than count — WinRM has the graceful-degradation and IPv6 cases plus the gateway-ports check; loopback has the wrong-username check that the WinRM alias takes from `ssh_config`, along with the reverse-forward release and bind-failure cases that need the far side to be this machine.
 
 **A run that fails one case with `exit=255` is usually a flake, not a regression.** 255 is ssh's own error code for a connection that never came up, and it turns up after the remote has been hammered with dozens of sessions in a row. Re-run the case before believing it: the final WinRM run here failed "shell exit status propagates" that way and passed 3/3 immediately afterwards.
 
@@ -229,7 +229,7 @@ Measured, interleaved, medians — depth is the whole story and the bandwidth-de
 
 At 8 MiB the same change is only **1.17×** (0.65 → 0.76), and incompressible 8 MiB does not move at all (0.48 → 0.53, with the paired rounds disagreeing in direction — noise, and expected, since that case is already at the downstream ceiling). The reason 8 MiB gains so little is arithmetic: ~3.4 s of connect plus ~3.4 s of the four fixed per-file round trips is ~6.8 s of an ~11 s transfer, and read-ahead cannot touch either. **Quote the 32 MiB figure; the 8 MiB one is mostly fixed cost.**
 
-**Per-file round trips now dominate anything that is not one large file.** 40 files of 900 bytes each — 36 KB in total — take **~150 s** whether read-ahead is on or off (152.7 s at depth 64 against 153.8 s and 148.8 s off, on the 300 ms dev host). That is `LSTAT`/`STAT`/`OPEN`/`CLOSE` per file and nothing else. It also settles a risk worth having checked: read-ahead issues up to `depth` requests before it learns where the file ends, so a small file costs ~64 requests instead of one — and it measures as **no regression**, because those requests pipeline into one frame and the fixed round trips swamp them. The plan's optional "cap the window from a passing `STAT`" was therefore left unimplemented, on measurement rather than argument.
+**Per-file round trips dominate anything that is not one large file**, and read-ahead never touched them: 40 files of 900 bytes each — 36 KB in total — took **~150 s** whether it was on or off (152.7 s at depth 64 against 153.8 s and 148.8 s off, on the 300 ms dev host). That is `LSTAT`/`STAT`/`OPEN`/`CLOSE` per file and nothing else. Two of those four are now removed — see *Per-file round trips* below, which takes the same case to **94 s**. It also settles a risk worth having checked: read-ahead issues up to `depth` requests before it learns where the file ends, so a small file costs ~64 requests instead of one — and it measures as **no regression**, because those requests pipeline into one frame and the fixed round trips swamp them. The plan's optional "cap the window from a passing `STAT`" was therefore left unimplemented, on measurement rather than argument.
 
 Hit ratio is the assertion that matters, since wall-clock on this transport has inverted conclusions twice. On the 300 ms dev host an 8 MiB download reports `clientReads=34 served=34 forwarded=0 parked=1 prefetchKiB=8192 nonSeq=0 valveTrips=0` — every read answered locally, prefetched bytes exactly equal to the file, no valve trips — in 6.5 s against 10.0 s with read-ahead off (1.54×).
 
@@ -253,6 +253,37 @@ What is **not** covered, and would need a client that behaves differently from `
 - **A true mid-transfer backwards seek.** `reget` covers starting at a non-zero offset, but nothing in the stock client seeks backwards mid-file, so the `nonSequential` counter and the 3-restart thrash limit are reasoned about rather than tested. An `sshfs`-style client is what would exercise them.
 - **Two files prefetching at once.** Only one prefetch is active at a time by design — `sftp` and `scp -r` read one file after another — and the same-file-twice case covers handle cycling, but genuine concurrent handles do not arise from the CLI.
 - **A single transfer exceeding the credit pool** has no dedicated case, but the depth sweep crossed that boundary in anger: depth 128 asks for 33.4 MB against a 32 MiB credit and completed bit-exact twice, which is the condition the credit-deadlock worry was about.
+
+### Per-file round trips (`LSTAT`/`STAT` speculation and early `CLOSE`)
+
+Measured with `sftp -vvv` rather than inferred, the client spends ~5 round trips per file:
+
+```
+LSTAT  →  STAT  →  OPEN  →  (data)  →  CLOSE
+```
+
+Two of those are now free, taking 40 files of 900 bytes from **~150 s to 94 s** on the 300 ms dev host — a 1.59×, in the case that was by far the worst.
+
+**Speculative metadata is a parallel fetch, not a cache.** On the client's first `LSTAT`/`STAT` for a path the engine forwards it untouched *and* asks the remote the other question on a channel of its own. The speculative request leaves at essentially the moment the client's own would have, so the answer is at most one round trip staler than what the client would have received, and nothing is held across an operation that could change it. Metadata is **never synthesised**: the client gets the remote's own answer to a byte-identical request with only the **4-byte request id patched**, because re-encoding an ATTRS payload could corrupt it and patching four bytes cannot.
+
+**`LSTAT` and `STAT` are not interchangeable** — `DoStat`'s `followLinks` — and a client that sees a junction as a directory recurses for ever. That is exactly why this issues a real second request rather than reusing the first reply, and why the held answers are keyed on *(type, path)* so a `STAT` can only ever be answered by a `STAT`.
+
+**The first attempt measured 80 speculations and zero hits**, and the miss trace said why: **a globbed get does not interleave one file's requests with the next.** It `LSTAT`s every match up front to expand the glob, and only then walks the files doing `STAT`, `OPEN`, reads, `CLOSE` one at a time. With a single held answer each `LSTAT` overwrote the last, so by the time `STAT(first)` arrived we held `STAT(last)`. A bounded **map** turns that glob phase — which the client pays for regardless — into preparation that makes every per-file `STAT` free.
+
+**Invalidation granularity is load-bearing for the same reason.** A request naming one path drops only that path, because a globbed get's own per-file `OPEN` and `CLOSE` would otherwise wipe the answers prepared for every later file. Read-only requests — including `OPENDIR`, `READDIR` and `REALPATH`, which a glob and a session start use — drop nothing. Everything else, known or not, drops the lot.
+
+**Early `CLOSE`** answers a read handle's close at once while still forwarding it, so the remote frees the `FileStream`. Only handles seen to be opened **read-only** qualify: a write handle's close is where an upload commits, and reporting that early could tell the client a transfer worked when it did not.
+
+The sharp edge there is that **the remote's own reply must be dropped**, or the client gets two replies for one id and hits `Can't find request for ID`. That is the one thing in this change that touches the bulk download path, so it keeps a zero-copy fast path (a feed is normally exactly one SFTP message, because the agent sends one frame per reply) and only rebuilds while a suppression is owed. **Rebuild mode is entered only on a message boundary**, since switching part way through a half-received message would either duplicate or lose the bytes it straddles.
+
+**Why the `OPEN` round trip stays**, recorded because the reason is a hazard rather than a preference:
+
+- **Speculating it would break `put` over an existing file.** Metadata requests do not reveal direction, so an open speculated at `STAT` time would be a read handle — and `DoOpen` uses `FileShare.None` for writes, so the client's subsequent write-open would fail against it. Uploads must not be loosened to speed up downloads.
+- **Answering the client's `OPEN` locally needs handle translation.** `handles` is an instance field of `AgentSftpChannel`, so handles are per-channel and one minted on a private channel is invalid on the client's. It would mean a synthetic handle rewritten in every forwarded `READ`/`FSTAT`/`CLOSE`, those routed to the private channel, and ids translated back — the id-translating proxy the read-ahead design deliberately avoided — and an open error would surface at the first `READ` instead. **Left as future work**, with that cost.
+
+Also considered and dropped: caching attributes from `READDIR` replies. It helps only globbed gets, `READDIR` carries `LSTAT` semantics so it could not answer a `STAT` anyway, and speculation subsumes it while also helping a single-file get.
+
+**The archive trick still beats all of this** for a large tree, and the README should keep saying so: ~3 round trips per file remain, so a 40-file tree is still on the order of a minute.
 
 ### Rekeying
 
