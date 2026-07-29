@@ -48,6 +48,10 @@ param(
     # 64 by measurement: 1.42x on 32 MiB, where 16 gave nothing at all and 128 gave less than
     # 64 because it asks for more than -CreditMiB allows to be in flight. Clamped to 128.
     [int]$SftpReadAheadChunks = 64,
+    # Give up if the ssh client stops speaking for this long, so a ProxyCommand that outlives
+    # its client cannot hold a WinRM shell open. The engine sends its own keepalive toward the
+    # client, so an idle interactive session refreshes this and is never dropped by it.
+    [int]$InactivityTimeoutSeconds = 300,
     # Testing hook: trip the SFTP read-ahead's safety valve part way through a transfer, once
     # this many KiB have been served from the buffer. Also readable as
     # PWSSH_SFTP_FAULT_AFTER_KIB, which is how the suite reaches it: ssh spawns this script
@@ -154,6 +158,15 @@ try {
              elseif ($env:PWSSH_SFTP_FAULT_AFTER_KIB) { [int]$env:PWSSH_SFTP_FAULT_AFTER_KIB }
              else { 0 }
     $cfg.SftpFaultAfterKiB = $fault
+    # As with the read-ahead knobs, the environment is consulted only when the parameter was not
+    # given: the suite drives an unmodified ssh_config and cannot add an alias per variation, and
+    # a five-minute idle is not something a test can wait out.
+    $cfg.InactivityTimeoutSeconds =
+        if ($PSBoundParameters.ContainsKey('InactivityTimeoutSeconds')) { $InactivityTimeoutSeconds }
+        elseif ($null -ne $env:PWSSH_INACTIVITY_TIMEOUT_SECONDS -and $env:PWSSH_INACTIVITY_TIMEOUT_SECONDS -ne '') {
+            [int]$env:PWSSH_INACTIVITY_TIMEOUT_SECONDS
+        }
+        else { $InactivityTimeoutSeconds }
 
     $engine = New-Object Pwssh.PwsshEngine $cfg
     $engine.Start()

@@ -25,6 +25,9 @@ param(
     [int]$SftpReadAheadChunks = -1,
     # Testing hook: trip the read-ahead's safety valve after this many KiB have been served.
     [int]$SftpFaultAfterKiB = 0,
+    # Idle shutdown, as pwssh-connect.ps1's -InactivityTimeoutSeconds. -1 keeps the engine's
+    # default of 300; a small value makes the idle watchdog reachable in seconds.
+    [int]$InactivityTimeoutSeconds = -1,
     [switch]$Quiet
 )
 
@@ -47,4 +50,5 @@ Import-PwsshFiles -Path (@(Get-PwsshAgentFiles -Repo $repo) + @(
 $key = Get-PwsshHostKey -Path $HostKeyPath
 
 Write-Host "pwssh dev host: 127.0.0.1:$Port  hostkey=$HostKeyPath$(if ($LatencyMs -gt 0) { "  latency=${LatencyMs}ms" })"
-[Pwssh.Dev.TcpHost]::Run($Port, $key, (-not $Quiet), [bool]$GatewayPorts, $LatencyMs, $SftpReadAheadChunks, $SftpFaultAfterKiB)
+[Pwssh.Dev.TcpHost]::Run($Port, $key, (-not $Quiet), [bool]$GatewayPorts, $LatencyMs,
+                         $SftpReadAheadChunks, $SftpFaultAfterKiB, $InactivityTimeoutSeconds)

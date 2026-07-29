@@ -587,7 +587,9 @@ namespace Pwssh
         private int rekeys;              // client-initiated rekeys completed, for the log and tests
         private string clientIdent;
         private byte[] clientKexInit, serverKexInit;
-        private bool authenticated;
+        // volatile because the watchdog thread reads it to decide whether a keepalive is due yet,
+        // while the protocol thread is what sets it.
+        private volatile bool authenticated;
         private int authFailures;
 
         // Several channels can be live at once: ssh -L/-D opens one per forwarded connection,
@@ -695,17 +697,78 @@ namespace Pwssh
         private void Watchdog()
         {
             int limitMs = cfg.InactivityTimeoutSeconds * 1000;
+
+            // A quarter of the timeout, capped at a minute, floored so a pathological setting
+            // cannot spin. The same ratio the agent's own keepalive uses -- "the agent times out
+            // at four times this" -- so a couple of lost or delayed keepalives are harmless. It is
+            // derived rather than configured so that one knob makes the whole mechanism testable:
+            // a 10 s timeout gives a 2.5 s keepalive without a second parameter to keep in step.
+            int keepAliveMs = 0;
+            if (limitMs > 0)
+            {
+                keepAliveMs = limitMs / 4;
+                if (keepAliveMs > 60000) keepAliveMs = 60000;
+                if (keepAliveMs < 1000) keepAliveMs = 1000;
+            }
+
+            // Normally 5 s, but a short timeout needs a finer tick or the keepalive cannot be sent
+            // often enough to feed it.
+            int tickMs = 5000;
+            if (keepAliveMs > 0 && keepAliveMs < tickMs) tickMs = keepAliveMs;
+
+            int lastKeepAlive = Environment.TickCount;
             while (!finished)
             {
-                Thread.Sleep(5000);
+                Thread.Sleep(tickMs);
                 if (finished) return;
                 CheckSftpParkDeadlines();
+
+                if (keepAliveMs > 0 && authenticated
+                    && unchecked(Environment.TickCount - lastKeepAlive) >= keepAliveMs)
+                {
+                    lastKeepAlive = Environment.TickCount;
+                    SendKeepAlive();
+                }
+
                 if (limitMs > 0 && unchecked(Environment.TickCount - lastInboundTick) > limitMs)
                 {
                     Log("no inbound data for " + cfg.InactivityTimeoutSeconds + "s; shutting down");
                     Stop();
                     return;
                 }
+            }
+        }
+
+        // Asks the client to say something, so that silence can be taken to mean it has gone.
+        //
+        // Without this the idle watchdog could not tell an idle interactive session from a dead
+        // client: ssh sends nothing while the user is not typing, since ServerAliveInterval
+        // defaults to 0 and TCPKeepAlive works below the SSH layer. So a session left sitting was
+        // dropped after InactivityTimeoutSeconds. This is the mirror image of the agent's own PING
+        // (PwsshAgentProxy.StartKeepAlive), for exactly the reason recorded there -- except that
+        // here we need the PEER to speak, so it has to be a request it is obliged to answer.
+        //
+        // The client does not implement keepalive@openssh.com and answers REQUEST_FAILURE, which is
+        // all that is needed: RFC 4254 4 requires a reply to any global request with want_reply
+        // set, and sshd's own ClientAliveInterval relies on the same thing. That reply arrives via
+        // PushInbound and refreshes lastInboundTick.
+        //
+        // It costs nothing on the slow link, which is worth saying on a transport where a round
+        // trip is most of a second: the SSH transport is local stdio between ssh.exe and this
+        // ProxyCommand, so neither the request nor its reply touches WinRM or wakes the remote.
+        private void SendKeepAlive()
+        {
+            try
+            {
+                SshWriter w = new SshWriter();
+                w.Byte(Msg.GLOBAL_REQUEST);
+                w.Str("keepalive@openssh.com");
+                w.Bool(true);                       // want_reply, which is the entire point
+                pkt.WritePacket(w.ToArray());
+            }
+            catch (Exception ex)
+            {
+                Log("keepalive failed: " + ex.Message);
             }
         }
 
@@ -1179,6 +1242,15 @@ namespace Pwssh
                                 ForgetChannel(mine);
                             }
                         }
+                        break;
+
+                    // Replies to our own keepalive. Handled rather than left to fall into default,
+                    // which would answer UNIMPLEMENTED to something perfectly legitimate. Safe to
+                    // treat any of these as ours because the keepalive is the only global request
+                    // this engine sends; a second kind would need the replies order-matched, as
+                    // the client's own global requests already are in pendingForwards.
+                    case Msg.REQUEST_SUCCESS:
+                    case Msg.REQUEST_FAILURE:
                         break;
 
                     default:

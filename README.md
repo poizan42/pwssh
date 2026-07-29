@@ -33,7 +33,7 @@ the protocol itself.
 | Not implemented | symlink creation (needs elevation on Windows) |
 
 Tested against OpenSSH 9.5p2 on Windows, with a Windows PowerShell 5.1 / .NET Framework 4.8
-remote. The test suite drives the real `ssh`, `sftp` and `scp` binaries: 69 cases over WinRM and
+remote. The test suite drives the real `ssh`, `sftp` and `scp` binaries: 70 cases over WinRM and
 62 against a loopback dev host.
 
 Two warts worth knowing:
@@ -130,6 +130,7 @@ Useful options on `pwssh-connect.ps1`:
 | `-Streams N` | extra receive sessions for bulk **incompressible** transfers (see below), default 1 |
 | `-SftpReadAheadChunks` | how far ahead an SFTP download is fetched, in 255 KiB chunks, default 64 (≈16 MiB held client-side). `0` turns read-ahead off and restores byte-for-byte forwarding |
 | `-GatewayPorts` | let `ssh -R` bind a non-loopback address on the remote. Off by default, matching OpenSSH's `GatewayPorts no`; a request for a wider address is refused rather than quietly narrowed |
+| `-InactivityTimeoutSeconds` | give up if the ssh client stops speaking for this long, default 300, so a proxy that outlives its client cannot hold a WinRM shell open. pwssh sends its own keepalive toward the client, so an **idle** interactive session is never dropped by this and needs no `ServerAliveInterval` |
 | `-Diagnostics` | progress to stderr. Off by default, since ssh shows a ProxyCommand's stderr on every connection |
 
 ## Performance, honestly

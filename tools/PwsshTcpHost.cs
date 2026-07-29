@@ -33,25 +33,36 @@ namespace Pwssh.Dev
             Run(port, hostKey, verbose, gatewayPorts, latencyMs, readAheadChunks, 0);
         }
 
+        public static void Run(int port, string hostKey, bool verbose, bool gatewayPorts,
+                               int latencyMs, int readAheadChunks, int faultAfterKiB)
+        {
+            Run(port, hostKey, verbose, gatewayPorts, latencyMs, readAheadChunks, faultAfterKiB, -1);
+        }
+
         // readAheadChunks: -1 leaves PwsshConfig's default alone, which is what every caller that
         // is not specifically testing read-ahead wants. 0 disables it, and is how the suite gets a
         // byte-for-byte forwarding run to compare against without needing WinRM.
+        // inactivitySeconds: -1 leaves PwsshConfig's default (300). A small value makes the idle
+        // watchdog reachable in seconds instead of five minutes, which is the only reason the
+        // client-side idle drop went unverified for as long as it did.
         public static void Run(int port, string hostKey, bool verbose, bool gatewayPorts,
-                               int latencyMs, int readAheadChunks, int faultAfterKiB)
+                               int latencyMs, int readAheadChunks, int faultAfterKiB,
+                               int inactivitySeconds)
         {
             TcpListener l = new TcpListener(IPAddress.Loopback, port);
             l.Start();
             Console.Error.WriteLine("[pwssh] listening on 127.0.0.1:" + port
                 + (latencyMs > 0 ? ("  latency " + latencyMs + " ms each way") : "")
                 + (readAheadChunks >= 0 ? ("  read-ahead " + readAheadChunks) : "")
-                + (faultAfterKiB > 0 ? ("  VALVE FAULT after " + faultAfterKiB + " KiB") : ""));
+                + (faultAfterKiB > 0 ? ("  VALVE FAULT after " + faultAfterKiB + " KiB") : "")
+                + (inactivitySeconds >= 0 ? ("  idle timeout " + inactivitySeconds + " s") : ""));
             while (true)
             {
                 TcpClient c = l.AcceptTcpClient();
                 Thread t = new Thread(new ParameterizedThreadStart(Serve));
                 t.IsBackground = true;
                 t.Start(new object[] { c, hostKey, verbose, gatewayPorts, latencyMs,
-                                       readAheadChunks, faultAfterKiB });
+                                       readAheadChunks, faultAfterKiB, inactivitySeconds });
             }
         }
 
@@ -65,6 +76,7 @@ namespace Pwssh.Dev
             int latencyMs = (int)a[4];
             int readAheadChunks = (int)a[5];
             int faultAfterKiB = (int)a[6];
+            int inactivitySeconds = (int)a[7];
 
             Console.Error.WriteLine("[pwssh] connection from " + c.Client.RemoteEndPoint);
             PwsshEngine eng = null;
@@ -76,6 +88,7 @@ namespace Pwssh.Dev
                 cfg.AllowGatewayPorts = gatewayPorts;
                 if (readAheadChunks >= 0) cfg.SftpReadAheadChunks = readAheadChunks;
                 cfg.SftpFaultAfterKiB = faultAfterKiB;
+                if (inactivitySeconds >= 0) cfg.InactivityTimeoutSeconds = inactivitySeconds;
                 // Dev-only: the metadata-speculation miss trace is what turns "the hit count is
                 // zero" into "and here is why", which is how the glob-first request order was
                 // found. Tied to the host's own verbose flag rather than a knob of its own.

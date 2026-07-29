@@ -92,7 +92,11 @@ function Invoke-Ssh {
     $p.StandardInput.BaseStream.Close()
 
     if (-not $p.WaitForExit(180000)) { try { $p.Kill() } catch {}; throw 'ssh timed out' }
-    $outTask.Wait(); $null = $errTask.Result
+    # Bounded deliberately. ssh having exited does not guarantee the stdout pipe is closed -- a
+    # surviving grandchild can hold it -- and an unbounded Wait() here turns one stuck case into a
+    # run that stops producing output altogether, which is far harder to diagnose than a failure.
+    if (-not $outTask.Wait(30000)) { throw 'ssh exited but its stdout never closed' }
+    $null = $errTask.Result
 
     [pscustomobject]@{
         ExitCode = $p.ExitCode
@@ -348,6 +352,58 @@ $r = Invoke-Ssh -Command '' -StdinBytes ([System.Text.Encoding]::ASCII.GetBytes(
 Assert-That 'shell exit status propagates' ($r.ExitCode -eq 3) `
     "exit=$($r.ExitCode) stderr='$($r.Stderr -replace "`r?`n", ' | ')'"
 
+# ---- 7a. an idle session must not be dropped by our own watchdog.
+#
+# ssh sends nothing while the user is not typing -- ServerAliveInterval defaults to 0 and
+# TCPKeepAlive works below the SSH layer -- so before the engine sent its own keepalive, silence
+# was indistinguishable from a dead client and a session left sitting died at
+# InactivityTimeoutSeconds. Verified as a real failure before the fix, not assumed.
+#
+# The timeout comes from the environment because five minutes is not something a suite can wait
+# out, and because -o cannot reach a ProxyCommand parameter. WinRM only, for the same reason as
+# the valve fault case: the dev host's engine lives in a process started before this script and
+# cannot see the variable. Use -InactivityTimeoutSeconds on the dev host there.
+if ($Port -eq 0) {
+    $idleTimeout = 12
+    [Environment]::SetEnvironmentVariable('PWSSH_INACTIVITY_TIMEOUT_SECONDS', "$idleTimeout")
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = 'ssh'
+        foreach ($a in (Get-SshArgs '' @('-o', 'ServerAliveInterval=0'))) { $psi.ArgumentList.Add($a) }
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardInput = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $ip = [System.Diagnostics.Process]::Start($psi)
+        $iso = $ip.StandardOutput.ReadToEndAsync()
+        $ise = $ip.StandardError.ReadToEndAsync()
+        $ip.StandardInput.WriteLine('echo idle-before')
+        $ip.StandardInput.Flush()
+        Start-Sleep -Seconds 6
+        Start-Sleep -Seconds ($idleTimeout * 2)          # well past the timeout, saying nothing
+        $stillUp = -not $ip.HasExited
+        # Guarded: if the session HAS been dropped the pipe is already gone, which is the failure
+        # being tested rather than an error in the test.
+        try { $ip.StandardInput.WriteLine('echo idle-after'); $ip.StandardInput.Flush() } catch { }
+        Start-Sleep -Seconds 6
+        try { $ip.StandardInput.WriteLine('exit'); $ip.StandardInput.Close() } catch { }
+        $null = $ip.WaitForExit(60000)
+        if (-not $ip.HasExited) { try { $ip.Kill() } catch { } }
+        $iout = $iso.Result
+        Assert-That 'an idle session is not dropped by the inactivity watchdog' `
+            ($stillUp -and ($iout -match 'idle-before') -and ($iout -match 'idle-after')) `
+            ("idle $($idleTimeout * 2)s against a ${idleTimeout}s timeout: alive=$stillUp " +
+             "before=$($iout -match 'idle-before') after=$($iout -match 'idle-after') " +
+             "stderr='$(($ise.Result -split "`r?`n" | Where-Object { $_ -match 'closed|reset' }) -join ' | ')'")
+    } finally {
+        [Environment]::SetEnvironmentVariable('PWSSH_INACTIVITY_TIMEOUT_SECONDS', $null)
+    }
+}
+else {
+    Write-Host '  SKIP  an idle session is not dropped by the inactivity watchdog (dev host: use -InactivityTimeoutSeconds)' -ForegroundColor DarkGray
+}
+
 # -tt forces pty allocation, so this proves pty-req was accepted and ConPTY drove a real
 # console. The output carries VT sequences, hence a substring match.
 $r = Invoke-Ssh -Command 'echo hello-from-pty' -Extra @('-tt')
@@ -492,7 +548,17 @@ if (-not $SkipReverse) {
         $l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
         $l.Start(); $p = $l.LocalEndpoint.Port; $l.Stop(); return $p
     }
-    if ($ReversePort -le 0) { $ReversePort = Get-FreePort }
+
+    # A port the FAR side has to be able to bind, which is a different question from one free here.
+    # Asking the local OS for an ephemeral port lands in 49152-65535, and Windows reserves large
+    # blocks of exactly that range -- on the test remote, `netsh interface ipv4 show
+    # excludedportrange protocol=tcp` lists 49773-49972 and 50000-50459 among others. A -R onto an
+    # excluded port fails to bind for reasons that have nothing to do with pwssh, which showed up
+    # as an intermittent failure of the -R round trip (port 50802, reproducible on that port and
+    # clean on 28080). Worse, the two cases that EXPECT a refusal would pass for the wrong reason.
+    function Get-FarSidePort { return 28000 + (Get-Random -Maximum 900) }
+
+    if ($ReversePort -le 0) { $ReversePort = Get-FarSidePort }
 
     # Probe run on the far side: connect to the forwarded port and report what came back.
     #
@@ -598,14 +664,16 @@ try {
 
     # Gateway policy. Note the wire convention is the opposite way round from how it reads:
     # OpenSSH sends "localhost" for a plain -R and an EMPTY address for -R *:...
-    $wildPort = Get-FreePort
+    # Far-side port on purpose: the refusal being asserted must come from the gateway POLICY, and
+    # an excluded port would produce the same message for an entirely different reason.
+    $wildPort = Get-FarSidePort
     $r = Invoke-Ssh -Command 'echo wild' -Extra @('-R', "*:${wildPort}:127.0.0.1:9")
     Assert-That 'wildcard reverse bind is refused by default' `
         ($r.Stderr -match 'remote port forwarding failed') `
         "stderr='$($r.Stderr -replace "`r?`n", ' | ')'"
 
     if ($GatewayTarget) {
-        $wildPort = Get-FreePort
+        $wildPort = Get-FarSidePort
         $r = Invoke-Ssh -Command (New-ReverseProbe $wildPort) `
             -Extra @('-R', "*:${wildPort}:127.0.0.1:9") `
             -UseTarget $GatewayTarget -UseConfig $GatewayConfigFile
