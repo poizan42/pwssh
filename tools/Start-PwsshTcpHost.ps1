@@ -69,5 +69,16 @@ if ($CreditKiB -gt 0) {
 }
 
 Write-Host "pwssh dev host: 127.0.0.1:$Port  hostkey=$HostKeyPath$(if ($LatencyMs -gt 0) { "  latency=${LatencyMs}ms" })"
+
+# ConPTY does not work in a process whose stdout is redirected: the child writes to the inherited
+# handle instead of the pseudoconsole, and the pty test cases fail with nothing wrong in pwssh. This
+# cost a real debugging cycle and was written into CLAUDE.md as a permanent property of the machine
+# before it was measured, so say it out loud rather than let it be rediscovered.
+if ([Console]::IsOutputRedirected) {
+    [Console]::Error.WriteLine(
+        "warning: this host's stdout is redirected, so ConPTY cannot attach and the pty test cases " +
+        "will fail. Start it with its own console (Start-Process -WindowStyle Hidden, no " +
+        "-RedirectStandardOutput) if you need those cases.")
+}
 [Pwssh.Dev.TcpHost]::Run($Port, $key, (-not $Quiet), [bool]$GatewayPorts, $LatencyMs,
                          $SftpReadAheadChunks, $SftpFaultAfterKiB, $InactivityTimeoutSeconds)

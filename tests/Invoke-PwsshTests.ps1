@@ -1321,8 +1321,16 @@ quit
 
     # ---- teardown
     $null = Far-Sftp "Remove-Item -LiteralPath '$farDir' -Recurse -Force -ErrorAction SilentlyContinue"
-    Get-ChildItem (Join-Path $repo 'tmp') -Filter "*$sftpTag*" -ErrorAction SilentlyContinue |
-        ForEach-Object { try { [System.IO.File]::Delete($_.FullName) } catch { } }
+    # Directories as well as files: the globbed-get and recursive-get cases leave whole trees behind,
+    # and File.Delete throws on a directory rather than removing it. The exception was swallowed by
+    # the catch, so every run leaked a fixture directory until 15 of them had piled up.
+    Get-ChildItem (Join-Path $repo 'tmp') -Filter "*$sftpTag*" -Force -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            try {
+                if ($_.PSIsContainer) { [System.IO.Directory]::Delete($_.FullName, $true) }
+                else { [System.IO.File]::Delete($_.FullName) }
+            } catch { }
+        }
 }
 
 # --------------------------------------------------------- 8. username rejected
