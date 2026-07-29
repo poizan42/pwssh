@@ -922,13 +922,18 @@ quit
     # ordered against each other. Answering the CLOSE early makes the put arrive sooner still.
     # Checked before this work existed as well, so a failure here is a regression and not a
     # discovery.
+    # Several pairs rather than one. The window is narrow by construction -- the agent frees a
+    # channel's handles on its serial frame loop, and a full round trip separates the two events --
+    # so a single pair proves very little. 200 pairs on a 900-byte file were run by hand; four here
+    # is what fits in a suite that also has to finish.
     $rpLocal = Join-Path $repo "tmp/sftp-rp-$sftpTag.bin"
-    $r = Invoke-Sftp @"
-get $farFwd/d522240.bin $($rpLocal.Replace($bs,'/'))
-put $($localUp.Replace($bs,'/')) $farFwd/replace.bin
-put $($localUp.Replace($bs,'/')) $farFwd/replace.bin
-quit
-"@ 'replace'
+    $rpBatch = New-Object System.Text.StringBuilder
+    for ($i = 0; $i -lt 4; $i++) {
+        [void]$rpBatch.AppendLine("get $farFwd/glob/g1.txt $($rpLocal.Replace($bs,'/'))")
+        [void]$rpBatch.AppendLine("put $($localUp.Replace($bs,'/')) $farFwd/replace.bin")
+    }
+    [void]$rpBatch.AppendLine('quit')
+    $r = Invoke-Sftp $rpBatch.ToString() 'replace'
     $rpFar = Far-Sftp "[Console]::Out.Write([Convert]::ToBase64String([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.IO.File]::ReadAllBytes('$farDir${bs}replace.bin'))))"
     Assert-That 'get then overwrite the same path leaves the upload intact' `
         ($rpFar -eq (Get-Sha ([System.IO.File]::ReadAllBytes($localUp)))) `

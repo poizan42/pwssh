@@ -1500,7 +1500,22 @@ namespace Pwssh
                 try { agent.SendStdin(p.Channel, w.ToArray()); } catch (Exception) { }
                 p.Handle = null;
             }
-            try { agent.CloseStdin(p.Channel); } catch (Exception) { }
+            // CloseChannel, not CloseStdin, and the difference is an ordering guarantee rather than
+            // tidiness. The agent frees a channel's handles inside Kill(), which runs on its SERIAL
+            // inbound frame loop, so by the time any later frame is dispatched our read handle is
+            // provably gone. An EOF frame instead leaves the release to this channel's own worker
+            // thread, which is asynchronous with the client channel's worker -- so a client that
+            // downloads a file and immediately uploads over it (write opens are FileShare.None)
+            // would be racing our teardown.
+            //
+            // That race was never observed: 200 get-then-put pairs on a 900-byte file, where the
+            // two are as close together as this design can put them, came back clean. It could not
+            // easily be otherwise, because at least one full round trip -- the put's own STAT --
+            // separates the two, while the worker needs microseconds to wake and dispose. But
+            // "the scheduler would have to starve a runnable thread for a round trip" is a weaker
+            // thing to rely on than "the frame loop already did it", for two lines.
+            try { agent.CloseChannel(p.Channel); } catch (Exception) { }
+            engine.ForgetPrefetchChannel(p.Channel);      // no DONE is coming now, so do it here
 
             // Released as the active prefetch immediately rather than when the remote's DONE
             // eventually arrives. Waiting for that would be a round trip during which the next
