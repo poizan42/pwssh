@@ -225,9 +225,27 @@ namespace Pwssh
             lock (gate) { clientEof = true; Monitor.PulseAll(gate); }
         }
 
+        // Tripwire, and the cheapest one available. The client can only ever grant back bytes it
+        // has actually received, so credit climbing above what it started at means it granted more
+        // than arrived -- which silently defeats the bound this window exists to enforce, and is
+        // invisible from either side otherwise. One line is proof; there is no arithmetic to
+        // interpret. Logged once, because the condition is sticky and would otherwise repeat for
+        // the rest of the transfer.
+        private bool creditOverGrantLogged;
+
         public void AddCredit(uint add)
         {
-            lock (creditGate) { credit += add; Monitor.PulseAll(creditGate); }
+            lock (creditGate)
+            {
+                credit += add;
+                if (credit > PwsshAgentHost.InitialCredit && !creditOverGrantLogged)
+                {
+                    creditOverGrantLogged = true;
+                    host.Log("sftp channel " + channel + ": credit " + credit + " exceeds the initial "
+                             + PwsshAgentHost.InitialCredit + "; the client granted more than it received");
+                }
+                Monitor.PulseAll(creditGate);
+            }
         }
 
         public void Kill()

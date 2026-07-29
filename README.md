@@ -33,7 +33,7 @@ the protocol itself.
 | Not implemented | symlink creation (needs elevation on Windows) |
 
 Tested against OpenSSH 9.5p2 on Windows, with a Windows PowerShell 5.1 / .NET Framework 4.8
-remote. The test suite drives the real `ssh`, `sftp` and `scp` binaries: 71 cases over WinRM and
+remote. The test suite drives the real `ssh`, `sftp` and `scp` binaries: 72 cases over WinRM and
 62 against a loopback dev host.
 
 Two warts worth knowing:
@@ -126,7 +126,7 @@ Useful options on `pwssh-connect.ps1`:
 |---|---|
 | `-Authentication` | WinRM auth mode, default `Negotiate` |
 | `-AgentDllPath` | where to find `PwsshAgent.dll`. Defaults to the build output, then to a copy beside the script |
-| `-CreditMiB` | bulk transfer window, default 32. Larger means fewer round trips on big transfers, at the cost of how much the agent may buffer client-side |
+| `-CreditMiB` | bulk transfer window, default 32. Larger means fewer round trips on big transfers, at the cost of how much the agent may buffer client-side. Values below 2 are raised to 2: a channel announces credit only once 2 MiB has accrued, so a smaller window deadlocks rather than throttling |
 | `-Streams N` | extra receive sessions for bulk **incompressible** transfers (see below), default 1 |
 | `-SftpReadAheadChunks` | how far ahead an SFTP download is fetched, in 255 KiB chunks, default 64 (≈16 MiB held client-side). `0` turns read-ahead off and restores byte-for-byte forwarding |
 | `-GatewayPorts` | let `ssh -R` bind a non-loopback address on the remote. Off by default, matching OpenSSH's `GatewayPorts no`; a request for a wider address is refused rather than quietly narrowed |

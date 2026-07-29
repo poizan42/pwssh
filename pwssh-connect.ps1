@@ -217,7 +217,23 @@ try {
     $null = $ps.AddScript($agentScript)
     $null = $ps.AddParameter('AgentDll', $agentDll)
     if ($EmitRemoteLog) { $null = $ps.AddParameter('EmitLog', $true) }
-    $null = $ps.AddParameter('CreditMiB', $CreditMiB)
+    # Test hook, same shape as the others: a small window is what forces the agent to SPLIT a
+    # reply across frames, which is the only way to exercise the credit accounting that handles it.
+    $creditMiB = if ($PSBoundParameters.ContainsKey('CreditMiB')) { $CreditMiB }
+                 elseif ($null -ne $env:PWSSH_CREDIT_MIB -and $env:PWSSH_CREDIT_MIB -ne '') {
+                     [int]$env:PWSSH_CREDIT_MIB
+                 }
+                 else { $CreditMiB }
+    # Floored, because below this the connection DEADLOCKS rather than merely running slowly. A
+    # session channel announces credit only once GRANT_THRESHOLD (2 MiB, PwsshEngine) has accrued,
+    # so an agent window smaller than that is exhausted before the first grant is ever sent and
+    # neither side can move. Found by setting it to 1 while testing: a download that fell back to
+    # the client's own channel stopped dead. A hang is a much worse answer than a clamp.
+    if ($creditMiB -lt 2) {
+        Write-Diag "CreditMiB $creditMiB is below the 2 MiB grant threshold; using 2"
+        $creditMiB = 2
+    }
+    $null = $ps.AddParameter('CreditMiB', $creditMiB)
     $null = $ps.AddParameter('DisableConPty', [bool]$DisableConPty)
     $null = $ps.AddParameter('DisableCoalescing', [bool]$DisableCoalescing)
     if ($stripes -gt 0) {

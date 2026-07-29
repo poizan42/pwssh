@@ -231,7 +231,6 @@ namespace Pwssh
         private Mode mode = Mode.Proxy;
         private readonly SftpFramer fromClient = new SftpFramer();
         private readonly SftpFramer fromAgent = new SftpFramer();
-        private readonly SftpFramer fromPrefetch = new SftpFramer();
         private readonly object gate = new object();
 
         private readonly PwsshEngine engine;
@@ -305,6 +304,8 @@ namespace Pwssh
                          + " metaForwarded=" + metaForwarded
                          + " metaSpeculated=" + metaSpeculated
                          + " closesEarly=" + closesAnsweredEarly
+                         + " creditRecv=" + creditReceived
+                         + " creditGranted=" + creditGranted
                          + " valveTrips=" + valveTrips;
                 if (valveReason != null) s += " (" + valveReason + ")";
                 return s;
@@ -1022,6 +1023,23 @@ namespace Pwssh
             public bool Eof;                     // the remote reported the end of the file
             public bool Failed;                  // the remote refused; stop and stay out of the way
 
+            // Its OWN framer, not one shared across prefetches. A shared framer carries residue and
+            // a sticky Error from one file's channel to the next: Feed returns immediately once
+            // Error is set, so a single desync would silently disable read-ahead for the rest of the
+            // session, and an abandon part way through a split reply would leave a partial DATA that
+            // the NEXT file's bytes append to. Same class of mistake as the valve dropping held
+            // bytes -- framer state outliving the thing it belonged to.
+            public readonly SftpFramer Framer = new SftpFramer();
+
+            // Credit accounting for this channel, as an absolute balance rather than a per-feed sum.
+            // The invariant is Received == Granted + Retained + Framer.ResidueLength: every byte
+            // that arrived has been handed back, is sitting in Segs waiting for the client, or is
+            // part of a message the framer has not finished reading. Carried here rather than on the
+            // proxy so it resets per prefetch for free.
+            public long Received;
+            public long Granted;
+            public long Retained;
+
             // The client's handle for the same file, learned from the HANDLE reply to ITS open.
             // Until that is known a client READ cannot be matched to this prefetch at all.
             public string ClientHandle;
@@ -1386,6 +1404,7 @@ namespace Pwssh
         // nothing of the agent's window is retained.
         private void OnMetaData(uint ch, byte[] buffer, int offset, int count)
         {
+            creditReceived += count;
             try
             {
                 List<SftpFramer.Msg> msgs = fromMeta.Feed(buffer, offset, count);
@@ -1418,7 +1437,9 @@ namespace Pwssh
             {
                 InvalidateSpeculation();
             }
-            try { agent.GrantWindow(ch, (uint)count); } catch (Exception) { }
+            // The full count, and correct: every reply is copied out of the frame buffer, so this
+            // channel retains nothing of the agent's window.
+            Grant(ch, count);
         }
 
         // ---- replies on our private channel ----
@@ -1427,64 +1448,107 @@ namespace Pwssh
         {
             lock (gate)
             {
-                if (stderr) return;                       // the agent's diagnostics, not protocol
+                if (stderr)
+                {
+                    // Granted before returning. No SFTP channel emits stderr today -- only a
+                    // process channel does -- but returning without granting would withhold that
+                    // many bytes for ever, which is the direction that stalls with no timeout.
+                    creditReceived += count;
+                    Grant(ch, count);
+                    return;
+                }
                 if (metaStarted && ch == metaChannel) { OnMetaData(ch, buffer, offset, count); return; }
+                creditReceived += count;
                 Prefetch p = active;
                 if (p == null || p.Channel != ch)
                 {
                     // A late reply for a prefetch that has already been abandoned. Its credit
                     // still has to be returned or the agent's channel would stall on the way to
-                    // being torn down.
-                    agent.GrantWindow(ch, (uint)count);
+                    // being torn down. Deliberately outside the balance below: that prefetch is
+                    // gone, and its channel is closed.
+                    Grant(ch, count);
                     return;
                 }
-                retainedThisFeed = 0;
+                p.Received += count;
                 try
                 {
-                    List<SftpFramer.Msg> msgs = fromPrefetch.Feed(buffer, offset, count);
-                    if (fromPrefetch.Error != null)
+                    List<SftpFramer.Msg> msgs = p.Framer.Feed(buffer, offset, count);
+                    if (p.Framer.Error != null)
                     {
                         // Our own channel desynced. Nothing of the client's is at risk, so this
                         // is simply the end of read-ahead for this file.
-                        AbandonPrefetch("prefetch stream: " + fromPrefetch.Error);
-                        agent.GrantWindow(ch, (uint)count);
+                        AbandonPrefetch("prefetch stream: " + p.Framer.Error);
+                        Grant(ch, count);
                         return;
                     }
-                    for (int i = 0; i < msgs.Count; i++) HandlePrefetchReply(p, msgs[i]);
-                    DrainWaiting(p);
+                    for (int i = 0; i < msgs.Count; i++)
+                    {
+                        HandlePrefetchReply(p, msgs[i]);
+                        // A reply can abandon the prefetch part way through the feed. Carrying on
+                        // would enqueue into a buffer nothing will ever read from.
+                        if (active != p) break;
+                    }
+                    if (active == p) DrainWaiting(p);
                 }
                 catch (Exception ex)
                 {
                     AbandonPrefetch("prefetch parse: " + ex.Message);
                 }
 
-                // Every byte received has exactly one fate and is accounted once. Framing and
-                // anything not retained is released now; bytes held for the client are released
-                // when they are handed over, or when they are discarded. Getting this wrong in
-                // the obvious way -- releasing nothing for retained bytes -- would let the
-                // outstanding total climb until credit was withheld permanently and the agent's
-                // channel stalled with no timeout to break it.
-                int releaseNow = count - retainedThisFeed;
-                if (releaseNow > 0) agent.GrantWindow(ch, (uint)releaseNow);
-                prefetchOwed += retainedThisFeed;
+                GrantOwed(p, ch);
             }
         }
 
-        // Bytes sitting in the buffer whose credit has not yet gone back, and the channel they
-        // belong to. Tracked so that a discard can return exactly what it holds.
-        private int retainedThisFeed;
-        private long prefetchOwed;
+        // Grants back whatever this channel is owed, as an absolute balance rather than a per-feed
+        // subtraction. That single change is the fix: the old code computed `count - retained` per
+        // feed and threw away the result when it went negative, so a fragment that completed
+        // nothing had its whole length granted and the completing fragment's retained blob was then
+        // granted again on consumption. The surplus was permanent because nothing remembered it.
+        //
+        // Here it is not permanent. A feed that overshoots computes owe <= 0 and grants nothing,
+        // and because Granted is remembered the following feeds grant correspondingly less until
+        // the books balance. No per-feed carry to get wrong.
+        //
+        // WHAT IS DELIBERATELY *NOT* SUBTRACTED, learned by breaking it: the framer's residue.
+        // Withholding credit for a half-received message deadlocks outright whenever the window is
+        // smaller than one message -- the client waits for the message to complete, the agent
+        // cannot send the rest of it without credit, and neither side can move. A 64 KiB window
+        // against 255 KiB replies hangs immediately. So residue counts as progress; the cost is
+        // that the balance may run ahead of what has arrived by at most one message (MAX_MSG,
+        // 256 KiB), which is bounded and self-correcting, where the buffered segments it does
+        // withhold are the part that would otherwise grow without limit.
+        private void GrantOwed(Prefetch p, uint ch)
+        {
+            long owe = p.Received - p.Granted - p.Retained;
+            if (owe <= 0) return;
+            p.Granted += owe;
+            Grant(ch, owe);
+        }
 
-        // Called as buffered bytes leave, whether to the client or to the bin.
+        // Every grant this class makes goes through here, so the session totals in Summary() are a
+        // complete picture. creditGranted exceeding creditReceived is proof of an over-grant, which
+        // is otherwise invisible from the client side.
+        private long creditReceived;
+        private long creditGranted;
+
+        private void Grant(uint ch, long n)
+        {
+            if (n <= 0) return;
+            creditGranted += n;
+            try { agent.GrantWindow(ch, (uint)n); } catch (Exception) { }
+        }
+
+        // Called as buffered bytes leave, whether to the client or to the bin. Every retained byte
+        // passes through here exactly once, which is what keeps the balance honest -- releasing one
+        // twice would turn a harmless over-grant into the under-grant that stalls for good.
         internal void ReleasePrefetchCredit(int bytes)
         {
             if (bytes <= 0) return;
             Prefetch p = active;
-            prefetchOwed -= bytes;
-            if (p != null)
-            {
-                try { agent.GrantWindow(p.Channel, (uint)bytes); } catch (Exception) { }
-            }
+            if (p == null) return;                 // its channel is already closed; credit is moot
+            p.Retained -= bytes;
+            p.Granted += bytes;
+            Grant(p.Channel, bytes);
         }
 
         private void HandlePrefetchReply(Prefetch p, SftpFramer.Msg m)
@@ -1537,7 +1601,7 @@ namespace Pwssh
                         p.Segs.Enqueue(s);
                         p.BufEnd += len;
                         p.DataOffset += len;
-                        retainedThisFeed += len;
+                        p.Retained += len;
 
                         // A reply shorter than asked for is how the end of the file announces
                         // itself, and the agent only ever answers short when the file truly ended.

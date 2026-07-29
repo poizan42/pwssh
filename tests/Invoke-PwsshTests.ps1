@@ -1128,6 +1128,33 @@ quit
         Assert-That 'sftp download is bit-exact across forced rekeys' ($rkh -eq $mkBig) `
             "$($r.Phase) got $rkh want $mkBig err='$($r.Err -replace "`r?`n", ' | ')'"
 
+        # ---- 12d. a download whose replies are SPLIT across frames.
+        #
+        # The agent fragments a reply by whatever credit is available, so a window narrower than the
+        # backlog makes a 255 KiB DATA reply arrive as several feeds. Nothing exercised that path
+        # before: at the 32 MiB default with a prompt consumer, credit never approaches zero and no
+        # reply ever splits -- which is exactly why the accounting bug in that path sat unnoticed.
+        # 4 MiB: far below the read-ahead's ~16 MiB backlog, so replies split, but above the 2 MiB
+        # GRANT_THRESHOLD a session channel needs before it announces any credit at all. Going under
+        # that floor deadlocks rather than splitting, which is why the knob is now clamped.
+        if ($Port -eq 0) {
+            $splitLocal = Join-Path $repo "tmp/sftp-split-$sftpTag.bin"
+            if (Test-Path $splitLocal) { [System.IO.File]::Delete($splitLocal) }
+            [Environment]::SetEnvironmentVariable('PWSSH_CREDIT_MIB', '4')
+            try {
+                $r = Invoke-Sftp "get $farFwd/big.bin $($splitLocal.Replace($bs,'/'))`nquit`n" `
+                     'split' @() '' '' 600000
+            } finally {
+                [Environment]::SetEnvironmentVariable('PWSSH_CREDIT_MIB', $null)
+            }
+            $splith = if (Test-Path $splitLocal) { Get-Sha ([System.IO.File]::ReadAllBytes($splitLocal)) } else { 'MISSING' }
+            Assert-That 'a download with split replies is bit-exact' ($splith -eq $mkBig) `
+                "$($r.Phase) got $splith want $mkBig err='$($r.Err -replace "`r?`n", ' | ')'"
+        }
+        else {
+            Write-Host '  SKIP  a download with split replies is bit-exact (dev host: use -CreditKiB)' -ForegroundColor DarkGray
+        }
+
         # ---- 12c. a valve trip while the framer holds an incomplete message.
         #
         # This is the case that caught a real corruption, and it needed both halves to coincide:

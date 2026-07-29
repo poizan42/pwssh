@@ -28,6 +28,18 @@ param(
     # Idle shutdown, as pwssh-connect.ps1's -InactivityTimeoutSeconds. -1 keeps the engine's
     # default of 300; a small value makes the idle watchdog reachable in seconds.
     [int]$InactivityTimeoutSeconds = -1,
+    # The agent's flow-control window, in KiB. This host runs the agent in-process, so setting it
+    # here is the only way to force a reply to be SPLIT across frames locally: SendPayload
+    # fragments by whatever credit is available, so a window below one 255 KiB chunk guarantees
+    # fragmentation. 0 leaves the agent's 32 MiB default.
+    #
+    # SHARP EDGE, deliberately not clamped here as pwssh-connect.ps1's -CreditMiB is: this sets a
+    # static, so it shrinks EVERY channel's window, and a session channel announces credit only
+    # once GRANT_THRESHOLD (2 MiB) has accrued. Below that, anything the client's own SFTP channel
+    # has to carry -- a transfer after the valve trips, or with read-ahead off -- deadlocks. Useful
+    # for testing the prefetch channel, which grants immediately and is safe at any size; do not
+    # read a hang under 2 MiB as a bug in the thing you were testing.
+    [int]$CreditKiB = 0,
     [switch]$Quiet
 )
 
@@ -48,6 +60,13 @@ Import-PwsshFiles -Path (@(Get-PwsshAgentFiles -Repo $repo) + @(
 )) -ProbeType 'Pwssh.Dev.TcpHost'
 
 $key = Get-PwsshHostKey -Path $HostKeyPath
+
+# Static on the agent host, and this process IS the agent, so it must be set before any channel
+# is constructed -- each one snapshots it into its own credit field.
+if ($CreditKiB -gt 0) {
+    [Pwssh.PwsshAgentHost]::InitialCredit = [uint32]($CreditKiB * 1024)
+    Write-Host "  agent credit forced to $CreditKiB KiB (replies will fragment)"
+}
 
 Write-Host "pwssh dev host: 127.0.0.1:$Port  hostkey=$HostKeyPath$(if ($LatencyMs -gt 0) { "  latency=${LatencyMs}ms" })"
 [Pwssh.Dev.TcpHost]::Run($Port, $key, (-not $Quiet), [bool]$GatewayPorts, $LatencyMs,
