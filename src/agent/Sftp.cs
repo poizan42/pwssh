@@ -319,6 +319,18 @@ namespace Pwssh
                 SshLikeReader r = new SshLikeReader(msg, 1);
                 id = r.UInt32();
                 Handle(type, id, r, msg);
+
+                // Said once per channel, and it is the only evidence available that the extended
+                // route was actually taken. "Long paths work" proves nothing on a machine with the
+                // LongPathsEnabled policy set -- which both machines this was developed on have --
+                // so the useful observation is that the \\?\ form is what carried the request.
+                if (longPathsLogged == 0 && Win32Fs.LongPathsSeen > 0)
+                {
+                    longPathsLogged = Win32Fs.LongPathsSeen;
+                    host.Log("sftp: extended-length path in use, longest " + Win32Fs.LongestPath
+                             + " chars; the \\\\?\\ prefix is what makes that independent of the"
+                             + " LongPathsEnabled policy");
+                }
             }
             catch (Exception ex)
             {
@@ -326,6 +338,8 @@ namespace Pwssh
                 if (type != SftpType.INIT) SendStatus(id, StatusFor(ex), ex.Message);
             }
         }
+
+        private int longPathsLogged;
 
         private void Handle(byte type, uint id, SshLikeReader r, byte[] msg)
         {
@@ -440,8 +454,7 @@ namespace Pwssh
             h.WinPath = win;
             try
             {
-                h.File = new FileStream(win, mode, access, share, 64 * 1024,
-                                        wantWrite ? FileOptions.None : FileOptions.SequentialScan);
+                h.File = Win32Fs.Open(win, mode, access, share, !wantWrite, 64 * 1024);
             }
             catch (Exception)
             {
@@ -530,25 +543,26 @@ namespace Pwssh
         {
             if (a.HasSize)
             {
-                using (FileStream fs = new FileStream(win, FileMode.Open, FileAccess.Write, FileShare.None))
+                using (FileStream fs = Win32Fs.Open(win, FileMode.Open, FileAccess.Write,
+                                                    FileShare.None, false, 4096))
                 {
                     fs.SetLength((long)a.Size);
                 }
             }
             if (a.HasTimes)
             {
-                File.SetLastAccessTimeUtc(win, FromUnix(a.Atime));
-                File.SetLastWriteTimeUtc(win, FromUnix(a.Mtime));
+                Win32Fs.SetTimesUtc(win, FromUnix(a.Atime), FromUnix(a.Mtime));
             }
             if (a.HasPerms)
             {
                 // The owner write bit is the only part of a POSIX mode Windows has anywhere to
                 // put it. Everything else is accepted and dropped.
                 bool writable = (a.Permissions & 0x080) != 0;
-                FileAttributes cur = File.GetAttributes(win);
-                bool isReadOnly = (cur & FileAttributes.ReadOnly) != 0;
-                if (writable && isReadOnly) File.SetAttributes(win, cur & ~FileAttributes.ReadOnly);
-                else if (!writable && !isReadOnly) File.SetAttributes(win, cur | FileAttributes.ReadOnly);
+                Win32Fs.Info cur = Win32Fs.GetInfo(win);
+                if (writable && cur.IsReadOnly)
+                    Win32Fs.SetAttributes(win, cur.Attributes & ~Win32Fs.FILE_ATTRIBUTE_READONLY);
+                else if (!writable && !cur.IsReadOnly)
+                    Win32Fs.SetAttributes(win, cur.Attributes | Win32Fs.FILE_ATTRIBUTE_READONLY);
             }
         }
 
@@ -589,36 +603,39 @@ namespace Pwssh
             string win = ToWindows(r.Text());
             ReadAttrs(r);                   // a mode we have nowhere to put
             // CreateDirectory is silently happy about an existing directory; the protocol is not.
-            if (Directory.Exists(win) || File.Exists(win))
+            if (Win32Fs.Exists(win))
             {
                 SendStatus(id, SftpStatus.FAILURE, "already exists");
                 return;
             }
-            Directory.CreateDirectory(win);
+            Win32Fs.CreateDirectory(win);
             SendStatus(id, SftpStatus.OK, "");
         }
 
         private void DoRmDir(uint id, string path)
         {
             string win = ToWindows(path);
-            if (!Directory.Exists(win))
+            Win32Fs.Info info;
+            bool exists = Win32Fs.TryGetInfo(win, out info);
+            if (!exists || !info.IsDirectory)
             {
-                SendStatus(id, File.Exists(win) ? SftpStatus.FAILURE : SftpStatus.NO_SUCH_FILE,
-                           File.Exists(win) ? "not a directory" : "no such directory");
+                SendStatus(id, exists ? SftpStatus.FAILURE : SftpStatus.NO_SUCH_FILE,
+                           exists ? "not a directory" : "no such directory");
                 return;
             }
-            Directory.Delete(win, false);   // never recursive: rmdir means rmdir
+            Win32Fs.RemoveDirectory(win);   // never recursive: rmdir means rmdir
             SendStatus(id, SftpStatus.OK, "");
         }
 
         private void DoRemove(uint id, string path)
         {
             string win = ToWindows(path);
-            // File.Delete is silent about a missing file, and would happily be asked to remove
+            // DeleteFile is silent about a missing file, and would happily be asked to remove
             // a directory; both need to be reported.
-            if (Directory.Exists(win)) { SendStatus(id, SftpStatus.FAILURE, "is a directory"); return; }
-            if (!File.Exists(win)) { SendStatus(id, SftpStatus.NO_SUCH_FILE, "no such file"); return; }
-            File.Delete(win);
+            Win32Fs.Info info;
+            if (!Win32Fs.TryGetInfo(win, out info)) { SendStatus(id, SftpStatus.NO_SUCH_FILE, "no such file"); return; }
+            if (info.IsDirectory) { SendStatus(id, SftpStatus.FAILURE, "is a directory"); return; }
+            Win32Fs.DeleteFile(win);
             SendStatus(id, SftpStatus.OK, "");
         }
 
@@ -631,7 +648,9 @@ namespace Pwssh
             // is the standard trade and what every other server does too.
             uint flags = MOVEFILE_COPY_ALLOWED;
             if (replace) flags |= MOVEFILE_REPLACE_EXISTING;
-            if (!MoveFileExW(from, to, flags))
+            // Extended on both sides: this is one of the two calls that was already native, and it
+            // needs the prefix for the same reason as everything in Win32Fs.
+            if (!MoveFileExW(Win32Fs.Extended(from), Win32Fs.Extended(to), flags))
             {
                 int err = Marshal.GetLastWin32Error();
                 // REPLACE_EXISTING will not replace a directory, and a plain rename onto an
@@ -656,7 +675,7 @@ namespace Pwssh
         {
             string existing = ToWindows(oldPath);
             string link = ToWindows(newPath);
-            if (!CreateHardLinkW(link, existing, IntPtr.Zero))
+            if (!CreateHardLinkW(Win32Fs.Extended(link), Win32Fs.Extended(existing), IntPtr.Zero))
             {
                 int err = Marshal.GetLastWin32Error();
                 uint code = (err == 2 || err == 3) ? SftpStatus.NO_SUCH_FILE
@@ -707,12 +726,11 @@ namespace Pwssh
             {
                 m = new Meta();
                 m.Size = h.File != null ? h.File.Length : 0;
-                try
+                Win32Fs.Info info;
+                if (Win32Fs.TryGetInfo(h.WinPath, out info))
                 {
-                    FileInfo fi = new FileInfo(h.WinPath);
-                    m.MtimeUtc = fi.LastWriteTimeUtc; m.AtimeUtc = fi.LastAccessTimeUtc;
+                    m.MtimeUtc = info.WriteUtc; m.AtimeUtc = info.AccessUtc;
                 }
-                catch (Exception) { }
             }
             SshLikeWriter w = new SshLikeWriter();
             w.Byte(SftpType.ATTRS);
@@ -748,17 +766,17 @@ namespace Pwssh
             else
             {
                 h.WinPath = ToWindows(path);
-                DirectoryInfo di = new DirectoryInfo(h.WinPath);
-                // Snapshot rather than a lazy enumerator: the client comes back for the next
-                // batch a round trip later, and holding a FindFirstFile handle open across
-                // seconds buys nothing.
-                FileSystemInfo[] items = di.GetFileSystemInfos();
-                h.Names = new string[items.Length];
-                h.Metas = new Meta[items.Length];
-                for (int i = 0; i < items.Length; i++)
+                // One Find pass carries name, attributes, size and both times per entry, so this
+                // no longer stats each name separately. Still snapshotted rather than lazy: the
+                // client comes back for the next batch a round trip later, and holding a Find
+                // handle open across that buys nothing.
+                List<Win32Fs.Entry> items = Win32Fs.List(h.WinPath);
+                h.Names = new string[items.Count];
+                h.Metas = new Meta[items.Count];
+                for (int i = 0; i < items.Count; i++)
                 {
                     h.Names[i] = items[i].Name;
-                    h.Metas[i] = FromInfo(items[i]);
+                    h.Metas[i] = FromWin32(items[i].Info, false);
                 }
             }
 
@@ -994,9 +1012,52 @@ namespace Pwssh
             }
 
             win = win.Replace('/', '\\');
-            // Collapses . and .. -- and throws on reserved names, trailing spaces and paths
-            // past MAX_PATH, which is why every caller runs inside a try.
-            return Path.GetFullPath(win);
+            return Normalize(win);
+        }
+
+        // What Path.GetFullPath used to do here, done by hand.
+        //
+        // It cannot stay: under legacy path handling -- the default for anything targeting below
+        // .NET Framework 4.6.2 -- GetFullPath throws for a path past MAX_PATH, which is precisely
+        // the case this layer exists to support.
+        //
+        // And it has to be COMPLETE, because the \\?\ form Win32Fs applies disables the OS's own
+        // normalisation: a ".." left in the path is not resolved, it is looked up as a directory
+        // with that literal name. Everything the OS would have done has to happen here instead.
+        //
+        // The result is deliberately NOT prefixed. Win32Fs adds \\?\ at the one place it is needed,
+        // which keeps WinPath readable in logs and lets ToSftp convert back without stripping.
+        private static string Normalize(string win)
+        {
+            if (win.Length < 2 || !char.IsLetter(win[0]) || win[1] != ':')
+                throw new NotSupportedException("path is not rooted on a drive: " + win);
+
+            string root = char.ToUpperInvariant(win[0]) + ":\\";
+            string rest = win.Length > 2 ? win.Substring(2) : "";
+
+            List<string> parts = new List<string>();
+            string[] segs = rest.Split('\\');
+            for (int i = 0; i < segs.Length; i++)
+            {
+                string s = segs[i];
+                if (s.Length == 0 || s == ".") continue;
+                if (s == "..")
+                {
+                    // Popping past the root stays at the root, as every filesystem does. This is
+                    // what stops a path of "/.." climbing out of the drive.
+                    if (parts.Count > 0) parts.RemoveAt(parts.Count - 1);
+                    continue;
+                }
+                // Windows silently strips trailing dots and spaces; \\?\ would preserve them and
+                // create files that no ordinary tool on the remote could open again. Strip them
+                // here so the prefix does not change what a name means.
+                string trimmed = s.TrimEnd(' ', '.');
+                if (trimmed.Length == 0)
+                    throw new NotSupportedException("path segment is not a usable name: " + s);
+                parts.Add(trimmed);
+            }
+
+            return parts.Count == 0 ? root : root + string.Join("\\", parts.ToArray());
         }
 
         private static string ToSftp(string windowsPath)
@@ -1050,57 +1111,30 @@ namespace Pwssh
             }
         }
 
-        private static Meta FromInfo(FileSystemInfo fi)
+        // One shape for both callers, since a Find result and a GetFileAttributesEx result now carry
+        // exactly the same fields.
+        //
+        // followLinks distinguishes STAT from LSTAT. With no link resolution available on 4.8 the
+        // only difference we can express is whether the link bit is reported -- and reporting it is
+        // not cosmetic: C:\Users\All Users is a junction to C:\ProgramData and AppData\Local\
+        // Application Data points at its own parent, so a client that sees them as plain
+        // directories recurses forever on a recursive get. The reference implementation gets this
+        // wrong; we deliberately do not copy it.
+        private static Meta FromWin32(Win32Fs.Info info, bool followLinks)
         {
             Meta m = new Meta();
-            try
-            {
-                FileAttributes a = fi.Attributes;
-                m.IsDir = (a & FileAttributes.Directory) != 0;
-                m.ReadOnly = (a & FileAttributes.ReadOnly) != 0;
-                // Reparse points are reported as links even though we refuse READLINK, and
-                // that is not cosmetic: C:\Users\All Users is a junction to C:\ProgramData and
-                // AppData\Local\Application Data points at its own parent, so a client that
-                // sees them as plain directories recurses forever on a recursive get. The
-                // reference implementation gets this wrong; we deliberately do not copy it.
-                m.IsLink = (a & FileAttributes.ReparsePoint) != 0;
-                m.MtimeUtc = fi.LastWriteTimeUtc;
-                m.AtimeUtc = fi.LastAccessTimeUtc;
-                FileInfo f = fi as FileInfo;
-                if (f != null && !m.IsDir) m.Size = f.Length;
-            }
-            catch (Exception)
-            {
-                // One unreadable entry must not fail a whole listing.
-            }
+            m.IsDir = info.IsDirectory;
+            m.ReadOnly = info.IsReadOnly;
+            m.IsLink = !followLinks && info.IsReparsePoint;
+            m.MtimeUtc = info.WriteUtc;
+            m.AtimeUtc = info.AccessUtc;
+            if (!m.IsDir) m.Size = info.Size;
             return m;
         }
 
-        // followLinks distinguishes STAT from LSTAT. With no link resolution available on 4.8
-        // the only difference we can express is whether the link bit is reported.
         private Meta Describe(string winPath, bool followLinks)
         {
-            FileAttributes a = File.GetAttributes(winPath);      // throws if absent
-            Meta m = new Meta();
-            m.IsDir = (a & FileAttributes.Directory) != 0;
-            m.ReadOnly = (a & FileAttributes.ReadOnly) != 0;
-            m.IsLink = !followLinks && (a & FileAttributes.ReparsePoint) != 0;
-            try
-            {
-                if (m.IsDir)
-                {
-                    DirectoryInfo di = new DirectoryInfo(winPath);
-                    m.MtimeUtc = di.LastWriteTimeUtc; m.AtimeUtc = di.LastAccessTimeUtc;
-                }
-                else
-                {
-                    FileInfo fi = new FileInfo(winPath);
-                    m.MtimeUtc = fi.LastWriteTimeUtc; m.AtimeUtc = fi.LastAccessTimeUtc;
-                    m.Size = fi.Length;
-                }
-            }
-            catch (Exception) { }
-            return m;
+            return FromWin32(Win32Fs.GetInfo(winPath), followLinks);   // throws if absent
         }
 
         private static Meta RootMeta()
@@ -1220,8 +1254,7 @@ namespace Pwssh
             if (!h.HasTimes || h.WinPath == null) return;
             try
             {
-                File.SetLastAccessTimeUtc(h.WinPath, FromUnix(h.Atime));
-                File.SetLastWriteTimeUtc(h.WinPath, FromUnix(h.Mtime));
+                Win32Fs.SetTimesUtc(h.WinPath, FromUnix(h.Atime), FromUnix(h.Mtime));
             }
             catch (Exception ex) { host.Log("could not set times on " + h.WinPath + ": " + ex.Message); }
         }

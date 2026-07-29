@@ -1063,6 +1063,108 @@ quit
     Assert-That 'absolute and drive-prefixed paths reach the same file' `
         (($h1 -eq $wantHash) -and ($h2 -eq $wantHash)) "withSlash=$h1 withoutSlash=$h2"
 
+    # ---- 10b. paths past MAX_PATH, which is what the \\?\ extended-length prefix exists for.
+    #
+    # The tree is built with sftp's own mkdir rather than a far-side helper, so every level is itself
+    # a test of the native CreateDirectoryW route and the fixture needs nothing the feature does not
+    # already provide. It is torn down the same way, because the far side's own Remove-Item -Recurse
+    # cannot be relied on to reach past MAX_PATH.
+    #
+    # What this case shows is that the whole cycle works at ~350 characters. What it CANNOT show is
+    # policy-independence: both machines available here have LongPathsEnabled on, so an unprefixed
+    # path would work too. That claim rests on the Win32 contract -- see CLAUDE.md.
+    $lpRoot = "$farFwd/lp-$sftpTag"
+    $lpLeaf = $lpRoot
+    $lpLevels = New-Object System.Collections.Generic.List[string]
+    foreach ($i in 1..8) {
+        $lpLeaf = "$lpLeaf/seg-{0:00}-{1}" -f $i, ('pad' * 9)
+        $lpLevels.Add($lpLeaf)
+    }
+    Assert-That 'the long-path fixture really is past MAX_PATH' ($lpLeaf.Length -gt 260) `
+        "leaf is only $($lpLeaf.Length) chars, so this case would prove nothing"
+
+    $lpBack = Join-Path $repo "tmp/lp-back-$sftpTag.bin"
+    if (Test-Path $lpBack) { [System.IO.File]::Delete($lpBack) }
+    $lpBatch = (@("mkdir $lpRoot") + ($lpLevels | ForEach-Object { "mkdir $_" })) -join "`n"
+    $lpBatch += @"
+
+put $($localUp.Replace($bs,'/')) $lpLeaf/up.bin
+put $($localUp.Replace($bs,'/')) $lpRoot/shallow.bin
+get $lpLeaf/up.bin $($lpBack.Replace($bs,'/'))
+rename $lpLeaf/up.bin $lpLeaf/moved.bin
+mkdir $lpLeaf/sub
+rmdir $lpLeaf/sub
+chmod 644 $lpLeaf/moved.bin
+ls -l $lpLeaf
+quit
+"@
+    $r = Invoke-Sftp $lpBatch 'longpath' -TimeoutMs 480000
+    Assert-That 'the whole cycle works on a path past MAX_PATH' (($r.ExitCode -eq 0) -and -not $r.Hung) `
+        "$($r.Phase) exit=$($r.ExitCode) err='$($r.Err -replace "`r?`n", ' | ')'"
+    $lpHash = if (Test-Path $lpBack) { Get-Sha ([System.IO.File]::ReadAllBytes($lpBack)) } else { 'MISSING' }
+    Assert-That 'a download from a long path is bit-exact' ($lpHash -eq $wantHash) "got $lpHash"
+
+    # The listing is what caught a struct-packing bug that produced plausible garbage: names read two
+    # WCHARs late, sizes 0 and times 1601. So assert the name AND the size, not just that a row exists.
+    $lpRows = ($r.Out -split "`r?`n") | Where-Object { $_ -match '^[-d]rw' }
+    Assert-That 'a long-path listing shows the real name and size' `
+        (@($lpRows | Where-Object { $_ -match "\s$($payload.Length)\s" -and $_ -match 'moved\.bin' }).Count -eq 1) `
+        "rows='$($lpRows -join ' | ')'"
+    Assert-That 'rmdir inside a long path removes the directory' `
+        (@($lpRows | Where-Object { $_ -match '^drw' }).Count -eq 0) "rows='$($lpRows -join ' | ')'"
+
+    # ---- 10c. a recursive get whose leaves are deep. This is the shape the original bug report
+    # described, and it is also the regression test for '.' and '..' being skipped in a listing:
+    # when they were not, the client recursed until its own "Maximum directory depth exceeded".
+    $lpRecv = Join-Path $repo "tmp/r-$sftpTag"
+    if ([System.IO.Directory]::Exists($lpRecv)) { [System.IO.Directory]::Delete($lpRecv, $true) }
+    $null = [System.IO.Directory]::CreateDirectory($lpRecv)
+    $r = Invoke-Sftp "get -r $lpRoot $($lpRecv.Replace($bs,'/'))`nquit`n" 'longpath-r' -TimeoutMs 600000
+    $lpGot = @([System.IO.Directory]::GetFiles($lpRecv, '*', [System.IO.SearchOption]::AllDirectories))
+    Assert-That 'a recursive get walks into a directory past MAX_PATH' `
+        ((@($lpGot | Where-Object { $_ -match 'moved\.bin$' }).Count -eq 1) -and
+         (@($lpGot | Where-Object { $_ -match 'shallow\.bin$' }).Count -eq 1)) `
+        "retrieved $($lpGot.Count) files: $(($lpGot | ForEach-Object { Split-Path $_ -Leaf }) -join ',')"
+    Assert-That 'a recursive get does not recurse into . or ..' ($r.Err -notmatch 'directory depth') `
+        "err='$($r.Err -replace "`r?`n", ' | ')'"
+
+    # ---- 10d. the two behaviour changes the prefix brings, asserted rather than left to surprise
+    # someone. \\?\ preserves trailing dots and spaces, which would create names no ordinary tool on
+    # the remote could reopen, so the normaliser trims them; and it stops treating reserved names as
+    # devices, so CON becomes an ordinary file. Both are deliberate.
+    #
+    # CON is created and removed inside one batch on purpose: the far side's own managed APIs would
+    # resolve an unprefixed C:\...\CON to the console device, so nothing but sftp may touch it.
+    $r = Invoke-Sftp @"
+put $($localUp.Replace($bs,'/')) $farFwd/trailing...
+put $($localUp.Replace($bs,'/')) $farFwd/CON
+ls -l $farFwd
+rm $farFwd/CON
+quit
+"@ 'prefixnames' -TimeoutMs 300000
+    $nameRows = ($r.Out -split "`r?`n") | Where-Object { $_ -match '^[-d]rw' }
+    Assert-That 'trailing dots are trimmed, so the name stays reopenable' `
+        ((@($nameRows | Where-Object { $_ -match '\strailing$' }).Count -eq 1) -and
+         (@($nameRows | Where-Object { $_ -match 'trailing\.' }).Count -eq 0)) `
+        "rows='$($nameRows -join ' | ')'"
+    Assert-That 'a reserved name is an ordinary file, not a device' `
+        (@($nameRows | Where-Object { $_ -match "\s$($payload.Length)\s.*\sCON$" }).Count -eq 1) `
+        "rows='$($nameRows -join ' | ')'"
+
+    # Remove the deep tree through sftp, deepest first. Left behind, the far side's teardown would
+    # silently fail to reach it and the suite would stop being footprint-free.
+    $lpRm = New-Object System.Collections.Generic.List[string]
+    $lpRm.Add("rm $lpLeaf/moved.bin")
+    $lpRm.Add("rm $lpRoot/shallow.bin")
+    for ($i = $lpLevels.Count - 1; $i -ge 0; $i--) { $lpRm.Add("rmdir $($lpLevels[$i])") }
+    $lpRm.Add("rmdir $lpRoot")
+    $lpRm.Add('quit')
+    $r = Invoke-Sftp (($lpRm -join "`n") + "`n") 'longpath-rm' -TimeoutMs 480000
+    Assert-That 'a long-path tree can be removed again' `
+        ((Far-Sftp "[Console]::Out.Write((Test-Path -LiteralPath '$($lpRoot.Replace('/', $bs))').ToString())") -eq 'False') `
+        "err='$($r.Err -replace "`r?`n", ' | ')'"
+    if ([System.IO.Directory]::Exists($lpRecv)) { [System.IO.Directory]::Delete($lpRecv, $true) }
+
     # ---- 11. scp, which speaks SFTP on OpenSSH 9.x and so comes free with the subsystem.
     # -p additionally exercises SETSTAT/FSETSTAT: without them scp reports failure on a file it
     # transferred perfectly well.

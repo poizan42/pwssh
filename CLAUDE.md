@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns the remote's `DOMAIN\user`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite runs 62–72 cases per transport: **WinRM is 72/72**, loopback **61/62** with one environmental exception — the pty case that this client machine's ConPTY breaks (see *Running and testing*). The two runs differ in composition rather than count — WinRM has the graceful-degradation and IPv6 cases plus the gateway-ports check; loopback has the wrong-username check that the WinRM alias takes from `ssh_config`, along with the reverse-forward release and bind-failure cases that need the far side to be this machine.
+**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns the remote's `DOMAIN\user`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite runs 72–82 cases per transport: loopback is **71/72** with one environmental exception — the pty case that this client machine's ConPTY breaks (see *Running and testing*). **The WinRM run is currently unconfirmed at 82 cases**: it was 72/72 before the long-path work, and this client machine then lost the ability to authenticate to the remote at all (see *A client that cannot authenticate is not a pwssh failure* under *Running and testing*), so the ten new long-path cases have only been run over loopback. The two runs differ in composition rather than count — WinRM has the graceful-degradation and IPv6 cases plus the gateway-ports check; loopback has the wrong-username check that the WinRM alias takes from `ssh_config`, along with the reverse-forward release and bind-failure cases that need the far side to be this machine.
 
 **A run that fails one case with `exit=255` is usually a flake, not a regression.** 255 is ssh's own error code for a connection that never came up, and it turns up after the remote has been hammered with dozens of sessions in a row. Re-run the case before believing it: the final WinRM run here failed "shell exit status propagates" that way and passed 3/3 immediately afterwards.
 
@@ -17,7 +17,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The throughput gain is WinRM's own compression, which an encrypted stream made useless. The same suite reports **0.31 MiB/s for an incompressible 8 MiB payload** — essentially identical to what the old architecture managed on *compressible* data, which is exactly what the mechanism predicts and a good confirmation of it.
 
-Implemented: version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, `none` auth with username matching, session channel, `exec`, `shell`, `pty-req` via ConPTY, `window-change`, `signal`, `direct-tcpip` forwarding (`-L`/`-D`/`-W`, IPv4 and IPv6), `tcpip-forward` + `forwarded-tcpip` reverse forwarding (`-R`, loopback by default, `-GatewayPorts` to widen), the `sftp` subsystem (version 3, and therefore `scp`), exit status, stderr as `CHANNEL_EXTENDED_DATA`, window management, credit-based flow control to the agent.
+Implemented: version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, `none` auth with username matching, session channel, `exec`, `shell`, `pty-req` via ConPTY, `window-change`, `signal`, `direct-tcpip` forwarding (`-L`/`-D`/`-W`, IPv4 and IPv6), `tcpip-forward` + `forwarded-tcpip` reverse forwarding (`-R`, loopback by default, `-GatewayPorts` to widen), the `sftp` subsystem (version 3, and therefore `scp`), paths past `MAX_PATH` via `\\?\` and Win32, rekeying, exit status, stderr as `CHANNEL_EXTENDED_DATA`, window management, credit-based flow control to the agent.
 
 Not implemented: symlink creation (needs elevation on Windows), strict KEX (deliberately — see *Rekeying*).
 
@@ -42,7 +42,7 @@ Nothing is written to the remote's disk, no service is reconfigured, no elevatio
 | Path | Role |
 |---|---|
 | `src/PwsshEngine.cs` | The SSH implementation — packet layer, KEX, cipher, MAC, auth, `SessionChannel`, plus `PwsshStdioBridge`. Runs on the **client** only. |
-| `src/agent/*.cs` | Everything the remote needs, plus the plumbing shared with the engine (`ByteChannel`, `FrameQueue`, `PwsshPump`, `Frame`). Eleven files: `Frames`, `ByteStream`, `Contracts`, `AgentProxy`, `AgentHost`, `ConPty`, `ProcessChannel`, `TcpChannel`, `Sftp`, `Listener`, `Loopback`. |
+| `src/agent/*.cs` | Everything the remote needs, plus the plumbing shared with the engine (`ByteChannel`, `FrameQueue`, `PwsshPump`, `Frame`). Twelve files: `Frames`, `ByteStream`, `Contracts`, `AgentProxy`, `AgentHost`, `ConPty`, `ProcessChannel`, `TcpChannel`, `Sftp`, `Win32Fs`, `Listener`, `Loopback`. |
 | `src/agent/PwsshAgent.csproj` | Builds those into the net48 DLL that gets pushed to the remote. **This is the only compiler that matters for the agent's language level** — see *The agent is a prebuilt assembly*. |
 | `src/PwsshCommon.ps1` | Client-only helpers: compilation with an on-disk cache, the agent-DLL lookup and staleness check, host key keystore. |
 | `src/Start-PwsshAgent.ps1` | Runs on the remote: loads the pushed assembly and shuttles frames. No crypto, no host key, no compiler. Must stay a *simple* script — see the parameter-binding trap below. |
@@ -307,6 +307,33 @@ Also considered and dropped: caching attributes from `READDIR` replies. It helps
 
 **The archive trick still beats all of this** for a large tree, and the README should keep saying so: ~3 round trips per file remain, so a 40-file tree is still on the order of a minute.
 
+### Long paths (`Win32Fs` and the `\\?\` prefix)
+
+Paths past `MAX_PATH` work, up to Win32's ~32,767. `src/agent/Win32Fs.cs` replaces the managed file-system calls with `CreateFileW`, `GetFileAttributesExW`, `FindFirstFileW`, `CreateDirectoryW`, `RemoveDirectoryW`, `DeleteFileW`, `SetFileAttributesW` and `SetFileTime`, and **every path it hands to Win32 carries `\\?\`**.
+
+**The failure this fixed could not be demonstrated on the available machines, and that is worth being straight about.** The known-limits entry claimed a 4.8 app-config switch was the cause; the red test refused to reproduce, and probing showed why — `UseLegacyPathHandling` and `BlockLongPaths` are both false here, the test remote has `LongPathsEnabled` by group policy, and both candidate host binaries declare `longPathAware`. So long paths already worked *on this remote*. What was actually wrong is that they worked **for a reason no other user is obliged to have**, and that older targets — explicitly on the roadmap — would fail outright, since under legacy path handling the managed layer rejects both `\\?\` and any path past `MAX_PATH` before it ever calls Win32.
+
+`\\?\` has been a Win32 contract since Windows 2000 and needs neither the policy nor a manifest. That is the whole reason for going native rather than prefixing a managed call.
+
+**Every path is prefixed, not just long ones.** One code path, so all the existing suite cases exercise it rather than leaving the long-path route as the branch that rots. `Win32Fs.Extended` does the prefixing at the single point of use, so `ToWindows` returns an ordinary unprefixed path, `WinPath` stays readable in logs, and `ToSftp` needs no stripping — which also removes the trap where a prefixed path fed back to the client would realpath as `/?/C:/…`.
+
+**The prefix means we own normalisation, and it has to be complete.** `\\?\` disables *all* of the OS's path handling, so a `..` left in the path is not resolved — it is looked up as a directory with that literal name, which is a path escaping where the caller meant rather than an error. `AgentSftpChannel.Normalize` replaces `Path.GetFullPath` (which throws on length under legacy handling, so it could not stay): split on `\`, drop empty and `.` segments, pop for `..` stopping at the root, and reject anything not rooted on a drive. It has direct tests, `..` at the root and repeated separators included.
+
+Two behaviour changes follow, both deliberate and both asserted in the suite rather than left to surprise someone:
+
+- **Trailing dots and spaces are trimmed** by the normaliser. `\\?\` would preserve them, which creates names that no ordinary tool on the remote could open again — so trimming keeps the prefix from changing what a name *means*.
+- **Reserved names are ordinary files.** `CON`, `NUL`, `PRN`, `COM1`–`COM9`, `LPT1`–`LPT9` stop resolving to devices. Correct for a file server, but note the consequence for anything else touching them: the far side's own managed APIs would still resolve an unprefixed `C:\dir\CON` to the console, so the suite creates and removes that file through sftp only.
+
+**Error mapping is the part that silently changes meaning.** `StatusFor` keys on exception *type*, so the native wrappers must throw the same types the managed APIs did or every error-status case in the suite quietly starts reporting something else: 2 → `FileNotFoundException`, 3 and 15 → `DirectoryNotFoundException`, 5 → `UnauthorizedAccessException`, 206 → `PathTooLongException`, and everything else → `IOException`, which maps to `FAILURE` exactly as before. `SetLastError = true` on every import, with `Marshal.GetLastWin32Error()` read immediately.
+
+**A P/Invoke struct-layout mistake here is silent, and this one produced plausible output.** `WIN32_FIND_DATAW` and `WIN32_FILE_ATTRIBUTE_DATA` need **`Pack = 4`**. A native `FILETIME` is two `DWORD`s, so every member is 4-byte aligned and nothing is padded; declaring the times as `long` makes the CLR want 8-byte alignment and insert four bytes after the attributes, shifting every field behind it. The symptoms were sizes of 0, timestamps of `Jan 01 1601`, and **names read two `WCHAR`s late** — `shallow.txt` came back as `allow.txt`, which is what identified it. Worse, `.` and `..` came back empty so they stopped being recognised as themselves, and a `get -r` recursed until the client's own *"Maximum directory depth exceeded: 64 levels"*. None of that is visible to a bit-exactness check, because reads go through a `FileStream` on a handle and never consult the struct. A static constructor now asserts `sizeof` is 592 and 36.
+
+**`FindFirstFileW` yielding name, attributes, size and both times in one pass buys nothing, and the plan was wrong to expect it to.** The reasoning was that `READDIR` would stop stat-ing each name separately — but `DirectoryInfo.GetFileSystemInfos` never did: the `FileSystemInfo` objects it returns cache the `WIN32_FIND_DATA` from the enumeration, so reading `.Length` or `.LastWriteTimeUtc` was already free. There was no per-entry syscall to remove. Measured on System32 (5,692 entries) over loopback, interleaved, three rounds: **177 ms against 189 ms medians, with the direction disagreeing between rounds and the within-variant spread wider than the difference** — i.e. no change, which is the correct outcome for work that was never doing anything. Entry counts agree exactly. Recorded because the premise was plausible and false.
+
+Verified over loopback, which is a genuine test here because the agent runs against this machine's own filesystem: the whole cycle at 478 characters — `mkdir`, `put`, `get` bit-exact, `ls -l` with correct names and sizes, `rename`, `chmod`, `rm`, `rmdir` — plus `get -r` through the deep tree, and the error statuses unchanged.
+
+**What no test here can show is the policy-independence, and it is the entire point of the change.** Both available machines have `LongPathsEnabled` on, so an unprefixed path would pass too. The claim rests on the documented Win32 contract plus inspection that every path handed to Win32 goes through `Extended` — and on the agent's counters (`LongPathsSeen`, `LongestPath`, logged once per channel, visible with `-EmitRemoteLog`) proving the extended route was actually taken. A machine with the policy off would settle it properly.
+
 ### Idle sessions (the client-side keepalive)
 
 `lastInboundTick` is refreshed only in `PwsshEngine.PushInbound` — inbound SSH bytes *from the ssh client* — and the watchdog gives up after `InactivityTimeoutSeconds` (300) without any. An idle `ssh` sends nothing (`ServerAliveInterval` defaults to 0; `TCPKeepAlive` works below the SSH layer), so **a session left sitting was dropped after five minutes**. Verified rather than assumed: with the timeout turned down, `echo` before an idle period worked, the client was already gone afterwards, and it reported `Connection to 127.0.0.1 closed by remote host`.
@@ -415,6 +442,16 @@ Get-WSManInstance -ConnectionURI $uri -ResourceURI shell -Enumerate -Credential 
 ```
 
 Both ends have an inactivity watchdog so orphans self-terminate rather than waiting out WinRM's 2-hour timeout: `PwsshConfig.InactivityTimeoutSeconds` (default 300) on the client, and `PwsshAgentHost.InactivityTimeoutSeconds` (default 120) on the remote, the latter backed by a 30 s `PING` from the client so that silence reliably means the client is gone. The remote one is what releases child processes and `-R` listeners after an abrupt disconnect, which is every disconnect — see the `-R` section.
+
+**A client that cannot authenticate is not a pwssh failure, and it looks exactly like one.** The whole WinRM suite went from passing to failing every case with `exit=255` mid-session, which reads as a regression in whatever was last touched. It was not: a direct `New-PSSession` failed identically, from both pwsh 7 and Windows PowerShell 5.1. Separate the two before debugging anything:
+
+```powershell
+New-PSSession -ComputerName <host> -Authentication Negotiate -Credential (Import-CliXml -Path <cred>.xml)
+```
+
+If that fails, the ProxyCommand is irrelevant. The distinguishing symptoms were **`0x8009030e SEC_E_NO_CREDENTIALS`** ("a specified logon session does not exist") on the Negotiate/NTLM path and **`0x80090311 SEC_E_NO_AUTHENTICATING_AUTHORITY`** ("your domain isn't available") on Kerberos, while the network was demonstrably fine — 5985 open, both DCs answering on 88 and 389, DNS resolving.
+
+The cause was **on the client and had nothing to do with this project**: installing Hyper-V and enabling VT-d started VBS (`VirtualizationBasedSecurityStatus = 2`), which activated **Credential Guard** — `lsaiso.exe` present, while `Win32_DeviceGuard.SecurityServicesConfigured` still reads 0 because that field reflects *policy* configuration rather than the default-on path. Credential Guard blocks supplied credentials for NTLM, and the client account here is local (`klist` shows no tickets), so every authentication to a domain account needs exactly the explicit-credential logon it refuses. Worth knowing because the error text points at TrustedHosts, which is a dead end.
 
 ## Implementation traps
 
@@ -635,7 +672,7 @@ This only affects interactive `shell` responsiveness — bulk transfer already p
 
 - ~~**No rekeying**~~ — **implemented**; see *Rekeying* below. It had stopped being theoretical: a single `scp` over ~1 GiB died part way through with `pwssh does not support rekeying`.
 - ~~**Seen once: the client→agent SFTP stream lost 4 bytes of alignment during a valve trip**~~ — **found and fixed**; see *A trip owes the framer's held bytes* under the read-ahead section.
-- **Long paths fail.** .NET Framework 4.8 needs an app-config switch for long-path awareness that cannot be set on the remote, so a path beyond ~260 characters raises `PathTooLongException` and comes back as `SSH_FX_FAILURE` mid-walk. Windows' own `sftp-server.exe` is `longPathAware` in its manifest, so this is a genuine behavioural difference from OpenSSH rather than a shared limitation.
+- ~~**Long paths fail**~~ — **implemented**; see *Long paths* below. The entry that used to be here said .NET Framework 4.8 needs an app-config switch that cannot be set on the remote, and **that diagnosis was wrong**: the red test would not reproduce. A 327-character path works on the test remote today, because it has `LongPathsEnabled` set by group policy and both candidate hosts declare `longPathAware`. So the reason to do the work was never a failure that could be demonstrated here — it was that the current behaviour depends on a policy no other user is obliged to have, and on older targets that are on the roadmap it would fail outright.
 - ~~**The loopback dev host cannot catch a round-trip regression**~~ — **done**, and it is how the read-ahead and the per-file round-trip work were developed. `-LatencyMs` on `tools/Start-PwsshTcpHost.ps1` stamps each frame on arrival and releases it when due, so a burst stays a burst; a `Thread.Sleep` in the shuttle loop would have serialised the link and made a correctly pipelined design measure as though it were not. It lives in the dev-only `tools/PwsshTcpHost.cs` rather than `PwsshLoopback` deliberately, so the agent source hash is untouched.
 - ~~**Not manually verified**~~ — **all confirmed**, by the project owner at a real interactive session: colour rendering, `Ctrl+C` interrupting a running command, and `window-change` reflowing output. None can be asserted from a script, so this is the only kind of evidence available for them.
 
