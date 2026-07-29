@@ -1128,6 +1128,40 @@ quit
         Assert-That 'sftp download is bit-exact across forced rekeys' ($rkh -eq $mkBig) `
             "$($r.Phase) got $rkh want $mkBig err='$($r.Err -replace "`r?`n", ' | ')'"
 
+        # ---- 12c. a valve trip while the framer holds an incomplete message.
+        #
+        # This is the case that caught a real corruption, and it needed both halves to coincide:
+        # the valve has to trip, AND the framer has to be holding bytes it consumed for a
+        # half-received message. The trip is guaranteed by the fault hook; whether a feed ends
+        # mid-message was otherwise left to how ssh happened to packetise the client's writes,
+        # which is why the bug appeared once and then hid for a dozen runs.
+        # PWSSH_SFTP_SPLIT_CLIENT_FEED forces the second condition.
+        #
+        # The failure was not subtle once provoked: the held bytes were dropped, so everything
+        # after arrived shifted, and the remote either rejected an absurd length ("bad SFTP packet
+        # length 83886080" -- a READ type byte read as one) or, when the bogus length happened to
+        # be plausible, waited for bytes that never came and the transfer hung. Hence a bounded
+        # timeout here rather than the default.
+        if ($Port -eq 0) {
+            $resLocal = Join-Path $repo "tmp/sftp-residue-$sftpTag.bin"
+            if (Test-Path $resLocal) { [System.IO.File]::Delete($resLocal) }
+            [Environment]::SetEnvironmentVariable('PWSSH_SFTP_FAULT_AFTER_KIB', '2048')
+            [Environment]::SetEnvironmentVariable('PWSSH_SFTP_SPLIT_CLIENT_FEED', '4')
+            try {
+                $r = Invoke-Sftp "get $farFwd/big.bin $($resLocal.Replace($bs,'/'))`nquit`n" `
+                     'residue' @() '' '' 300000
+            } finally {
+                [Environment]::SetEnvironmentVariable('PWSSH_SFTP_FAULT_AFTER_KIB', $null)
+                [Environment]::SetEnvironmentVariable('PWSSH_SFTP_SPLIT_CLIENT_FEED', $null)
+            }
+            $resh = if (Test-Path $resLocal) { Get-Sha ([System.IO.File]::ReadAllBytes($resLocal)) } else { 'MISSING' }
+            Assert-That 'a valve trip with held bytes still downloads bit-exact' ($resh -eq $mkBig) `
+                "$($r.Phase) got $resh want $mkBig err='$($r.Err -replace "`r?`n", ' | ')'"
+        }
+        else {
+            Write-Host '  SKIP  a valve trip with held bytes still downloads bit-exact (dev host: env hooks are not visible to it)' -ForegroundColor DarkGray
+        }
+
         # ---- 12b. the read-ahead's safety valve, exercised rather than claimed. It degrades to
         # verbatim forwarding on any anomaly, and the whole argument for the private-channel design
         # is that this is safe at ANY instant -- including part way through a transfer with a read

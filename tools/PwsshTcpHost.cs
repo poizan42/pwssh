@@ -89,6 +89,15 @@ namespace Pwssh.Dev
                 if (readAheadChunks >= 0) cfg.SftpReadAheadChunks = readAheadChunks;
                 cfg.SftpFaultAfterKiB = faultAfterKiB;
                 if (inactivitySeconds >= 0) cfg.InactivityTimeoutSeconds = inactivitySeconds;
+                // Test-only, dev host only: force client SFTP payloads to arrive as two feeds so a
+                // partial message is held. Read from the environment rather than a parameter
+                // because it is only ever used by a targeted reproduction, never by a suite run.
+                string splitEnv = Environment.GetEnvironmentVariable("PWSSH_SFTP_SPLIT_CLIENT_FEED");
+                if (!string.IsNullOrEmpty(splitEnv))
+                {
+                    int sp;
+                    if (int.TryParse(splitEnv, out sp) && sp > 0) cfg.SftpSplitClientFeed = sp;
+                }
                 // Dev-only: the metadata-speculation miss trace is what turns "the hit count is
                 // zero" into "and here is why", which is how the glob-first request order was
                 // found. Tied to the host's own verbose flag rather than a knob of its own.

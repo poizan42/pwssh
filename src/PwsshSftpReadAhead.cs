@@ -61,6 +61,25 @@ namespace Pwssh
 
         // True while part of a message is held over, waiting for the rest.
         public bool HasResidue { get { return residueLen > 0; } }
+        public int ResidueLength { get { return residueLen; } }
+
+        // Hands back the bytes held for an incomplete message and forgets them.
+        //
+        // These bytes have already been consumed from the caller's stream and never forwarded, so
+        // whoever stops parsing OWES them to the far side. Dropping them shifts every byte that
+        // follows, which is how a held 4-byte length prefix once turned into the agent reading a
+        // READ's type byte as a length: "bad SFTP packet length 83886080" (0x05000000). When the
+        // bogus length happens to be plausible instead, the far side simply waits for bytes that
+        // will never come and the transfer hangs.
+        public byte[] TakeResidue()
+        {
+            if (residueLen == 0) return null;
+            byte[] held = new byte[residueLen];
+            Array.Copy(residue, 0, held, 0, residueLen);
+            residue = new byte[0];
+            residueLen = 0;
+            return held;
+        }
 
         // One message, as a range. Buffer/Offset/Count cover the message body (type byte first),
         // excluding the 4-byte length prefix.
@@ -92,6 +111,11 @@ namespace Pwssh
                     m.Buffer = residue; m.Offset = 4; m.Count = residueLen - 4;
                     done.Add(m);
                     residueLen = 0;
+                    // Same reason as the sibling below: the array has just been handed out by
+                    // reference. This branch cannot currently be reached -- Feed only ever holds
+                    // strictly incomplete remainders, so NeededForResidue is never 0 on entry --
+                    // but the omission was a silent-corruption trap if that ever changed.
+                    residue = new byte[0];
                     break;
                 }
                 int take = Math.Min(need, end - p);
@@ -321,7 +345,21 @@ namespace Pwssh
             mode = Mode.Passthrough;
             valveTrips++;
             if (valveReason == null) valveReason = reason;
-            engine.LogInternal("sftp read-ahead valve tripped: " + reason);
+            engine.LogInternal("sftp read-ahead valve tripped: " + reason
+                               + (fromClient.HasResidue
+                                  ? "; client framer holds " + fromClient.ResidueLength + " byte(s)"
+                                  : "")
+                               + (fromAgent.HasResidue
+                                  ? "; agent framer holds " + fromAgent.ResidueLength + " byte(s)"
+                                  : ""));
+
+            // Held bytes are not dropped here, they are flushed by the next call in that direction
+            // (PrependHeld). Logging them is kept permanently as a tripwire: a trip with residue is
+            // exactly the condition that used to corrupt the stream, and it is otherwise invisible.
+
+            // Nothing will consume held metadata answers again, and the speculation channel has no
+            // further use, so let go of both rather than carrying them to teardown.
+            InvalidateSpeculation();
 
             // Abandoning is not optional here, and this was a hang waiting to happen. A read parked
             // at the moment of the trip is waiting on data the prefetch would have delivered; going
@@ -353,7 +391,10 @@ namespace Pwssh
             outCount = count;
             lock (gate)
             {
-                if (mode == Mode.Passthrough) return data;
+                if (mode == Mode.Passthrough)
+                {
+                    return PrependHeld(fromClient, data, offset, count, out outOffset, out outCount);
+                }
                 try
                 {
                     List<SftpFramer.Msg> msgs = fromClient.Feed(data, offset, count);
@@ -362,7 +403,7 @@ namespace Pwssh
                         Trip("client stream: " + fromClient.Error);
                         // Anything already held back has to go now, or the agent is left waiting
                         // for the rest of a message it half received.
-                        return FlushHeld(msgs, out outOffset, out outCount);
+                        return FlushHeld(fromClient, msgs, out outOffset, out outCount);
                     }
 
                     bool anySuppressed = false;
@@ -391,9 +432,52 @@ namespace Pwssh
             }
         }
 
-        private byte[] FlushHeld(List<SftpFramer.Msg> msgs, out int outOffset, out int outCount)
+        // The first passthrough feed after a trip has to carry whatever the framer was still holding.
+        //
+        // This is the whole fix for a corruption that took a long time to pin down. Trip() flips the
+        // mode from anywhere -- including the agent pump thread -- and the old code then returned the
+        // caller's buffer verbatim for ever after, so bytes consumed for a half-received message
+        // simply vanished and everything behind them arrived shifted. Draining here rather than
+        // inside Trip() is deliberate: it runs on the thread that owns this direction's stream, so
+        // it cannot race the caller's own send, and it covers a trip raised from either direction as
+        // well as from the error paths.
+        private static byte[] PrependHeld(SftpFramer framer, byte[] data, int offset, int count,
+                                         out int outOffset, out int outCount)
         {
-            return Rebuild(msgs, out outOffset, out outCount);
+            outOffset = offset;
+            outCount = count;
+            byte[] held = framer.TakeResidue();
+            if (held == null) return data;
+
+            byte[] joined = new byte[held.Length + count];
+            Array.Copy(held, 0, joined, 0, held.Length);
+            Array.Copy(data, offset, joined, held.Length, count);
+            outOffset = 0;
+            outCount = joined.Length;
+            return joined;
+        }
+
+        // Named for what it does now: the completed messages, and then whatever is still held. The
+        // held bytes are owed to the far side exactly as in PrependHeld, and this path used to drop
+        // them too -- its comment claimed otherwise, which is how it escaped notice.
+        //
+        // A framer error can still lose the tail of the feed that errored, from the bad length
+        // onwards, because Feed stops there. That is accepted: at that point the stream is provably
+        // not what we think it is, and the valve exists to stop interpreting it, not to repair it.
+        private byte[] FlushHeld(SftpFramer framer, List<SftpFramer.Msg> msgs,
+                                 out int outOffset, out int outCount)
+        {
+            byte[] rebuilt = Rebuild(msgs, out outOffset, out outCount);
+            byte[] held = framer.TakeResidue();
+            if (held == null) return rebuilt;
+
+            int haveLen = rebuilt == null ? 0 : outCount;
+            byte[] joined = new byte[haveLen + held.Length];
+            if (haveLen > 0) Array.Copy(rebuilt, outOffset, joined, 0, haveLen);
+            Array.Copy(held, 0, joined, haveLen, held.Length);
+            outOffset = 0;
+            outCount = joined.Length;
+            return joined;
         }
 
         private static byte[] Rebuild(List<SftpFramer.Msg> msgs, out int outOffset, out int outCount)
@@ -432,7 +516,15 @@ namespace Pwssh
             outCount = count;
             lock (gate)
             {
-                if (mode == Mode.Passthrough) return data;
+                // Passthrough still has to finish what it started. A CLOSE we already answered
+                // ourselves leaves the remote's own reply to that id owed a suppression, and letting
+                // it through gives the client two replies for one request -- fatal to it. So the
+                // shortcut is taken only once nothing is outstanding, and the held bytes go first
+                // either way.
+                if (mode == Mode.Passthrough && closeAnswered.Count == 0)
+                {
+                    return PrependHeld(fromAgent, data, offset, count, out outOffset, out outCount);
+                }
                 try
                 {
                     // Once anything is owed a suppression we stay in rebuild mode until it is done,
@@ -445,7 +537,7 @@ namespace Pwssh
                     if (fromAgent.Error != null)
                     {
                         Trip("agent stream: " + fromAgent.Error);
-                        return FlushHeld(msgs, out outOffset, out outCount);
+                        return FlushHeld(fromAgent, msgs, out outOffset, out outCount);
                     }
 
                     bool dropped = false;
@@ -624,6 +716,10 @@ namespace Pwssh
         // agent's worker is FIFO per channel and so processes the forwarded CLOSE first.
         private void TryAnswerCloseEarly(SftpFramer.Msg m, string handle)
         {
+            // Never arm a new suppression once the valve has tripped. Inspect does not itself check
+            // the mode, so a trip part way through a feed would otherwise let a later message in the
+            // same feed take on an obligation the reply direction has already stopped honouring.
+            if (mode != Mode.Proxy) return;
             if (handle == null || !readHandles.ContainsKey(handle)) return;
             // Only ever entered on a message boundary in the reply direction: FromAgent switches
             // to rebuilding while anything is owed, and that switch must not happen part way

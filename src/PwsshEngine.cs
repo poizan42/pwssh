@@ -60,6 +60,12 @@ namespace Pwssh
         // Debug-only tracing of metadata speculation misses.
         public bool SftpMetaTrace;
 
+        // Test-only: deliver each client SFTP payload as two feeds, the second this many bytes
+        // long, so the framer is left holding an incomplete message. 4 reproduces the exact shape
+        // that once corrupted a transfer -- a bare length prefix held at the moment the valve
+        // tripped. 0 is off.
+        public int SftpSplitClientFeed;
+
         // If the client vanishes without closing the session, the remote pipeline would
         // otherwise block forever and hold a WinRM shell until WinRM's own (2 hour)
         // timeout. Bounded here instead. 0 disables.
@@ -1721,6 +1727,7 @@ namespace Pwssh
         // Debug-only: one log line per metadata speculation miss, which is the only way to see
         // WHY a miss happened rather than just that the hit count is zero.
         internal bool SftpMetaTrace { get { return cfg.SftpMetaTrace; } }
+        internal int SftpSplitClientFeed { get { return cfg.SftpSplitClientFeed; } }
 
         // ---- IPwsshChannelSink: called from the agent side, must not block ----
 
@@ -2152,17 +2159,20 @@ namespace Pwssh
             // stream: its own requests go out on a private channel.
             if (sftp != null)
             {
-                int off, len;
-                byte[] send = sftp.FromClient(data, 0, data.Length, out off, out len);
-                if (send != null && len > 0)
+                // Testing hook: deliver this payload as two feeds instead of one, so the framer is
+                // left holding the head of an incomplete message. Whether a feed ends mid-message
+                // is otherwise up to how ssh happens to packetise the client's writes, which made
+                // a whole class of bug -- anything that loses the framer's held bytes -- turn up
+                // once in a while and then refuse to reproduce.
+                int split = engine.SftpSplitClientFeed;
+                if (split > 0 && data.Length > split)
                 {
-                    if (send == data && off == 0 && len == data.Length) agent.SendStdin(localId, data);
-                    else
-                    {
-                        byte[] slice = new byte[len];
-                        Array.Copy(send, off, slice, 0, len);
-                        agent.SendStdin(localId, slice);
-                    }
+                    SendSplitToAgent(data, 0, data.Length - split);
+                    SendSplitToAgent(data, data.Length - split, split);
+                }
+                else
+                {
+                    SendSplitToAgent(data, 0, data.Length);
                 }
             }
             else
@@ -2177,6 +2187,24 @@ namespace Pwssh
             w.UInt32(peerChannel);
             w.UInt32((uint)data.Length);
             pkt.WritePacket(w.ToArray());
+        }
+
+        // One feed through the read-ahead and on to the agent. Split out so the testing hook above
+        // can call it twice without duplicating the forwarding rules.
+        private void SendSplitToAgent(byte[] data, int start, int length)
+        {
+            if (length <= 0) return;
+            int off, len;
+            byte[] send = sftp.FromClient(data, start, length, out off, out len);
+            if (send == null || len <= 0) return;
+            if (send == data && off == start && len == length && start == 0 && length == data.Length)
+            {
+                agent.SendStdin(localId, data);
+                return;
+            }
+            byte[] slice = new byte[len];
+            Array.Copy(send, off, slice, 0, len);
+            agent.SendStdin(localId, slice);
         }
 
         public void ClientEof() { agent.CloseStdin(localId); }

@@ -158,6 +158,12 @@ try {
              elseif ($env:PWSSH_SFTP_FAULT_AFTER_KIB) { [int]$env:PWSSH_SFTP_FAULT_AFTER_KIB }
              else { 0 }
     $cfg.SftpFaultAfterKiB = $fault
+    # Test-only: split each client SFTP payload so the framer is left holding an incomplete
+    # message. Environment-only, like the fault hook, because only a targeted regression case
+    # wants it -- and it is the other half of the pair that reproduces the dropped-residue desync.
+    if ($null -ne $env:PWSSH_SFTP_SPLIT_CLIENT_FEED -and $env:PWSSH_SFTP_SPLIT_CLIENT_FEED -ne '') {
+        $cfg.SftpSplitClientFeed = [int]$env:PWSSH_SFTP_SPLIT_CLIENT_FEED
+    }
     # As with the read-ahead knobs, the environment is consulted only when the parameter was not
     # given: the suite drives an unmodified ssh_config and cannot add an alias per variation, and
     # a five-minute idle is not something a test can wait out.

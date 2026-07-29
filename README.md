@@ -33,7 +33,7 @@ the protocol itself.
 | Not implemented | symlink creation (needs elevation on Windows) |
 
 Tested against OpenSSH 9.5p2 on Windows, with a Windows PowerShell 5.1 / .NET Framework 4.8
-remote. The test suite drives the real `ssh`, `sftp` and `scp` binaries: 70 cases over WinRM and
+remote. The test suite drives the real `ssh`, `sftp` and `scp` binaries: 71 cases over WinRM and
 62 against a loopback dev host.
 
 Two warts worth knowing:
