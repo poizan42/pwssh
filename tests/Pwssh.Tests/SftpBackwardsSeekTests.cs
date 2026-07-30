@@ -10,19 +10,20 @@
 // channel to passthrough, and there is no restart counter or thrash limit anywhere in the code, so a
 // later file in the same session still gets a fresh prefetch. Tests 2 and 4 hold that distinction.
 //
-// WHAT "MID-TRANSFER" HAS TO MEAN HERE, learned the hard way.
+// WHY THESE TESTS USE A SHALLOW DEPTH AND INJECTED LATENCY
 //
-// The non-sequential path is only reachable while a prefetch is ACTIVE, and a prefetch ends as soon
-// as it has fetched through EOF: Refill calls FinishPrefetch on `p.Eof && p.Outstanding <= 0`, which
-// nulls `active`. Depth does not prevent that -- it bounds outstanding requests, not buffered bytes,
-// so the prefetch keeps issuing until the file runs out. On any link fast relative to the client it
-// therefore finishes almost immediately, and a seek arriving later reaches nothing at all: measured
-// at the default depth on a bare loopback, an 8 MiB read gave served=45 forwarded=212 nonSeq=0, with
-// no park or abandon recorded because none of those paths ran. That is how these tests first failed,
-// and it is a real behaviour rather than a harness artifact -- see the last test in this file.
+// A prefetch retires when it has fetched through EOF, and depth does not prevent that -- it bounds
+// outstanding requests, not buffered bytes, so the prefetch keeps issuing until the file runs out. On
+// a link fast relative to the client it therefore finishes almost immediately.
 //
-// So the seek is done EARLY, after a few hundred KiB, while the prefetch demonstrably still has
-// requests in flight. Injected latency widens that window and is what the real transport has anyway.
+// That used to mean a seek arriving afterwards reached nothing at all, because retiring dropped the
+// buffer and nulled `active`. It no longer does: a finished prefetch keeps serving from what it
+// already holds, so the non-sequential path is reachable whether or not the fetch is still running --
+// which `A_backwards_seek_after_the_prefetch_retired_stays_bit_exact` covers deliberately.
+//
+// The shallow depth and latency are kept for the tests that want the seek to land while the fetch is
+// genuinely still in flight, which is a different state from serving a finished buffer and worth
+// exercising on its own. Latency is also what the real transport has.
 //
 // Every assertion is on the engine's own log rather than on what the client observed, because
 // SftpFileStream buffers internally: a seek can be satisfied without any READ reaching the server, so
@@ -321,23 +322,16 @@ namespace Pwssh.Tests
         }
 
         [Fact]
-        public void A_prefetch_that_finishes_before_the_client_drains_it_stops_serving()
+        public void A_prefetch_that_finishes_first_keeps_serving_from_its_buffer()
         {
-            // Not an aspiration, a record of what the code does today, found while writing the tests
-            // above and pinned here so it cannot change unnoticed.
+            // The inverse of a test that used to pin the opposite, and the measurement that motivated
+            // the fix turned green. At the default depth on a bare loopback the prefetch reaches EOF
+            // long before the client has consumed anything; it now keeps serving from what it holds
+            // instead of retiring and letting the rest be fetched a second time.
             //
-            // Refill calls FinishPrefetch as soon as `p.Eof && p.Outstanding <= 0`, and FinishPrefetch
-            // sets `active = null`. Nothing checks whether the buffer still holds bytes the client has
-            // not read, so on a link fast relative to the client the prefetch fetches the whole file,
-            // retires, and every remaining read is forwarded to the remote -- fetching those bytes a
-            // second time. Nothing in the counters flags it: no park, no abandon, no valve trip.
-            //
-            // Over WinRM the client can usually keep pace, which is why CLAUDE.md's served=34
-            // forwarded=0 figure came from a latency-injected host rather than a bare loopback one.
-            // It is still reachable there by any client that reads in small increments.
-            //
-            // If this test starts failing because served went up and forwarded went to zero, that is
-            // an improvement: delete the test and record the change.
+            // Before: served=18 forwarded=111 prefetchKiB=8192 -- the whole file fetched, six sevenths
+            // of it fetched again. The assertion is forwarded == 0, because "mostly served" would pass
+            // just as well on the old behaviour with a slower client.
             using (PwsshTestHost host = new PwsshTestHost())   // default depth, no latency
             {
                 try
@@ -351,24 +345,21 @@ namespace Pwssh.Tests
                             ReadExactly(s, whole, whole.Length);
                         }
                     }
-                    // Whatever the read-ahead does or does not do, the bytes are right.
                     Assert.Equal(expected, whole);
 
                     Assert.True(host.WaitForLog("sftp read-ahead: "), "no read-ahead summary was logged");
                     string summary = host.FindLog("sftp read-ahead: ");
                     output.WriteLine(summary);
 
-                    // The whole file was fetched by the prefetch...
                     Assert.Equal(FileSize / 1024, Counter(summary, "prefetchKiB"));
-                    // ...some of it was served from the buffer...
-                    Assert.True(Counter(summary, "served") > 0, "read-ahead never engaged: " + summary);
-                    // ...and the rest was fetched again, from the remote, after the prefetch retired.
-                    Assert.True(Counter(summary, "forwarded") > 0,
-                        "the prefetch no longer retires early, which is an improvement: " + summary);
-                    // Silently, which is the part worth knowing.
+                    Assert.Equal(0, Counter(summary, "forwarded"));
+                    Assert.Equal(Counter(summary, "clientReads"), Counter(summary, "served"));
+                    Assert.Equal(FileSize / 1024, Counter(summary, "servedKiB"));
                     Assert.Equal(0, Counter(summary, "nonSeq"));
                     Assert.Equal(0, Counter(summary, "valveTrips"));
-                    Assert.Null(host.FindLog("sftp prefetch abandoned"));
+                    // Nothing was fetched that the client did not read.
+                    Assert.Equal(0, Counter(summary, "unreadKiB"));
+                    AssertCreditSane(summary);
                 }
                 catch
                 {
@@ -376,6 +367,178 @@ namespace Pwssh.Tests
                     throw;
                 }
             }
+        }
+
+        [Fact]
+        public void A_backwards_seek_after_the_prefetch_retired_stays_bit_exact()
+        {
+            // A path that did not exist before: with no latency the prefetch retires almost at once, so
+            // the seek lands on a buffer that is serving rather than fetching. It must take the same
+            // non-sequential route -- abandon the buffer, forward the read -- rather than quietly doing
+            // nothing, which is what used to happen when retiring nulled `active`.
+            using (PwsshTestHost host = new PwsshTestHost())   // default depth, no latency
+            {
+                try
+                {
+                    byte[] before = new byte[ReadBeforeSeek];
+                    byte[] after = new byte[ReadAfterSeek];
+                    using (SftpClient sftp = SshNetClient.Sftp(host, bufferSize: ClientBuffer))
+                    {
+                        sftp.Connect();
+                        using (SftpFileStream s = sftp.Open(Wire(fileA), FileMode.Open, FileAccess.Read))
+                        {
+                            ReadExactly(s, before, before.Length);
+                            s.Seek(0, SeekOrigin.Begin);
+                            ReadExactly(s, after, after.Length);
+                        }
+                    }
+                    Assert.Equal(Slice(expected, 0, before.Length), before);
+                    Assert.Equal(Slice(expected, 0, after.Length), after);
+
+                    Assert.True(host.WaitForLog("sftp read-ahead: "), "no read-ahead summary was logged");
+                    string summary = host.FindLog("sftp read-ahead: ");
+                    output.WriteLine(summary);
+                    Assert.True(Counter(summary, "nonSeq") >= 1,
+                        "a backwards seek onto a retired buffer went unnoticed: " + summary);
+                    Assert.Equal(0, Counter(summary, "valveTrips"));
+                    AssertCreditSane(summary);
+                }
+                catch
+                {
+                    Dump(host);
+                    throw;
+                }
+            }
+        }
+
+        [Fact]
+        public void A_retired_buffer_is_dropped_when_a_second_file_is_opened_without_closing_the_first()
+        {
+            // The only cover for OnClientOpen's drop. A finished buffer must not block the next file's
+            // prefetch -- that would cost the many-small-files case its read-ahead entirely, which is
+            // the case that needs it most. Two handles open at once does not arise from `sftp` or
+            // `scp -r`, which close before opening, but SSH.NET can do it.
+            using (PwsshTestHost host = new PwsshTestHost())   // default depth, no latency
+            {
+                try
+                {
+                    // Nearly all of A, deliberately: A's prefetch must have REACHED EOF and retired
+                    // before B is opened, or the early return in OnClientOpen is the correct answer and
+                    // this tests nothing. An earlier version read 256 KiB of 8 MiB and failed for that
+                    // reason -- the prefetch was still legitimately in flight. Leaving half a megabyte
+                    // unread also exercises the unread accounting rather than only the drop path.
+                    const int LeaveUnread = 512 * 1024;
+                    byte[] fromA = new byte[FileSize - LeaveUnread];
+                    byte[] fromB = new byte[ReadBeforeSeek];
+                    byte[] restOfA = new byte[ReadBeforeSeek];
+                    using (SftpClient sftp = SshNetClient.Sftp(host, bufferSize: ClientBuffer))
+                    {
+                        sftp.Connect();
+                        using (SftpFileStream a = sftp.Open(Wire(fileA), FileMode.Open, FileAccess.Read))
+                        {
+                            ReadExactly(a, fromA, fromA.Length);
+
+                            using (SftpFileStream b = sftp.Open(Wire(fileB), FileMode.Open, FileAccess.Read))
+                            {
+                                ReadExactly(b, fromB, fromB.Length);
+                            }
+
+                            // A is still open and must still read correctly, from the remote now that
+                            // its buffer has been dropped in B's favour.
+                            ReadExactly(a, restOfA, restOfA.Length);
+                        }
+                    }
+                    Assert.Equal(Slice(expected, 0, fromA.Length), fromA);
+                    Assert.Equal(Slice(expected, 0, fromB.Length), fromB);
+                    Assert.Equal(Slice(expected, fromA.Length, restOfA.Length), restOfA);
+
+                    int opened = 0;
+                    foreach (string line in host.Log)
+                        if (line != null && line.Contains("sftp prefetch opening on channel")) opened++;
+                    Assert.True(opened >= 2,
+                        "the second file did not get a prefetch of its own, saw " + opened + " opening(s)");
+
+                    Assert.True(host.WaitForLog("sftp read-ahead: "), "no read-ahead summary was logged");
+                    AssertCreditSane(host.FindLog("sftp read-ahead: "));
+                }
+                catch
+                {
+                    Dump(host);
+                    throw;
+                }
+            }
+        }
+
+        [Fact]
+        public void Many_small_files_each_get_their_own_prefetch()
+        {
+            // The guard for the property the eager release existed to protect, asserted on counters
+            // rather than wall-clock because this transport has twice inverted a conclusion drawn from
+            // a single timing. It is also where the fix should GAIN: a small file's prefetch completes
+            // before the client reads anything, so every one of these used to be served from the remote.
+            const int Files = 20;
+            string smallDir = Path.Combine(dir, "small");
+            Directory.CreateDirectory(smallDir);
+            byte[] body = new byte[900];
+            for (int i = 0; i < body.Length; i++) body[i] = (byte)(i * 3);
+            string[] paths = new string[Files];
+            for (int i = 0; i < Files; i++)
+            {
+                paths[i] = Path.Combine(smallDir, "f" + i.ToString("00") + ".bin");
+                File.WriteAllBytes(paths[i], body);
+            }
+
+            using (PwsshTestHost host = new PwsshTestHost())
+            {
+                try
+                {
+                    using (SftpClient sftp = SshNetClient.Sftp(host, bufferSize: ClientBuffer))
+                    {
+                        sftp.Connect();
+                        for (int i = 0; i < Files; i++)
+                        {
+                            byte[] got = new byte[body.Length];
+                            using (SftpFileStream s = sftp.Open(Wire(paths[i]), FileMode.Open, FileAccess.Read))
+                            {
+                                ReadExactly(s, got, got.Length);
+                            }
+                            Assert.Equal(body, got);
+                        }
+                    }
+
+                    int opened = 0;
+                    foreach (string line in host.Log)
+                        if (line != null && line.Contains("sftp prefetch opening on channel")) opened++;
+                    Assert.True(opened >= Files,
+                        "expected a prefetch per file, saw " + opened + " opening(s) for " + Files + " files");
+
+                    // One summary per file; the last one carries the session totals.
+                    Assert.True(host.WaitForLog("sftp read-ahead: "), "no read-ahead summary was logged");
+                    string summary = null;
+                    foreach (string line in host.Log)
+                        if (line != null && line.Contains("sftp read-ahead: ")) summary = line;
+                    output.WriteLine(summary);
+                    Assert.Equal(0, Counter(summary, "forwarded"));
+                    AssertCreditSane(summary);
+                }
+                catch
+                {
+                    Dump(host);
+                    throw;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Granting more credit than arrived is the one direction the agent's window exists to prevent,
+        /// and it is what a stale prefetch reference would cause. The unambiguous detector is agent-side
+        /// (AgentSftpChannel.AddCredit logs it), but PwsshAgentHost's log is not reachable from
+        /// PwsshTestHost, so the summary is the only proxy available here.
+        /// </summary>
+        private static void AssertCreditSane(string summary)
+        {
+            Assert.True(Counter(summary, "creditGranted") <= Counter(summary, "creditRecv"),
+                "granted more credit than was received: " + summary);
         }
     }
 }

@@ -251,6 +251,15 @@ namespace Pwssh
         private int valveTrips;
         private string valveReason;
 
+        // Bytes fetched that the client never asked for, summed over every buffer dropped with data
+        // still in it. This is the counter that keeps the fix honest: letting a finished prefetch go on
+        // serving removed the old "forwarded" signal that made re-fetching visible, and replaced it
+        // with a quieter waste -- fetching up to the whole credit and throwing it away. Same reason
+        // creditRecv and creditGranted are in the summary: a cost with no counter is a cost nobody
+        // finds. Small values are normal (the prefetch reads in 255 KiB chunks and the file rarely
+        // ends on one); a figure approaching the file size means the client stopped early.
+        private long unreadBytes;
+
         // The client handle of the file most recently prefetched, so its CLOSE can report the
         // counters. Cleared once reported, so a second CLOSE of the same handle stays quiet.
         private string lastPrefetchHandle;
@@ -306,6 +315,7 @@ namespace Pwssh
                          + " closesEarly=" + closesAnsweredEarly
                          + " creditRecv=" + creditReceived
                          + " creditGranted=" + creditGranted
+                         + " unreadKiB=" + (unreadBytes / 1024)
                          + " valveTrips=" + valveTrips;
                 if (valveReason != null) s += " (" + valveReason + ")";
                 return s;
@@ -799,6 +809,15 @@ namespace Pwssh
 
             // Past a proven end of file: the same STATUS the remote would send, one round trip
             // sooner. Only ever when the remote actually proved it.
+            //
+            // This used to be close to dead code -- the prefetch was retired almost the instant
+            // EofOffset became known, so `active` was null by the time a read could reach here. Now
+            // that a finished buffer keeps serving, it is live for as long as the client holds the
+            // handle, which freezes the client's view of where the file ends at the moment our
+            // prefetch proved it. A file being appended to therefore reads short. That is deliberate:
+            // the alternative is a forwarded round trip per file, which is the very cost the metadata
+            // speculation was built to remove, and a real SFTP server racing a concurrent writer gives
+            // no better guarantee.
             if (offset >= p.EofOffset)
             {
                 SendStatusEof(id);
@@ -909,7 +928,7 @@ namespace Pwssh
                 {
                     p.Segs.Dequeue();
                     p.BufStart = s.FileOffset + s.Count;
-                    ReleasePrefetchCredit(s.Count);
+                    ReleasePrefetchCredit(p, s.Count);
                     continue;
                 }
                 break;
@@ -938,7 +957,7 @@ namespace Pwssh
                     p.Segs.Dequeue();
                     p.BufStart = s.FileOffset + s.Count;
                     // The whole segment has been handed over, so its credit goes back now.
-                    ReleasePrefetchCredit(s.Count);
+                    ReleasePrefetchCredit(p, s.Count);
                 }
                 else
                 {
@@ -947,7 +966,7 @@ namespace Pwssh
                     s.Count -= skip + take;
                     s.FileOffset = offset;
                     p.BufStart = offset;
-                    ReleasePrefetchCredit(skip + take);
+                    ReleasePrefetchCredit(p, skip + take);
                 }
             }
             return parts;
@@ -986,7 +1005,12 @@ namespace Pwssh
             {
                 // The client is finished with this file, so anything still buffered or in flight is
                 // waste. Its own CLOSE is forwarded untouched and answered by the remote as usual.
-                AbandonPrefetch("client closed the file");
+                //
+                // The wording matters. A prefetch that merely finished and kept serving now reaches
+                // here on EVERY ordinary download, and "abandoned" once per file would read as a fault
+                // in every session log. Only say something when there is something to say -- bytes
+                // fetched that the client never read -- and say it neutrally.
+                AbandonPrefetch(p.ChannelClosed ? null : "client closed the file");
             }
 
             // Reported here, and not only from Kill(), because Kill() does not run: ssh
@@ -1023,6 +1047,11 @@ namespace Pwssh
             public bool Eof;                     // the remote reported the end of the file
             public bool Failed;                  // the remote refused; stop and stay out of the way
 
+            // The fetch is over and the private channel is gone, but the buffer is still serving the
+            // client. This is the one state in which a non-null `active` means "a buffer" rather than
+            // "a fetch", and every place that reads `active` has to know which of the two it wants.
+            public bool ChannelClosed;
+
             // Its OWN framer, not one shared across prefetches. A shared framer carries residue and
             // a sticky Error from one file's channel to the next: Feed returns immediately once
             // Error is set, so a single desync would silently disable read-ahead for the rest of the
@@ -1036,6 +1065,13 @@ namespace Pwssh
             // that arrived has been handed back, is sitting in Segs waiting for the client, or is
             // part of a message the framer has not finished reading. Carried here rather than on the
             // proxy so it resets per prefetch for free.
+            //
+            // The balance FREEZES at ChannelClosed, so afterwards Retained also covers "was retained
+            // at the moment the channel closed". Releasing credit past that point would be correct in
+            // the arithmetic and pointless on the wire: the grants would be upstream WINDOW frames for
+            // a channel the agent has already killed, and upstream is the scarce direction -- about
+            // 130 of them for a full 32 MiB buffer, which is exactly the waste the batching in
+            // GRANT_THRESHOLD exists to avoid.
             public long Received;
             public long Granted;
             public long Retained;
@@ -1079,7 +1115,23 @@ namespace Pwssh
         {
             // Only one prefetch at a time: sftp and scp read one file after another, so a second
             // would be speculative work competing with the first for the same link.
-            if (active != null) return;
+            //
+            // A RETIRED buffer is different, and must not block the next file. Its fetch is over and
+            // its channel is gone; only unread bytes remain, and the client is evidently done with
+            // them or it would not be opening something else. Dropping it here is what keeps the
+            // many-small-files case working -- that case is the one that needs read-ahead most (40
+            // files of 900 bytes went 150 s to 94 s on earlier work), and it would lose its prefetch
+            // entirely if a finished one still counted as active.
+            //
+            // In practice this is the rare path: sftp, scp -r and SSH.NET all CLOSE a file before
+            // opening the next, so OnClientClose has usually dropped the buffer already. When it does
+            // fire -- a client holding two handles at once -- the second file simply gets today's
+            // behaviour rather than none.
+            if (active != null)
+            {
+                if (!active.ChannelClosed) return;
+                AbandonPrefetch("a new file was opened while a finished buffer was still held");
+            }
 
             // OPEN is: byte type, uint32 id, string path, uint32 pflags, ATTRS.
             SshLikeReader r = new SshLikeReader(m.Buffer, m.Offset + 1);
@@ -1460,6 +1512,24 @@ namespace Pwssh
                 if (metaStarted && ch == metaChannel) { OnMetaData(ch, buffer, offset, count); return; }
                 creditReceived += count;
                 Prefetch p = active;
+                if (p != null && p.Channel == ch && p.ChannelClosed)
+                {
+                    // A late reply on a retired prefetch's channel, which in practice means the STATUS
+                    // answering the CLOSE that retiring sent. Nothing is owed on it -- retiring
+                    // requires Outstanding <= 0, so every READ has been answered -- and feeding it to
+                    // the framer would be actively harmful: a DATA would push BufEnd past EofOffset and
+                    // a STATUS would drive Outstanding negative, then retire a second time.
+                    //
+                    // No grant: the channel is closed, so a WINDOW frame would be upstream traffic the
+                    // agent discards. That leaves creditGranted below creditReceived, the harmless
+                    // direction, and the freeze note on Retained explains why.
+                    //
+                    // This is a RACE GUARD, not the normal path: ForgetPrefetchChannel means
+                    // PwsshEngine.OnData's FindPrefetch usually drops such a reply a level up. It is
+                    // reachable only when OnData resolved the channel under chanGate and then blocked
+                    // on `gate` while the client thread retired the prefetch. Do not delete it as dead.
+                    return;
+                }
                 if (p == null || p.Channel != ch)
                 {
                     // A late reply for a prefetch that has already been abandoned. Its credit
@@ -1486,9 +1556,16 @@ namespace Pwssh
                         HandlePrefetchReply(p, msgs[i]);
                         // A reply can abandon the prefetch part way through the feed. Carrying on
                         // would enqueue into a buffer nothing will ever read from.
-                        if (active != p) break;
+                        //
+                        // ChannelClosed has to be checked as well as `active`, because retiring no
+                        // longer changes `active` -- so without it this loop would keep feeding a
+                        // prefetch whose channel is gone: a DATA past EofOffset, a STATUS driving
+                        // Outstanding negative, and a second retirement.
+                        if (active != p || p.ChannelClosed) break;
                     }
-                    if (active == p) DrainWaiting(p);
+                    // Retiring already drained; doing it again would be harmless but the condition
+                    // has to agree with the loop's, or the two disagree about what `active` means.
+                    if (active == p && !p.ChannelClosed) DrainWaiting(p);
                 }
                 catch (Exception ex)
                 {
@@ -1541,11 +1618,17 @@ namespace Pwssh
         // Called as buffered bytes leave, whether to the client or to the bin. Every retained byte
         // passes through here exactly once, which is what keeps the balance honest -- releasing one
         // twice would turn a harmless over-grant into the under-grant that stalls for good.
-        internal void ReleasePrefetchCredit(int bytes)
+        // The prefetch is a parameter rather than read from `active`, and that is load-bearing rather
+        // than tidiness. A retired buffer can now be dropped while a NEW prefetch is being installed
+        // (OnClientOpen), and a stale read of `active` here would decrement the new prefetch's
+        // Retained -- after which GrantOwed computes owe = Received - Granted - Retained against an
+        // understated Retained and over-grants on a LIVE channel. That is the one direction the window
+        // exists to prevent, and it is what AgentSftpChannel.AddCredit logs as "the client granted
+        // more than it received". Passing p makes it unrepresentable.
+        private void ReleasePrefetchCredit(Prefetch p, int bytes)
         {
-            if (bytes <= 0) return;
-            Prefetch p = active;
-            if (p == null) return;                 // its channel is already closed; credit is moot
+            if (bytes <= 0 || p == null) return;
+            if (p.ChannelClosed) return;           // the channel is gone; see the freeze note on Retained
             p.Retained -= bytes;
             p.Granted += bytes;
             Grant(p.Channel, bytes);
@@ -1646,13 +1729,46 @@ namespace Pwssh
             // Reads issued past the end of the file are the normal way EOF is discovered, and
             // they cost a few bytes each rather than a chunk: the measured prefetchKiB for a
             // 2 MiB file was exactly 2048, so nothing beyond the file is ever transferred.
-            if ((p.Eof || p.Failed) && p.Outstanding <= 0) FinishPrefetch(p);
+            if ((p.Eof || p.Failed) && p.Outstanding <= 0) RetirePrefetch(p);
         }
 
-        // Closes our handle and channel once the file has been read through. The client's own
-        // handle is untouched: it has its own, and closes it when it chooses.
-        private void FinishPrefetch(Prefetch p)
+        // Closes our handle and channel once the file has been read through, and KEEPS THE BUFFER.
+        // The client's own handle is untouched: it has its own, and closes it when it chooses.
+        //
+        // The buffer outliving the fetch is the whole point. It used to be dropped here -- `active`
+        // was nulled, TryServeRead then refused, and every remaining client read was forwarded to the
+        // remote, fetching bytes we already held a second time. Measured on 8 MiB read in 128 KiB
+        // increments at the default depth: served=18, forwarded=111, the whole file prefetched and six
+        // sevenths of it fetched twice, with no counter showing it.
+        //
+        // Steps 1-3 are also the fix for a hang, which is the more serious half. This runs from inside
+        // OnPrefetchData's per-message loop; nulling `active` there made the loop break and skipped the
+        // DrainWaiting after it, and nothing else ever looked at p.Waiting again -- FinishPrefetch
+        // never replayed, and CheckParkDeadline reads `active`, so the backstop could not see the
+        // orphaned prefetch either. Any read parked at that instant was never answered and never
+        // forwarded, and SFTP has no timeout: the client waited for ever. Reachable at depth 1 on the
+        // EOF path, and at ANY depth once p.Failed stops Refill and the last in-flight reply retires.
+        private void RetirePrefetch(Prefetch p)
         {
+            // The loop can now reach this twice, because `active` no longer changes to stop it.
+            if (p.ChannelClosed) return;
+
+            // Everything the now-complete buffer can answer. Safe before the handle is released only
+            // because Refill returns on p.Eof || p.Failed, which retiring guarantees -- so the Refill
+            // at the tail of ServeFromBuffer cannot issue on a channel that is about to close.
+            DrainWaiting(p);
+
+            // Whatever the buffer could not answer goes to the remote after all. Only reachable on the
+            // Failed path: once Eof is proven, EofOffset is set and BufEnd has reached it, so every
+            // read is either satisfiable or answered EOF and nothing can still be parked. Always safe
+            // regardless -- a parked read was never forwarded, so the remote answers it exactly once.
+            if (p.Waiting.Count > 0) ReplayParked(p);
+
+            // A failed prefetch keeps nothing: TryServeRead refuses on Failed, so its buffer would
+            // serve nobody and only hold memory. Discarded here, before the close, so its credit still
+            // has a live channel to go back to.
+            if (p.Failed) DiscardBuffer(p);
+
             if (p.Handle != null)
             {
                 SshLikeWriter w = new SshLikeWriter();
@@ -1676,22 +1792,42 @@ namespace Pwssh
             // thing to rely on than "the frame loop already did it", for two lines.
             try { agent.CloseChannel(p.Channel); } catch (Exception) { }
             engine.ForgetPrefetchChannel(p.Channel);      // no DONE is coming now, so do it here
+            p.ChannelClosed = true;
 
-            // Released as the active prefetch immediately rather than when the remote's DONE
-            // eventually arrives. Waiting for that would be a round trip during which the next
-            // file's OPEN would find a prefetch still apparently running and skip its own --
-            // which is exactly the many-small-files case that needs the help most. Late replies
-            // for this channel are recognised and discarded by OnPrefetchData.
-            if (active == p) active = null;
+            // A failed prefetch is released as `active` outright; one that finished normally stays
+            // installed so its buffer can go on serving. Either way the NEXT file's OPEN is not
+            // blocked: OnClientOpen drops a retired buffer rather than returning early, which is what
+            // preserves the many-small-files case that needs the help most. Late replies on this
+            // channel -- the STATUS answering the CLOSE just sent -- are discarded by OnPrefetchData.
+            if (p.Failed && active == p) active = null;
         }
 
         // Gives up on the current prefetch without touching the client's stream. Safe at any
         // instant, which is the whole reason the fetching happens on a channel of its own.
+        //
+        // A null reason means "nothing went wrong": a finished prefetch whose buffer the client is
+        // simply done with. That case reaches here on every ordinary download, and "abandoned" once per
+        // file would read as a fault in every session log.
         private void AbandonPrefetch(string reason)
         {
             Prefetch p = active;
             if (p == null) return;
-            engine.LogInternal("sftp prefetch abandoned: " + reason);
+            if (reason != null) engine.LogInternal("sftp prefetch abandoned: " + reason);
+
+            // Bytes fetched that the client never asked for. Counted here rather than at the call
+            // sites because this is the single funnel through which a buffer is dropped, whichever
+            // path got here -- a CLOSE, a second OPEN, a backwards seek, a valve trip.
+            if (p.ChannelClosed)
+            {
+                long unread = p.BufEnd - p.BufStart;
+                if (unread > 0)
+                {
+                    unreadBytes += unread;
+                    engine.LogInternal("sftp prefetch buffer released with " + (unread / 1024)
+                        + " KiB the client never read");
+                }
+            }
+
             p.Failed = true;
 
             // Anything still parked must be let through rather than dropped, or the client waits
@@ -1699,8 +1835,17 @@ namespace Pwssh
             ReplayParked(p);
             DiscardBuffer(p);
 
-            try { agent.CloseChannel(p.Channel); } catch (Exception) { }
-            engine.ForgetPrefetchChannel(p.Channel);
+            // A retired prefetch has already released these. Closing a forgotten channel twice is
+            // harmless agent-side -- FindStream returns null and the frame is ignored -- but saying so
+            // once is better than relying on it at four call sites.
+            if (!p.ChannelClosed)
+            {
+                try { agent.CloseChannel(p.Channel); } catch (Exception) { }
+                engine.ForgetPrefetchChannel(p.Channel);
+            }
+            // Always cleared, whether the prefetch was fetching or merely serving: every caller of
+            // this -- the backwards seek, Trip, OnClientClose, the park deadline, a second OPEN --
+            // means "this buffer is finished with".
             active = null;
         }
 
@@ -1711,7 +1856,7 @@ namespace Pwssh
             while (p.Segs.Count > 0)
             {
                 Segment s = p.Segs.Dequeue();
-                ReleasePrefetchCredit(s.Count);
+                ReleasePrefetchCredit(p, s.Count);
             }
             p.BufStart = p.BufEnd;
         }
@@ -1742,7 +1887,12 @@ namespace Pwssh
             lock (gate)
             {
                 engine.ForgetPrefetchChannel(ch);
-                if (active != null && active.Channel == ch) active = null;
+                // NOT for a retired prefetch: this fires for a channel we closed deliberately, and
+                // nulling `active` here would silently throw away a buffer that is still serving the
+                // client. It is the one place that must leave `active` alone. Before the buffer
+                // outlived the fetch this could not run at all for a finished prefetch, because
+                // ForgetPrefetchChannel had already made the engine's lookup fail; now it can.
+                if (active != null && active.Channel == ch && !active.ChannelClosed) active = null;
                 if (metaStarted && ch == metaChannel)
                 {
                     // Speculation stops rather than being retried on a fresh channel: if the
@@ -1772,8 +1922,14 @@ namespace Pwssh
 
                 Prefetch p = active;
                 if (p == null) return;
-                try { agent.CloseChannel(p.Channel); } catch (Exception) { }
-                engine.ForgetPrefetchChannel(p.Channel);
+                // The guard is cosmetic rather than load-bearing: a retired prefetch has already
+                // released both, and closing a forgotten channel again is a no-op agent-side. It is
+                // here so the code says which state it is in rather than relying on that.
+                if (!p.ChannelClosed)
+                {
+                    try { agent.CloseChannel(p.Channel); } catch (Exception) { }
+                    engine.ForgetPrefetchChannel(p.Channel);
+                }
                 active = null;
             }
         }
