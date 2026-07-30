@@ -12,3 +12,9 @@ src/agent/bin/
 src/agent/obj/
 PwsshAgent.dll
 PwsshAgent.dll.srchash
+
+# Build and test output from tests/Pwssh.Tests. The two entries above are path-anchored to the
+# agent, so these are needed as well or a restore shows up as untracked noise.
+bin/
+obj/
+TestResults/

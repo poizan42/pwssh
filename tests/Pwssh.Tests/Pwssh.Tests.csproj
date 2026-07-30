@@ -1,0 +1,72 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Tests for the parts the stock OpenSSH client cannot reach.
+
+    Two layers. SSH.NET over a real loopback socket covers client behaviours `sftp` never produces,
+    a mid-transfer backwards seek above all. A frame-level driver covers SFTP packets the CLI has no
+    command for at all, with no SSH in the loop.
+
+    WHY THE PRODUCT SOURCES ARE COMPILED IN RATHER THAN REFERENCED
+
+    The interesting types are internal: SftpReadAhead, SftpFramer, AgentSftpChannel, PacketLayer.
+    Compiling the sources into this assembly reaches them with no InternalsVisibleTo, which matters
+    because the attribute would have to live in a file, and a new .cs file under src/agent/ would
+    change the agent source hash and invalidate every built and released PwsshAgent.dll.
+
+    THIS PROJECT IS NOT THE LANGUAGE GATE
+
+    It compiles the agent sources at LangVersion latest, so a C# 8+ construct accidentally added to
+    one of them would build here and fail only in tools/Build-Agent.ps1, which pins 7.3 for net48.
+    That is no worse than the status quo (the client compiles the same files with PowerShell 7's
+    Roslyn, which is just as permissive), but the csproj remains what catches you.
+  -->
+
+  <PropertyGroup>
+    <!--
+      Windows-specific because the agent P/Invokes kernel32 throughout and uses WindowsIdentity.
+      Built with the 10.0.302 SDK and run on the 8.0 runtime; 8.0 also matches what release.yml pins.
+    -->
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>Pwssh.Tests</RootNamespace>
+    <AssemblyName>Pwssh.Tests</AssemblyName>
+    <!--
+      Deliberately NOT TreatWarningsAsErrors: the agent csproj owns that judgement for the product
+      sources, and this project compiles them under a different TFM and language version.
+    -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      The same 14 files the client compiles (pwssh-connect.ps1). The glob is non-recursive, which
+      matches Get-PwsshAgentFiles in src/PwsshCommon.ps1 and so naturally skips bin/ and obj/.
+      tools/PwsshTcpHost.cs is excluded on purpose: PwsshTestHost replaces it, because TcpHost.Run
+      cannot be stopped and writes unconditionally to Console.Error.
+    -->
+    <Compile Include="..\..\src\agent\*.cs" />
+    <Compile Include="..\..\src\PwsshEngine.cs" />
+    <Compile Include="..\..\src\PwsshSftpReadAhead.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <!--
+      Two independent reasons for this floor, both load-bearing.
+
+      2024.0.0 is the first release with hmac-sha2-256-etm@openssh.com, and pwssh offers exactly that
+      one MAC with no non-ETM framing in the packet layer to fall back to.
+
+      2025.1.0 is the first with ShellStream.ChangeWindowSize, which is the only public route to a
+      window-change request; before it, that request could only be reached through the non-public
+      ChannelSession, and the resize path had to stay manually verified.
+    -->
+    <PackageReference Include="SSH.NET" Version="2025.1.0" />
+  </ItemGroup>
+
+</Project>

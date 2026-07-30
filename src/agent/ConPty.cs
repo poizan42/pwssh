@@ -207,29 +207,54 @@ namespace Pwssh
         // Probes once: the export must exist AND a pseudoconsole must actually be creatable.
         // The second half matters because this runs inside a service-session host with no
         // console of its own.
+        //
+        // The result is computed into a local and published only at the end, which is load-bearing
+        // rather than style. Assigning `available = 0` up front and raising it to 1 on success
+        // publishes "no ConPTY here" for the whole duration of the probe, so a second thread arriving
+        // in that window takes the early return and reports conpty=0 in its HELLO -- and pty-req is
+        // then refused for that connection with nothing wrong. It is reachable: PwsshAgentHost.Start
+        // calls this per connection and the dev host serves each connection on its own thread, so two
+        // clients connecting together race. Found by the xUnit pty tests, whose readiness probe opens
+        // a throwaway connection immediately before the real one.
+        //
+        // Two threads may now both probe, which is harmless: the probe has no side effects that
+        // outlive it and both compute the same answer, so publishing is idempotent.
         public static bool IsAvailable()
         {
             if (available >= 0) return available == 1;
-            available = 0;
+
+            int result = 0;
             try
             {
                 IntPtr k = GetModuleHandle("kernel32.dll");
-                if (k == IntPtr.Zero || GetProcAddress(k, "CreatePseudoConsole") == IntPtr.Zero) return false;
+                if (k == IntPtr.Zero || GetProcAddress(k, "CreatePseudoConsole") == IntPtr.Zero)
+                {
+                    available = 0;
+                    return false;
+                }
 
                 IntPtr inR, inW, outR, outW, hPC;
-                if (!CreatePipe(out inR, out inW, IntPtr.Zero, 0)) return false;
+                if (!CreatePipe(out inR, out inW, IntPtr.Zero, 0))
+                {
+                    available = 0;
+                    return false;
+                }
                 if (!CreatePipe(out outR, out outW, IntPtr.Zero, 0))
                 {
-                    CloseHandle(inR); CloseHandle(inW); return false;
+                    CloseHandle(inR); CloseHandle(inW);
+                    available = 0;
+                    return false;
                 }
                 COORD sz; sz.X = 1; sz.Y = 1;
                 int hr = CreatePseudoConsole(sz, inR, outW, 0, out hPC);
                 CloseHandle(inR); CloseHandle(outW);
-                if (hr == 0) { ClosePseudoConsole(hPC); available = 1; }
+                if (hr == 0) { ClosePseudoConsole(hPC); result = 1; }
                 CloseHandle(inW); CloseHandle(outR);
             }
-            catch (Exception) { available = 0; }
-            return available == 1;
+            catch (Exception) { result = 0; }
+
+            available = result;
+            return result == 1;
         }
 
         private IntPtr hPC = IntPtr.Zero;
