@@ -91,11 +91,26 @@ function Invoke-Ssh {
     $p.StandardInput.BaseStream.Flush()
     $p.StandardInput.BaseStream.Close()
 
-    if (-not $p.WaitForExit(180000)) { try { $p.Kill() } catch {}; throw 'ssh timed out' }
+    if (-not $p.WaitForExit(180000)) {
+        # Kill first, which closes the pipes and lets the reader tasks complete, then report what
+        # ssh had managed to say. A bare 'ssh timed out' names neither the case nor the reason, and
+        # the stderr it discards is usually the whole diagnosis.
+        try { $p.Kill() } catch { }
+        $so = ''
+        try { if ($errTask.Wait(5000)) { $so = $errTask.Result } } catch { }
+        $tail = (($so -split "`r?`n") | Where-Object { $_ -match '\S' } | Select-Object -Last 6) -join ' | '
+        throw ("ssh timed out after 180s; stderr tail: " + $tail)
+    }
     # Bounded deliberately. ssh having exited does not guarantee the stdout pipe is closed -- a
     # surviving grandchild can hold it -- and an unbounded Wait() here turns one stuck case into a
     # run that stops producing output altogether, which is far harder to diagnose than a failure.
     if (-not $outTask.Wait(30000)) { throw 'ssh exited but its stdout never closed' }
+    # Bounded for exactly the same reason, and it was not. The ProxyCommand inherits ssh's stderr
+    # handle, and ssh only TerminateProcesses it on its own clean exit paths -- so a surviving
+    # proxy holds this pipe open and `.Result` blocks for ever. That is worse than the stdout case
+    # it sits next to: there is no timeout to trip and no message, so the whole run simply stops
+    # mid-case with no output and nothing to attribute it to. Two runs were lost to it.
+    if (-not $errTask.Wait(30000)) { throw 'ssh exited but its stderr never closed' }
     $null = $errTask.Result
 
     [pscustomobject]@{
@@ -693,8 +708,16 @@ try {
         (New-Object System.Random 20260728).NextBytes($payload)
         $want = Get-Sha $payload
 
-        $bulkPort = Get-FreePort
+        # Get-FarSidePort, not Get-FreePort: this one is bound on the REMOTE, and an ephemeral
+        # local pick lands in 49152-65535, large parts of which Windows reserves -- so the bind
+        # fails there while looking perfectly free here. The service port below really is local,
+        # so it stays on Get-FreePort. Missed when Get-FarSidePort was introduced for the other
+        # -R cases, and it presents as a 180 s timeout rather than as a bind error.
+        $bulkPort = Get-FarSidePort
         $bulkService = Get-FreePort
+        # Named because a -R failure is otherwise impossible to attribute afterwards: the remote
+        # port and the local one fail for entirely different reasons.
+        Write-Host ("        reverse bulk: remote -R {0} -> local service {1}" -f $bulkPort, $bulkService) -ForegroundColor DarkGray
         $bsvc = [powershell]::Create().AddScript({
                 param($port, $bytes)
                 $l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $port)
@@ -709,19 +732,57 @@ try {
                 }
                 finally { $l.Stop() }
             }).AddArgument($bulkService).AddArgument($payload)
-        $null = $bsvc.BeginInvoke()
-        Start-Sleep -Milliseconds 400
+        $bulkHandle = $bsvc.BeginInvoke()
+        # Wait for the listener to actually accept rather than sleeping and hoping. 400 ms is
+        # plenty on an idle machine and not always enough after the suite has been running for
+        # several minutes -- and when it is not, the failure lands on the far side as a connect to
+        # nothing, which used to present as a 180 s hang rather than as a setup problem.
+        # Asked of the OS rather than by connecting: the service accepts exactly one client, so a
+        # throwaway probe connection consumes the accept the forward needs and the payload is
+        # written to the probe's dead socket instead. That yields LEN=0 -- a clean EOF with no
+        # bytes -- which is a convincing-looking wrong answer rather than an obvious mistake.
+        # GetActiveTcpListeners, not Get-NetTCPConnection: the latter is a CIM call costing well
+        # over a second each time on a busy machine, so a hundred of them is minutes rather than
+        # the seconds this is meant to take. Measured here at 18 ms against 1326 ms for one call.
+        $bulkReady = $false
+        foreach ($i in 1..100) {
+            $listeners = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
+            if (@($listeners | Where-Object { $_.Port -eq $bulkService }).Count -gt 0) { $bulkReady = $true; break }
+            Start-Sleep -Milliseconds 50
+        }
+        # BeginInvoke swallows anything the runspace throws, so without this a failed listener is
+        # completely silent and only ever shows up as a missing payload.
+        #
+        # Indexed, never piped. Streams.Error is a PSDataCollection and it stays OPEN for as long
+        # as the runspace runs; enumerating an open one BLOCKS waiting for data that will never
+        # come, and here the runspace cannot finish until the forward it is waiting for completes
+        # -- which cannot happen while this line is holding up the ssh invocation that would carry
+        # it. `$bsvc.Streams.Error | ForEach-Object {...}` deadlocks the whole run, silently, with
+        # the case's own assertion never printing. Count and the indexer do not block.
+        $bulkErr = ''
+        for ($e = 0; $e -lt $bsvc.Streams.Error.Count; $e++) { $bulkErr += $bsvc.Streams.Error[$e].ToString() + ' ' }
+        Assert-That 'the local service for the reverse forward is listening' $bulkReady `
+            "port $bulkService never accepted; runspace errors: '$bulkErr'"
 
+        # The read loop is bounded. An unbounded one here is how this case used to hang for the
+        # full 180 s and report nothing at all: if the forward never delivers, Read blocks for
+        # ever, the far-side powershell never exits, and so neither does ssh. ReceiveTimeout turns
+        # that into a short, self-describing failure. The -R round-trip probe above was given the
+        # same treatment long ago; this one was missed.
         $bulkProbe = New-FarSideCommand @"
-`$c = New-Object System.Net.Sockets.TcpClient
-`$c.Connect('127.0.0.1', $bulkPort)
-`$s = `$c.GetStream()
-`$ms = New-Object System.IO.MemoryStream
-`$b = New-Object byte[] 65536
-while (`$true) { `$n = `$s.Read(`$b, 0, `$b.Length); if (`$n -le 0) { break }; `$ms.Write(`$b, 0, `$n) }
-`$c.Close()
-`$h = [System.Security.Cryptography.SHA256]::Create().ComputeHash(`$ms.ToArray())
-[Console]::Out.Write('LEN=' + `$ms.Length + ' SHA=' + [Convert]::ToBase64String(`$h))
+try {
+    `$c = New-Object System.Net.Sockets.TcpClient
+    `$c.Connect('127.0.0.1', $bulkPort)
+    `$c.ReceiveTimeout = 30000
+    `$s = `$c.GetStream()
+    `$ms = New-Object System.IO.MemoryStream
+    `$b = New-Object byte[] 65536
+    try { while (`$true) { `$n = `$s.Read(`$b, 0, `$b.Length); if (`$n -le 0) { break }; `$ms.Write(`$b, 0, `$n) } }
+    catch { [Console]::Out.Write('STALLED after ' + `$ms.Length + ' bytes: ' + `$_.Exception.Message); `$c.Close(); exit }
+    `$c.Close()
+    `$h = [System.Security.Cryptography.SHA256]::Create().ComputeHash(`$ms.ToArray())
+    [Console]::Out.Write('LEN=' + `$ms.Length + ' SHA=' + [Convert]::ToBase64String(`$h))
+} catch { [Console]::Out.Write('CONNECTFAILED: ' + `$_.Exception.Message) }
 "@
         $r = Invoke-Ssh -Command $bulkProbe -Extra @('-R', "${bulkPort}:127.0.0.1:$bulkService")
         $so = [System.Text.Encoding]::ASCII.GetString($r.Stdout)
@@ -1296,6 +1357,66 @@ quit
             ((Far-Link "$farDir${bs}lnkdir") -eq 'ABSENT||') `
             "$($r.Phase) err='$($r.Err -replace "`r?`n", ' | ')'"
     }
+
+    # ---- 10f. df, i.e. statvfs@openssh.com.
+    #
+    # The client renders the reply through its own fx2txt and formatting rather than showing the
+    # server's numbers raw, so this section asserts the shape of what a user sees; the eleven
+    # fields themselves are pinned in the xUnit suite where they are readable.
+    #
+    # Note there are three OpenSSH installs on the development machine -- System32's 9.5p2, Git for
+    # Windows' 9.7p1, and 10.0p2 under Program Files, which is the one PATH resolves for pwsh and
+    # therefore the one these cases actually exercise. All three carry the guard the -i case below
+    # depends on, but it is worth knowing which binary a result came from.
+    $r = Invoke-Sftp "df $farFwd`nquit`n" 'df'
+    Assert-That 'df succeeds' (($r.ExitCode -eq 0) -and -not $r.Hung) `
+        "$($r.Phase) err='$($r.Err -replace "`r?`n", ' | ')'"
+    # The negative is the one that proves the advertisement landed. If the VERSION reply omitted
+    # the extension, or advertised it as "1" -- which the client compares against "2" exactly --
+    # every positive assertion below would still hold on the header line alone.
+    Assert-That 'the client does not report the extension as missing' `
+        (($r.Out + $r.Err) -notmatch 'does not support statvfs') `
+        "out='$($r.Out -replace "`r?`n", ' | ')' err='$($r.Err -replace "`r?`n", ' | ')'"
+    Assert-That 'df prints a capacity table' `
+        (($r.Out -match 'Size\s+Used\s+Avail') -and
+         (@(($r.Out -split "`r?`n") | Where-Object { $_ -match '^\s*\d+\s+\d+\s+\d+\s+\d+\s+\d+%\s*$' }).Count -eq 1)) `
+        "out='$($r.Out -replace "`r?`n", ' | ')'"
+
+    # The suffix is two characters -- "820GB", not "820G" -- which is fmt_scaled's convention and
+    # not the one a df on Linux would print.
+    $r = Invoke-Sftp "df -h $farFwd`nquit`n" 'dfh'
+    Assert-That 'df -h scales the figures' `
+        (@(($r.Out -split "`r?`n") | Where-Object { $_ -match '^\s*\d+(\.\d+)?[KMGT]?B\s+\d+(\.\d+)?[KMGT]?B\s' }).Count -eq 1) `
+        "out='$($r.Out -replace "`r?`n", ' | ')'"
+
+    # Windows has no inode count, so the reply reports zero and the client prints ERR in the
+    # capacity column rather than dividing by it. This is the only place that decision is checked
+    # against the binary a user actually runs, rather than against the source of do_df -- and the
+    # failure it guards against is not a wrong number but the client dying on a division by zero.
+    $r = Invoke-Sftp "df -i $farFwd`nquit`n" 'dfi'
+    Assert-That 'df -i reports unknown inodes without dividing by zero' `
+        ((($r.ExitCode -eq 0) -and -not $r.Hung) -and
+         ($r.Out -match 'Inodes\s+Used\s+Avail') -and ($r.Out -match 'ERR')) `
+        "$($r.Phase) exit=$($r.ExitCode) out='$($r.Out -replace "`r?`n", ' | ')'"
+
+    # The virtual root is a listing of drive letters we invent, not a filesystem, so it is refused.
+    #
+    # The refusal cannot be asserted on the client's output, because there is none: do_df calls
+    # sftp_statvfs with quiet=1, so a server-side failure status prints NOTHING at all and the
+    # message our server takes care to word is never shown to an sftp user. (It does reach a
+    # library client and `-vvv`.) What is observable is the batch behaviour: unprefixed, the
+    # failure aborts the run before `pwd`, which is what these two cases pin between them.
+    $r = Invoke-Sftp "df /`npwd`nquit`n" 'dfroot'
+    Assert-That 'df on the virtual root is refused' `
+        (($r.ExitCode -ne 0) -and ($r.Out -notmatch 'Remote working directory')) `
+        "$($r.Phase) exit=$($r.ExitCode) out='$($r.Out -replace "`r?`n", ' | ')'"
+
+    # And with the '-' prefix that suppresses the abort, everything after it still runs -- so the
+    # refusal costs the connection nothing.
+    $r = Invoke-Sftp "-df /`npwd`nquit`n" 'dfroot2'
+    Assert-That 'the session survives a refused df' `
+        ((($r.ExitCode -eq 0) -and -not $r.Hung) -and ($r.Out -match 'Remote working directory: /[A-Za-z]:/')) `
+        "$($r.Phase) exit=$($r.ExitCode) out='$($r.Out -replace "`r?`n", ' | ')'"
 
     # ---- 11. scp, which speaks SFTP on OpenSSH 9.x and so comes free with the subsystem.
     # -p additionally exercises SETSTAT/FSETSTAT: without them scp reports failure on a file it

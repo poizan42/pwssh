@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns the remote's `DOMAIN\user`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite runs 81–91 cases per transport, and both are green: **WinRM 91/91, loopback 81/81**. A second suite, `tests/Pwssh.Tests`, adds **46 xUnit cases** for what the stock client cannot ask for — a mid-transfer backwards seek, raw SFTP packets, every symlink case, and the first automated coverage of pty, `window-change` and `signal`; see *The SSH.NET test project*. Loopback needs the dev host started with its own console, or the pty case fails on a harness artifact rather than a pwssh bug — see *Running and testing*. The two runs differ in composition rather than count — WinRM has the graceful-degradation and IPv6 cases plus the gateway-ports check; loopback has the wrong-username check that the WinRM alias takes from `ssh_config`, along with the reverse-forward release and bind-failure cases that need the far side to be this machine.
+**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns the remote's `DOMAIN\user`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite runs 89–99 cases per transport, and both are green: **WinRM 99/99, loopback 89/89**. A second suite, `tests/Pwssh.Tests`, adds **55 xUnit cases** for what the stock client cannot ask for — a mid-transfer backwards seek, raw SFTP packets, every symlink case, and the first automated coverage of pty, `window-change` and `signal`; see *The SSH.NET test project*. Loopback needs the dev host started with its own console, or the pty case fails on a harness artifact rather than a pwssh bug — see *Running and testing*. The two runs differ in composition rather than count — WinRM has the graceful-degradation and IPv6 cases plus the gateway-ports check; loopback has the wrong-username check that the WinRM alias takes from `ssh_config`, along with the reverse-forward release and bind-failure cases that need the far side to be this machine.
 
 **A run that fails one case with `exit=255` is usually a flake, not a regression.** 255 is ssh's own error code for a connection that never came up, and it turns up after the remote has been hammered with dozens of sessions in a row. Re-run the case before believing it: the final WinRM run here failed "shell exit status propagates" that way and passed 3/3 immediately afterwards.
 
@@ -17,9 +17,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The throughput gain is WinRM's own compression, which an encrypted stream made useless. The same suite reports **0.31 MiB/s for an incompressible 8 MiB payload** — essentially identical to what the old architecture managed on *compressible* data, which is exactly what the mechanism predicts and a good confirmation of it.
 
-Implemented: version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, `none` auth with username matching, session channel, `exec`, `shell`, `pty-req` via ConPTY, `window-change`, `signal`, `direct-tcpip` forwarding (`-L`/`-D`/`-W`, IPv4 and IPv6), `tcpip-forward` + `forwarded-tcpip` reverse forwarding (`-R`, loopback by default, `-GatewayPorts` to widen), the `sftp` subsystem (version 3, and therefore `scp`), paths past `MAX_PATH` via `\\?\` and Win32, rekeying, exit status, stderr as `CHANNEL_EXTENDED_DATA`, window management, credit-based flow control to the agent, `SYMLINK`/`READLINK`.
+Implemented: version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, `none` auth with username matching, session channel, `exec`, `shell`, `pty-req` via ConPTY, `window-change`, `signal`, `direct-tcpip` forwarding (`-L`/`-D`/`-W`, IPv4 and IPv6), `tcpip-forward` + `forwarded-tcpip` reverse forwarding (`-R`, loopback by default, `-GatewayPorts` to widen), the `sftp` subsystem (version 3, and therefore `scp`), paths past `MAX_PATH` via `\\?\` and Win32, rekeying, exit status, stderr as `CHANNEL_EXTENDED_DATA`, window management, credit-based flow control to the agent, `SYMLINK`/`READLINK`, `statvfs@openssh.com` (`df`).
 
-Not implemented: `statvfs@openssh.com` (`sftp`'s `df`), strict KEX (deliberately — see *Rekeying*).
+Not implemented: `expand-path@openssh.com` and `users-groups-by-id@openssh.com` (the only two extension names the client knows and we do not answer), strict KEX (deliberately — see *Rekeying*).
 
 **The host key is now purely ceremonial.** It authenticates this proxy, not the remote machine — nothing about it crosses the link. It still has to be stable, because the client pins it in `known_hosts`.
 
@@ -192,6 +192,45 @@ Implementation points that are easy to get wrong:
 - **Modes are `0644`/`0755`**, not the reference's `0600`/`0700`, so that `scp -p` onto a Linux box does not land everything mode 600. A judgement call, and commented as one. Never derived from ACLs: a per-entry lookup during a 5,600-entry readdir is unaffordable.
 - **`SetErrorMode(SEM_FAILCRITICALERRORS)`** once per process, and the virtual root does not stat the drives it lists — the reference does not either. Reaching an empty card reader otherwise raises the "no disk" dialog, which in a session with no desktop means the call blocks.
 - **Handle ids are never reused**, so a stale handle gets `FAILURE` instead of silently addressing a different file. Handles are disposed in three places (`CLOSE`, the worker's `finally`, `Kill`) because a leaked `FileStream` holds an NTFS lock until `wsmprovhost` exits — worse than a leaked port, since the user's next attempt fails on their own file.
+
+#### Disk free space (`statvfs@openssh.com`)
+
+`sftp`'s `df` works, along with `df -h` and `df -i`. Both halves of the documented pair are implemented — `statvfs@openssh.com` takes a path, `fstatvfs@openssh.com` takes a handle — even though no CLI command sends the second; answering half of a pair is an odd thing to advertise, and it cost five lines.
+
+**Advertised at `"2"`, not `"1"`.** The client compares the value against `"2"` *exactly* before it will use either extension, so `"1"` reads to it as no support at all — and the symptom is the same `Server does not support statvfs@openssh.com extension` you get from advertising nothing, against a server that implements it perfectly. Asserted in the suite for that reason.
+
+**This is the first SFTP feature here with no reference server to copy.** Every other convention in this section was settled by driving `C:\Windows\System32\OpenSSH\sftp-server.exe` over a pipe with `sftp -D`. That does not work here: the Microsoft port compiles statvfs under `HAVE_STATVFS`, which Windows does not have, so their server does not implement it either. The format therefore comes from OpenSSH's `PROTOCOL`, and the numbers are checked against `DriveInfo` — a weaker oracle, and the test says so, because `DriveInfo` is `GetDiskFreeSpaceEx` underneath and so shares its source.
+
+| field | source |
+|---|---|
+| `f_bsize`, `f_frsize` | `GetDiskFreeSpaceW`: sectors-per-cluster × bytes-per-sector |
+| `f_blocks` | `GetDiskFreeSpaceExW` `TotalNumberOfBytes` ÷ frsize |
+| `f_bfree` | `TotalNumberOfFreeBytes` ÷ frsize, **clamped** |
+| `f_bavail` | `FreeBytesAvailableToCaller` ÷ frsize |
+| `f_files`, `f_ffree`, `f_favail` | 0 |
+| `f_fsid` | volume serial |
+| `f_flag` | `ST_RDONLY` from `FILE_READ_ONLY_VOLUME`, `ST_NOSUID` always |
+| `f_namemax` | `lpMaximumComponentLength`, 255 |
+
+**`f_bfree` is clamped to `f_blocks`, and without it a quota'd volume prints garbage.** `GetDiskFreeSpaceEx` reports its *total* as what the calling user may use — quota-limited — while its *free* figure is the whole disk and is not. Left alone, a small quota on a mostly-empty volume gives `f_bfree` above `f_blocks`, and the client computes Used as `f_blocks - f_bfree` in unsigned 64-bit, which underflows to an astronomical number rather than erroring. Quotas turn up on managed domain machines, i.e. exactly this project's population. Neither test machine has one, so the clamp is reasoned rather than demonstrated; it costs nothing on an unquota'd volume. Note the consequence that remains: **`f_blocks` is the caller's quota'd total, not the filesystem size** POSIX means. That is the only figure this API family offers.
+
+**Inode counts are zero, and that is the honest answer rather than a shortcut.** Windows has no inode concept; the nearest thing is the MFT record count, which is NTFS-only and needs a raw volume handle — admin on the remote, so out of scope on principle. Zero is what POSIX means by *unknown* and what Linux btrfs actually reports, so any client that copes with an ordinary btrfs server copes with this. Confirmed in OpenSSH at both `V_9_5_P1` and `V_9_7_P1`: `do_df` guards the division and prints `ERR` in the capacity column. The suite asserts that `ERR` against the running binary, because a division by zero would kill the user's client rather than print a wrong number.
+
+**Exactly eleven fields, and the strictness is one-directional.** `get_decode_statvfs` calls `fatal_fr()` on a field it cannot read — so a reply one field short *kills the user's `sftp.exe`* rather than reporting an error — while it ignores anything trailing. The frame-level parser in the tests therefore refuses a reply with trailing bytes as well as a short one.
+
+**Geometry from `GetDiskFreeSpaceW`, every byte count from the `Ex` form.** That call also reports cluster *counts*, and they must not be used: they are `DWORD`s, so they overflow on a large enough volume, and they are quota-adjusted as well. Sectors-per-cluster × bytes-per-sector is immune to both. If it fails outright the block size falls back to **1**, which keeps the capacity figures exact while claiming nothing about allocation — a judgement call, and it also guarantees the division is never by zero.
+
+**The `\\?\` prefix is carried through all four calls rather than stripped**, so `Win32Fs` keeps one path convention and the existing suite exercises the extended route. Probed rather than assumed: `C:\` against `\\?\C:\` for all three volume queries, on this client and on the net48 remote, byte-identical every time. `GetVolumePathNameW` returns a *prefixed* root for prefixed input, which is what makes that matter.
+
+Two more things about `GetVolumePathNameW`. Its output buffer is sized from the *input*, not fixed at `MAX_PATH`: one character short and the call **succeeds** but drops the trailing backslash, which `GetVolumeInformationW` then rejects; anything shorter fails outright. And it **succeeds on a path that does not exist**, handing back the root — measured, `\\?\C:\no-such-dir-xyz\deeper` → `\\?\C:\` — which is why `DoStatVfs` stats the path first. Without that, `df` on a typo would confidently describe the volume.
+
+**`f_namemax` is 255, and that is not a contradiction of the long-path work.** `LongPathsEnabled` and the `\\?\` prefix raise the limit on a whole *path*; the limit on a single *component* is unchanged.
+
+**`DoFStatVfs` deliberately omits the `h.File == null` guard** that every other handle-taking request uses. Those all read or write bytes; this one does not, and a directory is a perfectly ordinary thing to ask which filesystem it is on. Inheriting that line by copying the request next door is the bug the directory-handle test exists to catch.
+
+**`df /` is refused, and the user sees nothing at all.** `/` here is a listing of drive letters the server invents rather than a filesystem, so there are no honest numbers for it. The refusal is a choice rather than a necessity — the client's guard means a reply of zeroes would print `ERR` — but a fabricated table is worse than a failure. The sharp edge, found by the suite rather than by reading: **`do_df` calls `sftp_statvfs` with `quiet=1`**, so a server-side failure status prints *nothing*, and the message the server takes care to word is never shown to an `sftp` user. It does reach a library client and `-vvv`. What the suite pins instead is the batch behaviour — unprefixed, the failure aborts the run before the next command; with `-`, everything after it still works.
+
+**A `df` mid-session discards the read-ahead's held metadata**, because `EXTENDED` lands in `PwsshSftpReadAhead`'s catch-all invalidation. Left alone deliberately: `posix-rename` and `fsync` are `EXTENDED` too and genuinely do change things, so the type cannot be exempted wholesale — it would have to be exempted by *name*, which means parsing the name in the path every bulk transfer goes through, to save a couple of round trips on a command a user types once.
 
 #### Symlinks, and the elevation claim that was wrong
 
@@ -486,6 +525,20 @@ pwsh -NoProfile -File .\tests\Invoke-PwsshTests.ps1 -Target pwssh-test -Port 0 -
 
 A single manual call: `ssh -F tmp/ssh_config pwssh-test whoami`. Add `-Diagnostics` to the ProxyCommand for stderr progress, which is off by default because ssh shows a ProxyCommand's stderr in the user's terminal on every connection.
 
+**Run the suite from a shell whose PATH finds the WINDOWS OpenSSH client, not Git for Windows'.** This is the single most expensive trap found so far: launching the suite from Git Bash — or from anything that inherits its PATH, including a `pwsh` started by it — resolves `sftp` to `/usr/bin/sftp`, the MSYS build. That build treats a drive-letter path as **relative**, so the harness's `C:/Users/.../scratch` is joined to the remote working directory and every request goes to `/C:/Users/kb/C:/Users/kb/...`. The first `put` fails and takes about thirty cases with it, all of them looking like a server-side path regression. Measured directly, same command against the same remote:
+
+| client | `ls C:/Users/kb/AppData/Local/Temp/x` |
+|---|---|
+| `C:\Program Files\OpenSSH\sftp.exe` (10.0p2) | works |
+| `C:\Windows\System32\OpenSSH\sftp.exe` (9.5p2) | works |
+| `/usr/bin/sftp` (Git for Windows, MSYS) | **doubles the path and fails** |
+
+The Windows builds special-case `X:/…` as absolute; the MSYS build does not. Nothing in the failure output points at the client, so check `(Get-Command sftp).Source` before believing a path regression.
+
+**Never pipe a live `PSDataCollection`, including `$ps.Streams.Error`.** Enumerating one BLOCKS until the collection is closed, and a runspace's error stream stays open for as long as the runspace runs — so `$svc.Streams.Error | ForEach-Object {...}` on a still-running background service deadlocks the whole run, silently, with the case's own assertion never printing. It looks exactly like a transport hang and it is not. `.Count` and the indexer do not block; use those. This cost several 20-minute runs and three wrong diagnoses before the block was timed in isolation, which located it immediately: runspace creation 8 ms, `BeginInvoke` 2 ms, readiness poll 122 ms, then nothing.
+
+**Check which `ssh`/`sftp` a run actually used before trusting a client-behaviour claim.** This machine has three OpenSSH installs and they are not the same version: `C:\Windows\System32\OpenSSH` is 9.5p2, Git for Windows ships 9.7p1 and shadows it inside Git Bash, and `C:\Program Files\OpenSSH` is 10.0p2 — which is what PATH resolves for `pwsh`, and therefore what the suite runs. Anything settled by reading strings out of a binary has to come from that one. Note `strings` defaults to a 4-character minimum, which hides the 3-character `ERR` the `df -i` case depends on; use `strings -n 3`.
+
 **To compare against the reference SFTP server, no sshd required.** Windows ships `sftp-server.exe` even on machines with no SSH service, and `sftp -D` drives it over a pipe with SSH entirely out of the loop:
 
 ```powershell
@@ -520,7 +573,7 @@ The failing run's VT stream is the tell: it emits `ESC[?9001l ESC[?1004l` immedi
 
 ### The SSH.NET test project
 
-`tests/Pwssh.Tests` exists because the PowerShell suite is driven entirely through the stock OpenSSH client, and a client cannot ask for what it has no command for. **46 tests, ~39 s**, `dotnet test tests/Pwssh.Tests`. It needs no dev host and no DLL — it compiles the product sources in and hosts the engine itself.
+`tests/Pwssh.Tests` exists because the PowerShell suite is driven entirely through the stock OpenSSH client, and a client cannot ask for what it has no command for. **55 tests, ~37 s**, `dotnet test tests/Pwssh.Tests`. It needs no dev host and no DLL — it compiles the product sources in and hosts the engine itself.
 
 ```powershell
 dotnet test tests\Pwssh.Tests\Pwssh.Tests.csproj
@@ -529,7 +582,7 @@ dotnet test tests\Pwssh.Tests\Pwssh.Tests.csproj
 Two layers, and the second is the more valuable one:
 
 - **SSH.NET over a real loopback socket**, for client *behaviours* `sftp` never produces: a mid-transfer backwards seek above all. `PwsshTestHost` is a near-copy of `TcpHost.Serve` with four differences — port 0 with the assigned port readable, a stop path, captured engine log lines, and bounded waits in teardown. `TcpHost.Run` itself cannot be reused: it is an unstoppable `while (true)` accept loop whose listener is a local variable, and it never exposes the port it got.
-- **A frame-level SFTP driver** (`AgentSftpDriver`), which sends a `SUBSYSTEM` frame and then raw SFTP packets straight to `PwsshAgentHost`. No SSH, no engine, no round trips — **7 to 70 ms per test** against seconds for the SSH.NET ones. This is what reaches a forged handle, an unknown extension name, an `INIT` claiming version 6, and the one-reply-per-request invariant; several of those code paths had never executed. It is also where the symlink cases that no client can reach live: `sftp` has no `readlink` command at all, and it renders a status through its own `fx2txt` rather than showing the server's *message* — so the tag parsing, the argument order and the text naming the three privilege routes are assertable only from here. The nine cases in the PowerShell suite cover the other half, which is the part only a real client produces: the reversed wire order of `SSH_FXP_SYMLINK`.
+- **A frame-level SFTP driver** (`AgentSftpDriver`), which sends a `SUBSYSTEM` frame and then raw SFTP packets straight to `PwsshAgentHost`. No SSH, no engine, no round trips — **7 to 70 ms per test** against seconds for the SSH.NET ones. This is what reaches a forged handle, an unknown extension name, an `INIT` claiming version 6, and the one-reply-per-request invariant; several of those code paths had never executed. The same goes for `statvfs`: the frame-level cases are the only place the eleven reply fields are readable at all, since `df` prints a formatted table, and `fstatvfs` has no CLI command whatsoever. It is also where the symlink cases that no client can reach live: `sftp` has no `readlink` command at all, and it renders a status through its own `fx2txt` rather than showing the server's *message* — so the tag parsing, the argument order and the text naming the three privilege routes are assertable only from here. The nine cases in the PowerShell suite cover the other half, which is the part only a real client produces: the reversed wire order of `SSH_FXP_SYMLINK`.
 
 **Compiling the sources in rather than referencing an assembly** is what makes `SftpReadAhead`, `SftpFramer`, `AgentSftpChannel` and `PacketLayer` reachable with no `InternalsVisibleTo` — which matters because that attribute would need a file, and a new `.cs` under `src/agent/` would change the agent source hash and invalidate every built and released DLL. Confirmed safe: `Build-Agent.ps1 -CheckOnly` still reports `current` with the project in place.
 
