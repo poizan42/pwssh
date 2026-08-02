@@ -211,7 +211,22 @@ namespace Pwssh
                 switch (type)
                 {
                     case FrameType.EXEC:
-                        StartChannel(ch, ShellPath() + " /c " + Frame.PayloadText(frame));
+                        {
+                            // `scp -f` / `scp -t` is the legacy scp protocol, which every client
+                            // except OpenSSH 9.x's own scp still speaks -- and which normally needs
+                            // an scp binary on the remote, exactly what this project promises not
+                            // to require. Serve it here instead of spawning anything.
+                            //
+                            // A pty pending on the channel means a human ran `ssh -t host "scp ..."`
+                            // rather than a client driving the protocol; they should get the shell's
+                            // error, not a byte stream in their terminal.
+                            string command = Frame.PayloadText(frame);
+                            ScpCommand scp;
+                            bool ptyPending;
+                            lock (chanGate) { ptyPending = pendingPty.ContainsKey(ch); }
+                            if (!ptyPending && ScpCommand.TryParse(command, out scp)) StartScp(ch, scp, command);
+                            else StartChannel(ch, ShellPath() + " /c " + command);
+                        }
                         break;
 
                     case FrameType.SHELL:
@@ -443,6 +458,27 @@ namespace Pwssh
                 streams[ch] = c;
             }
             Log("sftp subsystem on channel " + ch);
+            c.Start();
+        }
+
+        private void StartScp(uint ch, ScpCommand scp, string command)
+        {
+            AgentScpChannel c = new AgentScpChannel(this, ch, scp);
+            lock (chanGate)
+            {
+                if (streams.ContainsKey(ch))
+                {
+                    Send(Frame.MakeText(FrameType.FAIL, ch, "channel already in use"));
+                    return;
+                }
+                streams[ch] = c;
+                // The pty request is dropped as StartChannel would have dropped it, so a stale
+                // entry cannot outlive the channel.
+                pendingPty.Remove(ch);
+            }
+            // Logged because it is the only agent-side evidence that the command was served here
+            // rather than by an scp.exe the remote happened to have.
+            Log("scp " + (scp.Sink ? "sink" : "source") + " on channel " + ch + ": " + command);
             c.Start();
         }
 
