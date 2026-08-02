@@ -861,9 +861,17 @@ namespace Pwssh
             {
                 m = new Meta();
                 m.Size = h.File != null ? h.File.Length : 0;
+                // The times must come from the same file the size did. The handle was opened
+                // following links, so a path lookup here would mix the target's size with the LINK's
+                // timestamps for any file reached through one -- invisible until links could exist.
                 Win32Fs.Info info;
                 if (Win32Fs.TryGetInfo(h.WinPath, out info))
                 {
+                    if (info.IsReparsePoint)
+                    {
+                        try { info = Win32Fs.GetInfoFollowingLinks(h.WinPath); }
+                        catch (Exception) { }
+                    }
                     m.MtimeUtc = info.WriteUtc; m.AtimeUtc = info.AccessUtc;
                 }
             }
@@ -1273,7 +1281,21 @@ namespace Pwssh
 
         private Meta Describe(string winPath, bool followLinks)
         {
-            return FromWin32(Win32Fs.GetInfo(winPath), followLinks);   // throws if absent
+            Win32Fs.Info info = Win32Fs.GetInfo(winPath);              // throws if absent
+
+            // GetFileAttributesExW does not traverse a reparse point, so for STAT -- which is meant
+            // to answer about the TARGET -- it reports the link's own size (zero for a directory
+            // link) and the link's own timestamps. Suppressing the link bit was the only difference
+            // STAT and LSTAT used to express, which was fine while no link could be created here and
+            // wrong the moment one could: `ls -l` and a download's progress both read from this.
+            //
+            // Only reparse points pay for the second call. Two consequences, both correct and both
+            // new: a dangling link's STAT now fails with NO_SUCH_FILE, as POSIX stat does; and a tag
+            // whose target cannot be opened at all -- a WSL symlink, say -- now errors where it used
+            // to return the link's own attributes.
+            if (followLinks && info.IsReparsePoint) info = Win32Fs.GetInfoFollowingLinks(winPath);
+
+            return FromWin32(info, followLinks);
         }
 
         private static Meta RootMeta()

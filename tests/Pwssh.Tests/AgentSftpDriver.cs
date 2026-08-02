@@ -202,6 +202,18 @@ namespace Pwssh.Tests
             return msg[0];
         }
 
+        /// <summary>The size an ATTRS reply carries, or -1 when it carries none.</summary>
+        public static long SizeOf(byte[] msg)
+        {
+            if (msg[0] != SftpTypeByte.Attrs)
+                throw new InvalidDataException("expected ATTRS, got type " + msg[0]);
+            Reader r = new Reader(msg, 1);
+            r.UInt32();                                  // request id
+            uint flags = r.UInt32();
+            if ((flags & 0x1) == 0) return -1;
+            return ((long)r.UInt32() << 32) | r.UInt32();
+        }
+
         /// <summary>
         /// Whether an ATTRS reply's permission word carries S_IFLNK. Layout is
         /// type, id, flags, [size], [uid, gid], [permissions], [atime, mtime] — the optional fields
@@ -262,6 +274,7 @@ namespace Pwssh.Tests
             public const byte Init = 1;
             public const byte Version = 2;
             public const byte Read = 5;
+            public const byte Stat = 17;
             public const byte Lstat = 7;
             public const byte Attrs = 105;
             public const byte Realpath = 16;

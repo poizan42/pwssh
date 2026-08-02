@@ -118,6 +118,99 @@ namespace Pwssh.Tests
             }
         }
 
+        // ---------------------------------------------------------------- stat vs lstat
+
+        [Fact]
+        public void Stat_on_a_directory_junction_succeeds_and_reports_a_directory()
+        {
+            // MANDATORY, and it exists to catch one specific omission. STAT now re-opens a reparse
+            // point to describe its target, and CreateFileW refuses to open a DIRECTORY at all
+            // without FILE_FLAG_BACKUP_SEMANTICS -- so leaving that flag out would make STAT start
+            // failing on every junction on the machine, and nothing else in either suite touches a
+            // reparse point to notice.
+            string junction = Path.Combine(
+                Path.GetPathRoot(Environment.GetFolderPath(Environment.SpecialFolder.Windows)),
+                @"Users\Default User");
+            if (!Directory.Exists(junction))
+            {
+                output.WriteLine("no stock junction on this machine, nothing to assert");
+                return;
+            }
+
+            using (AgentSftpDriver d = Started())
+            {
+                uint sid = d.NextId();
+                d.Send(AgentSftpDriver.OneString(AgentSftpDriver.SftpTypeByte.Stat, sid, Wire(junction)));
+                byte[] statReply = d.Receive();
+                Assert.Equal(AgentSftpDriver.SftpTypeByte.Attrs, AgentSftpDriver.TypeOf(statReply));
+                // Following the link means describing the directory it points at, so no link bit.
+                Assert.False(AgentSftpDriver.IsSymlinkMode(statReply),
+                    "STAT reported a link, so it did not follow");
+
+                // LSTAT must be unchanged: its link bit is what stops a recursive get walking into
+                // AppData\Local\Application Data for ever.
+                uint lid = d.NextId();
+                d.Send(AgentSftpDriver.OneString(AgentSftpDriver.SftpTypeByte.Lstat, lid, Wire(junction)));
+                Assert.True(AgentSftpDriver.IsSymlinkMode(d.Receive()),
+                    "LSTAT stopped reporting the link bit, which is the recursion guard");
+            }
+        }
+
+        [Fact]
+        public void Stat_through_a_symlink_reports_the_targets_size()
+        {
+            // The user-visible half: before this, STAT returned the link's own size -- zero -- so
+            // `ls -l` and a download's progress meter were both wrong for anything reached by a link.
+            string target = Path.Combine(dir, "sized.txt");
+            File.WriteAllText(target, new string('x', 4242));
+            string link = Path.Combine(dir, "sized-link");
+            if (!CanCreateLinks())
+            {
+                output.WriteLine("cannot create links here; the resolution half is covered elsewhere");
+                return;
+            }
+            Pwssh.Win32Fs.CreateSymbolicLink(link, target, false);
+
+            using (AgentSftpDriver d = Started())
+            {
+                uint sid = d.NextId();
+                d.Send(AgentSftpDriver.OneString(AgentSftpDriver.SftpTypeByte.Stat, sid, Wire(link)));
+                Assert.Equal(4242L, AgentSftpDriver.SizeOf(d.Receive()));
+
+                // And LSTAT still describes the link itself.
+                uint lid = d.NextId();
+                d.Send(AgentSftpDriver.OneString(AgentSftpDriver.SftpTypeByte.Lstat, lid, Wire(link)));
+                Assert.True(AgentSftpDriver.IsSymlinkMode(d.Receive()));
+            }
+        }
+
+        [Fact]
+        public void Stat_on_a_dangling_link_reports_no_such_file()
+        {
+            // Correct POSIX behaviour -- stat on a dangling link is ENOENT -- and a change from the
+            // old behaviour, which described the link itself.
+            if (!CanCreateLinks())
+            {
+                output.WriteLine("cannot create links here");
+                return;
+            }
+            string link = Path.Combine(dir, "points-nowhere");
+            Pwssh.Win32Fs.CreateSymbolicLink(link, Path.Combine(dir, "absent.txt"), false);
+
+            using (AgentSftpDriver d = Started())
+            {
+                uint sid = d.NextId();
+                d.Send(AgentSftpDriver.OneString(AgentSftpDriver.SftpTypeByte.Stat, sid, Wire(link)));
+                AgentSftpDriver.Status s = AgentSftpDriver.ParseStatus(d.Receive());
+                Assert.Equal(AgentSftpDriver.StatusCode.NoSuchFile, s.Code);
+
+                // LSTAT still answers, because the link itself is perfectly real.
+                uint lid = d.NextId();
+                d.Send(AgentSftpDriver.OneString(AgentSftpDriver.SftpTypeByte.Lstat, lid, Wire(link)));
+                Assert.True(AgentSftpDriver.IsSymlinkMode(d.Receive()));
+            }
+        }
+
         // ---------------------------------------------------------------- argument order
 
         [Fact]

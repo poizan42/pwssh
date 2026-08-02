@@ -49,10 +49,12 @@ namespace Pwssh
         {
             int find = Marshal.SizeOf(typeof(FindData));
             int attrs = Marshal.SizeOf(typeof(FileAttributeData));
-            if (find != 592 || attrs != 36)
+            int byHandle = Marshal.SizeOf(typeof(ByHandleFileInformation));
+            if (find != 592 || attrs != 36 || byHandle != 52)
                 throw new InvalidOperationException(
                     "Win32Fs struct layout is wrong: WIN32_FIND_DATAW is " + find + " bytes (expected 592), " +
-                    "WIN32_FILE_ATTRIBUTE_DATA is " + attrs + " bytes (expected 36)");
+                    "WIN32_FILE_ATTRIBUTE_DATA is " + attrs + " bytes (expected 36), " +
+                    "BY_HANDLE_FILE_INFORMATION is " + byHandle + " bytes (expected 52)");
         }
 
         // Observability. A long path taking the extended route is otherwise invisible from either
@@ -104,6 +106,10 @@ namespace Pwssh
         [return: MarshalAs(UnmanagedType.U1)]
         private static extern bool CreateSymbolicLinkW(string link, string target, uint flags);
 
+        [DllImport("kernel32.dll", SetLastError = true, EntryPoint = "GetFileInformationByHandle")]
+        private static extern bool GetFileInformationByHandle(SafeFileHandle handle,
+                                                              out ByHandleFileInformation info);
+
         [DllImport("kernel32.dll", SetLastError = true, EntryPoint = "DeviceIoControl")]
         private static extern bool DeviceIoControl(SafeFileHandle handle, uint code,
                                                    IntPtr inBuf, int inSize,
@@ -151,6 +157,24 @@ namespace Pwssh
             public long LastWriteTime;
             public uint SizeHigh;
             public uint SizeLow;
+        }
+
+        // Pack = 4 for the same reason as the two below: every member is 4-byte aligned natively,
+        // and letting the CLR 8-align the long fields would insert padding after Attributes and shift
+        // everything behind it.
+        [StructLayout(LayoutKind.Sequential, Pack = 4)]
+        private struct ByHandleFileInformation
+        {
+            public uint Attributes;
+            public long CreationTime;
+            public long LastAccessTime;
+            public long LastWriteTime;
+            public uint VolumeSerialNumber;
+            public uint SizeHigh;
+            public uint SizeLow;
+            public uint NumberOfLinks;
+            public uint FileIndexHigh;
+            public uint FileIndexLow;
         }
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode, Pack = 4)]
@@ -342,6 +366,43 @@ namespace Pwssh
         {
             if (SetFileAttributesW(Extended(fullPath), attributes)) return;
             throw Error(Marshal.GetLastWin32Error(), fullPath);
+        }
+
+        /// <summary>
+        /// The information for what a path ultimately names, following any reparse point. Only worth
+        /// calling when GetInfo already said IsReparsePoint: GetFileAttributesExW does not traverse,
+        /// so it reports the link's own (zero) size and the link's own timestamps.
+        /// </summary>
+        public static Info GetInfoFollowingLinks(string fullPath)
+        {
+            // FILE_READ_ATTRIBUTES rather than GENERIC_READ, because cloud placeholders are reparse
+            // points too and a read request would recall their contents over the network.
+            // BACKUP_SEMANTICS because most reparse points on Windows are directories, and CreateFileW
+            // refuses to open one without it -- omit it and STAT starts failing on every junction.
+            // No OPEN_REPARSE_POINT, which is the whole point: this opens the target.
+            SafeFileHandle h = CreateFileW(Extended(fullPath), FILE_READ_ATTRIBUTES, FILE_SHARE_ALL,
+                                           IntPtr.Zero, OPEN_EXISTING,
+                                           FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero);
+            if (h.IsInvalid)
+            {
+                int err = Marshal.GetLastWin32Error();
+                h.Dispose();
+                throw Error(err, fullPath);
+            }
+            try
+            {
+                ByHandleFileInformation bhfi;
+                if (!GetFileInformationByHandle(h, out bhfi))
+                    throw Error(Marshal.GetLastWin32Error(), fullPath);
+
+                Info info = new Info();
+                info.Attributes = bhfi.Attributes;
+                info.Size = ((long)bhfi.SizeHigh << 32) | (uint)bhfi.SizeLow;
+                info.WriteUtc = FromFileTime(bhfi.LastWriteTime);
+                info.AccessUtc = FromFileTime(bhfi.LastAccessTime);
+                return info;
+            }
+            finally { h.Dispose(); }
         }
 
         // ---- links ----
