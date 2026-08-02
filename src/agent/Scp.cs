@@ -549,7 +549,13 @@ namespace Pwssh
                 // Our own status byte for the body, then their verdict. Two bytes, opposite
                 // directions, in that order -- reversing them is a mutual wait.
                 if (readError == null) SendOk(); else Warn(name + ": " + readError);
-                return ReadAck() || true;
+
+                // Their verdict on the file. It is read because the protocol requires it -- leaving
+                // the byte unread would make it the first character of the next record -- but a
+                // refusal here does not stop the transfer: ReadAck has already counted it, and
+                // whether to continue is the next entity's business, not this one's.
+                ReadAck();
+                return true;
             }
             finally { try { f.Dispose(); } catch (Exception) { } }
         }
@@ -726,8 +732,10 @@ namespace Pwssh
             }
 
             // Their status byte for the body comes first, then our verdict. Skipping this read
-            // leaves the byte to be mistaken for the next record's first character.
-            bool theirs = ReadAck();
+            // leaves the byte to be mistaken for the next record's first character. A failure
+            // reported here is already counted by ReadAck; it does not change what we write back,
+            // because our verdict is about whether WE stored the bytes.
+            ReadAck();
 
             try { open.Dispose(); } catch (Exception ex) { if (writeError == null) writeError = ex.Message; }
             open = null;
@@ -740,8 +748,7 @@ namespace Pwssh
             }
 
             if (writeError != null) Warn(name + ": " + writeError);
-            else if (theirs) SendOk();
-            else SendOk();                               // their error is already counted
+            else SendOk();
         }
 
         // ---- helpers ----

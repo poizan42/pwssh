@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns the remote's `DOMAIN\user`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite runs 89–99 cases per transport, and both are green: **WinRM 99/99, loopback 89/89**. A second suite, `tests/Pwssh.Tests`, adds **55 xUnit cases** for what the stock client cannot ask for — a mid-transfer backwards seek, raw SFTP packets, every symlink case, and the first automated coverage of pty, `window-change` and `signal`; see *The SSH.NET test project*. Loopback needs the dev host started with its own console, or the pty case fails on a harness artifact rather than a pwssh bug — see *Running and testing*. The two runs differ in composition rather than count — WinRM has the graceful-degradation and IPv6 cases plus the gateway-ports check; loopback has the wrong-username check that the WinRM alias takes from `ssh_config`, along with the reverse-forward release and bind-failure cases that need the far side to be this machine.
+**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns the remote's `DOMAIN\user`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite runs 99–109 cases per transport, and both are green: **WinRM 109/109, loopback 99/99**. A second suite, `tests/Pwssh.Tests`, adds **102 xUnit cases** for what the stock client cannot ask for — a mid-transfer backwards seek, raw SFTP packets, every symlink case, and the first automated coverage of pty, `window-change` and `signal`; see *The SSH.NET test project*. Loopback needs the dev host started with its own console, or the pty case fails on a harness artifact rather than a pwssh bug — see *Running and testing*. The two runs differ in composition rather than count — WinRM has the graceful-degradation and IPv6 cases plus the gateway-ports check; loopback has the wrong-username check that the WinRM alias takes from `ssh_config`, along with the reverse-forward release and bind-failure cases that need the far side to be this machine.
 
 **A run that fails one case with `exit=255` is usually a flake, not a regression.** 255 is ssh's own error code for a connection that never came up, and it turns up after the remote has been hammered with dozens of sessions in a row. Re-run the case before believing it: the final WinRM run here failed "shell exit status propagates" that way and passed 3/3 immediately afterwards.
 
@@ -17,7 +17,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The throughput gain is WinRM's own compression, which an encrypted stream made useless. The same suite reports **0.31 MiB/s for an incompressible 8 MiB payload** — essentially identical to what the old architecture managed on *compressible* data, which is exactly what the mechanism predicts and a good confirmation of it.
 
-Implemented: version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, `none` auth with username matching, session channel, `exec`, `shell`, `pty-req` via ConPTY, `window-change`, `signal`, `direct-tcpip` forwarding (`-L`/`-D`/`-W`, IPv4 and IPv6), `tcpip-forward` + `forwarded-tcpip` reverse forwarding (`-R`, loopback by default, `-GatewayPorts` to widen), the `sftp` subsystem (version 3, and therefore `scp`), paths past `MAX_PATH` via `\\?\` and Win32, rekeying, exit status, stderr as `CHANNEL_EXTENDED_DATA`, window management, credit-based flow control to the agent, `SYMLINK`/`READLINK`, `statvfs@openssh.com` (`df`).
+Implemented: version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, `none` auth with username matching, session channel, `exec`, `shell`, `pty-req` via ConPTY, `window-change`, `signal`, `direct-tcpip` forwarding (`-L`/`-D`/`-W`, IPv4 and IPv6), `tcpip-forward` + `forwarded-tcpip` reverse forwarding (`-R`, loopback by default, `-GatewayPorts` to widen), the `sftp` subsystem (version 3, and therefore `scp`), paths past `MAX_PATH` via `\\?\` and Win32, rekeying, exit status, stderr as `CHANNEL_EXTENDED_DATA`, window management, credit-based flow control to the agent, `SYMLINK`/`READLINK`, `statvfs@openssh.com` (`df`), the legacy scp protocol (`scp -O`, pscp, `ScpClient`).
 
 Not implemented: `expand-path@openssh.com` and `users-groups-by-id@openssh.com` (the only two extension names the client knows and we do not answer), strict KEX (deliberately — see *Rekeying*).
 
@@ -42,7 +42,7 @@ Nothing is written to the remote's disk, no service is reconfigured, no elevatio
 | Path | Role |
 |---|---|
 | `src/PwsshEngine.cs` | The SSH implementation — packet layer, KEX, cipher, MAC, auth, `SessionChannel`, plus `PwsshStdioBridge`. Runs on the **client** only. |
-| `src/agent/*.cs` | Everything the remote needs, plus the plumbing shared with the engine (`ByteChannel`, `FrameQueue`, `PwsshPump`, `Frame`). Twelve files: `Frames`, `ByteStream`, `Contracts`, `AgentProxy`, `AgentHost`, `ConPty`, `ProcessChannel`, `TcpChannel`, `Sftp`, `Win32Fs`, `Listener`, `Loopback`. |
+| `src/agent/*.cs` | Everything the remote needs, plus the plumbing shared with the engine (`ByteChannel`, `FrameQueue`, `PwsshPump`, `Frame`). Thirteen files: `Frames`, `ByteStream`, `Contracts`, `AgentProxy`, `AgentHost`, `ConPty`, `ProcessChannel`, `TcpChannel`, `Sftp`, `Scp`, `Win32Fs`, `Listener`, `Loopback`. |
 | `src/agent/PwsshAgent.csproj` | Builds those into the net48 DLL that gets pushed to the remote. **This is the only compiler that matters for the agent's language level** — see *The agent is a prebuilt assembly*. |
 | `src/PwsshCommon.ps1` | Client-only helpers: compilation with an on-disk cache, the agent-DLL lookup and staleness check, host key keystore. |
 | `src/Start-PwsshAgent.ps1` | Runs on the remote: loads the pushed assembly and shuttles frames. No crypto, no host key, no compiler. Must stay a *simple* script — see the parameter-binding trap below. |
@@ -169,7 +169,7 @@ Measured: 512 KiB through a reverse forward is bit-exact, in ~1.1 s on loopback.
 
 ### SFTP subsystem
 
-`sftp` works, and so does **`scp`** — which had no working path at all before, because scp 9.x speaks SFTP and its `-O` fallback needs `scp.exe` on the remote, exactly what a pwssh target does not have. `scp`, `scp -r` and `scp -p` all work with no scp-specific code.
+`sftp` works, and so does **`scp`** — which had no working path at all before, because scp 9.x speaks SFTP and its `-O` fallback needs `scp.exe` on the remote, exactly what a pwssh target does not have. `scp`, `scp -r` and `scp -p` all work over this subsystem with no scp-specific code. The `-O` fallback, and every client that is not OpenSSH 9.x, take a different route entirely — see *The legacy scp protocol*.
 
 The server is **version 3, implemented in the agent** (`AgentSftpChannel`), reached through a `subsystem` channel request and one new frame, `SUBSYSTEM` (0x0F). Everything else reuses the existing channel frames: an SFTP subsystem is exactly a bidirectional byte stream that ends in an exit status, which `DATA`/`OUT`/`EOF`/`CLOSE`/`WINDOW`/`EXIT`/`DONE` already carry.
 
@@ -421,6 +421,118 @@ Also considered and dropped: caching attributes from `READDIR` replies. It helps
 
 **The archive trick still beats all of this** for a large tree, and the README should keep saying so: ~3 round trips per file remain, so a 40-file tree is still on the order of a minute.
 
+### The legacy scp protocol
+
+`scp -O` works, and so do PuTTY's `pscp`, SSH.NET's `ScpClient`, JSch, paramiko's `SCPClient` and any OpenSSH before 9.0.
+
+Until this existed, `scp` worked here only by accident of version. OpenSSH 9.x's `scp` speaks **SFTP**, which pwssh implements; every other client speaks the original rcp-over-ssh protocol, and for that the client execs `scp -f <path>` or `scp -t <path>` **as a remote command** — which needs an `scp` binary on the remote, exactly what a pwssh target is defined not to have. `AgentScpChannel` serves that protocol in the agent instead, so nothing is installed and nothing is spawned.
+
+**Interception is in the `EXEC` frame** (`AgentHost.cs`), before the command is concatenated into `cmd.exe /c`. Recognition is narrow: the first token, after unquoting, must be exactly `scp`, and the flags must include `-f` or `-t`. Two guards on top of that:
+
+- **A pending `pty-req` suppresses it.** scp clients never ask for a terminal, so a pty means a human typed `ssh -t host "scp -f x"` and should get the shell's error rather than a byte stream in their terminal.
+- **An unknown flag does not fall through.** Falling back to the shell would run the remote's own `scp.exe` wherever one is installed, which puts behaviour back to depending on what the target happens to have — the thing serving this ourselves exists to avoid. The channel starts and reports the bad flag.
+
+**Everything about the wire format was measured, not read.** `scp -f` and `scp -t` are pure stdin/stdout programs, so both halves of the reference can be driven over pipes with no SSH in the loop — the same trick `sftp -D` gave for SFTP, and worth re-running before changing any of this:
+
+```powershell
+printf '\0\0\0\0' | & 'C:\Program Files\OpenSSH\scp.exe' -f somefile
+```
+
+That yields `C0666 853 NuGet.config\n`, the raw bytes, then a trailing `\0`; `-pf` prepends `T<mtime> 0 <atime> 0\n`; `-rf` wraps entries in `D0777 0 <name>\n` … `E\n`. Driving `scp -t <dir>` the other way settles the sink. **Two of those measurements contradicted the design and are the reason this works at all:**
+
+- **`E` at depth 0 is *accepted*, not refused** — the reference acks it and ends. Refusing would have made pwssh stricter than the implementation it clones, breaking clients for no benefit.
+- **The byte after a file body is the *source's* own status**, and only then does the sink answer with its verdict. Two bytes, opposite directions. Reversing them is a mutual wait — both sides read, and it hangs.
+
+**Every control record is acknowledged individually, including `T`.** Treating `T` and the `C` that follows it as one unit runs the whole transfer an ack behind: it works perfectly until the first error, and then reads message text as status bytes. An ack is one byte — `\0` ok, `\1` error + message + `\n`, `\2` fatal — never a bare zero, and a `\1` in reply to a `C` line means **skip: the body must not be sent** (measured: a real source then aborts rather than moving to the next file).
+
+**The size in a `C` line is a contract.** Once it is out, exactly that many bytes must follow. If the file shrinks or a read fails part way, pad to the promised count and report the failure in the trailing status byte; truncating desynchronises everything after it, and a bit-exactness check on a single file would not notice.
+
+**Downloads echo back the name the client asked for, not the on-disk casing.** Since 8.0 the client `fnmatch`es every incoming name against its own request and that match is **case-sensitive** — so `scp -O host:File.TXT .` opens quite happily on NTFS but is rejected as an attempted spoof if the reply says `file.txt`. Globs are expanded case-insensitively, which is what a Windows user means, and then filtered to names that *also* match case-sensitively, because a name the client did not ask for aborts the transfer rather than being skipped.
+
+**Wildcards are expanded server-side at all**, which a real scp never does — it relies on the remote *shell* to have expanded them before scp is executed, and there is no shell in this path. Only the last component, and only `*` and `?`.
+
+**Recursive downloads skip reparse points.** `C:\Users\All Users` is a symlink and `AppData\Local\Application Data` points at its own parent, so following them recurses until the client's own 64-level limit stops it. Same protection READDIR's LSTAT semantics give a recursive `sftp get`.
+
+#### Measured: bulk downloads are 1.5x faster than SFTP
+
+Source mode streams the body with **no per-chunk acknowledgement** — no request ramp, no round
+trip per read. That is exactly the pathology the SFTP read-ahead exists to mitigate, and it simply
+does not arise here. Interleaved, three rounds, medians, 32 MiB compressible over WinRM, every
+transfer hashed (`tools/Measure-ScpVsSftp.ps1`):
+
+| 32 MiB download | median | |
+|---|---|---|
+| `scp -O` | 5,559 ms | **5.76 MiB/s** |
+| `sftp` (read-ahead on) | 8,495 ms | 3.77 MiB/s |
+
+**1.53x, and the direction was consistent across all three rounds** — which matters on a link
+whose run-to-run variance has inverted conclusions twice before.
+
+**The harness's third column is not a usable ceiling, and the number it produces should be
+ignored.** It runs `cmd /c type <file>`, which routes the whole payload through cmd.exe's own I/O
+and measured 3.72 MiB/s — slower than either file protocol, and nothing like the 6.76 MiB/s this
+file records for `exec` at 32 MiB, which was produced by a different generator. `type` is a
+bottleneck in its own right, so it bounds nothing. Left in the script because a broken reference
+that is labelled as broken is more useful than a missing one; do not quote it.
+
+**Per-file cost is a different story, and the arithmetic says so before any measurement.** The `C`
+record must be acknowledged before the body may flow, and that ack cannot be pipelined — a ``
+there means "skip this file", so the source genuinely cannot start sending. That is 2 round trips
+per file, 3 with `-p`, against SFTP's ~3. Comparable, not better. The README's advice to tar a large
+tree and move one archive applies to `scp -O` exactly as it does to `sftp`.
+
+**The many-small-files figure is NOT yet measured properly**, and the first attempt is worth
+recording as a warning rather than a result. It reported medians of 50,634 ms for `scp -O -r`
+against 4,965 ms for `sftp get -r` — a ten-fold difference that would have been nonsense to
+publish, because three of its six runs transferred **zero files**: both variants in a round shared
+one destination directory, so the second landed on the first's leftovers and failed. The one
+genuinely paired round gave **52.7 s against 56.2 s**, which is the "comparable" the arithmetic
+predicts. `tools/Measure-ScpVsSftp.ps1` now uses a destination per round *and* per variant and
+counts a round only when the expected number of files arrived; re-run `-SmallFiles` to settle it.
+The lesson generalises: a timing for an incomplete transfer is not a timing, and a median will
+happily average it in.
+
+#### Upload filenames are the security boundary
+
+The names in `C` and `D` records come from the client, so sink mode is where a hostile or buggy peer could write outside the directory the user named. OpenSSH's own sink checks **empty, `/`, `.` and `..`** and stops there, because it is POSIX and has no drives, streams or backslashes to worry about. `ValidateEntryName` adds what Windows needs, and is applied to every record at every depth:
+
+| rejected | why |
+|---|---|
+| empty, `.`, `..` | the CVE-2018-20685 set, and OpenSSH's whole check |
+| `/` and `\` | either separator escapes or invents structure |
+| `:` | drive-absolute (`C:evil`), drive-relative, **and** NTFS alternate data streams (`f.txt:stream`, `f.txt::$DATA`) — one character, three doors |
+| control characters, `* ? " < > \|` | NTFS refuses most of these anyway; rejecting up front gives a better message |
+
+After joining, the path goes through `Normalize` — which trims trailing dots and spaces, and throws on a segment that trims to nothing — and then the result is re-checked to still sit under the target directory, `OrdinalIgnoreCase`. That last check is belt and braces, because `Normalize` pops `..` lexically. Reserved names (`CON`, `NUL`) stay ordinary files under `\\?\`, consistent with the settled SFTP decision. A symlink planted at the destination is followed, which is exactly what OpenSSH does — at parity, documented rather than fixed.
+
+**The target is not always a directory.** `scp -O f.txt host:C:/tmp/renamed.txt` sends `scp -t C:/tmp/renamed.txt`, and when the target is not an existing directory the received name is **ignored** and the body lands at the target path. Measured against the reference; implementing only the directory case breaks upload-with-rename, which is a very common command.
+
+#### Parsing the command line
+
+The command arrives as one raw string a POSIX shell would normally have split, so it is tokenised here — single quotes literal, double quotes escaping only before `"` `\` `` ` `` `$`. **With one deliberate deviation**: a bare backslash escapes only before space, tab, quote or backslash, and is an ordinary character everywhere else. POSIX rules would turn `C:\Users\kb\f.txt` into `C:Userskbf.txt`, and Windows paths are exactly what this project's users type.
+
+**Two client dialects, both of which must parse.** OpenSSH builds `scp%s%s%s%s` from `" -v"`, `" -r"`, `" -p"`, `" -d"` — **separate** flags, with `-- ` inserted only when the path starts with `-`. SSH.NET sends **bundled** flags and a **double-quoted** path: `scp -pf "…"`, `scp -prf "…"`. A parser handling only one form passes everything else and fails on exactly one client.
+
+`~` arrives verbatim, because a real remote's shell would have expanded it; `~` and `~/rest` map to the home directory and `~user` is refused.
+
+#### Why the tests are shaped the way they are
+
+**Both this machine and the test remote have `scp.exe` on PATH** — the remote has two. So if the agent failed to recognise the command, the exec would fall through to that binary and the transfer would succeed anyway: **an end-to-end test cannot tell a working implementation from a silent fall-through**, because both produce the right bytes.
+
+Two things address that. `tests/Pwssh.Tests/AgentScpDriver.cs` pushes an `EXEC` frame into a directly-constructed `PwsshAgentHost`, where no external binary can be involved — that is the load-bearing proof, and it is also the only route to what no client will send: a hostile filename, a `C` line whose size disagrees with the bytes after it, a nacked control record. And every error message carries a **`pwssh-scp:`** prefix, so the real-client cases have a discriminator too; a fall-through would say `scp:`.
+
+`\1` is used even for unrecoverable errors: measured, OpenSSH's own `run_err` never emits `\2`, and some third-party sinks handle it poorly.
+
+#### Flow control and teardown
+
+The channel reuses `ByteChannel` (`src/agent/ByteStream.cs`) for inbound bytes rather than growing another reassembler — `Write` copies and pulses without blocking, which the `IAgentStream` contract demands since it runs on the frame dispatch thread, while `ReadExact` blocks on the worker thread and throws `EndOfStreamException` at EOF. scp's framing is mode-dependent (a line, then exactly N bytes, then one byte), so a blocking reader is the natural fit where SFTP's self-delimiting messages needed a framer.
+
+**`Kill()` and `CloseWrite()` both close it**, and that is not tidiness: `ReadExact` waits with no timeout, so otherwise a client that dies mid-upload leaves a worker parked until the watchdog, holding an open `FileStream` — the NTFS-lock leak the SFTP section warns about. The worker's `finally` disposes any open handle, and the inbound queue carries the same `MAX_QUEUED` tripwire `AgentSftpChannel` has.
+
+Unlike `AgentSftpChannel`, which hard-codes exit 0, the scp channel tracks errors and reports a **real exit status** — OpenSSH's client ORs the remote status into its own, so `scp -O …; echo $?` depends on it.
+
+`RESIZE` and `SIGNAL` resolve through `as AgentChannel` and so no-op on an scp channel, exactly as they do for SFTP. Teardown comes from the `CLOSE` frame when ssh exits.
+
 ### Long paths (`Win32Fs` and the `\\?\` prefix)
 
 Paths past `MAX_PATH` work, up to Win32's ~32,767. `src/agent/Win32Fs.cs` replaces the managed file-system calls with `CreateFileW`, `GetFileAttributesExW`, `FindFirstFileW`, `CreateDirectoryW`, `RemoveDirectoryW`, `DeleteFileW`, `SetFileAttributesW` and `SetFileTime`, and **every path it hands to Win32 carries `\\?\`**.
@@ -573,7 +685,7 @@ The failing run's VT stream is the tell: it emits `ESC[?9001l ESC[?1004l` immedi
 
 ### The SSH.NET test project
 
-`tests/Pwssh.Tests` exists because the PowerShell suite is driven entirely through the stock OpenSSH client, and a client cannot ask for what it has no command for. **55 tests, ~37 s**, `dotnet test tests/Pwssh.Tests`. It needs no dev host and no DLL — it compiles the product sources in and hosts the engine itself.
+`tests/Pwssh.Tests` exists because the PowerShell suite is driven entirely through the stock OpenSSH client, and a client cannot ask for what it has no command for. **102 tests, ~35 s**, `dotnet test tests/Pwssh.Tests`. It needs no dev host and no DLL — it compiles the product sources in and hosts the engine itself.
 
 ```powershell
 dotnet test tests\Pwssh.Tests\Pwssh.Tests.csproj

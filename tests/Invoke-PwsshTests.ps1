@@ -1449,6 +1449,101 @@ quit
             "got $($dm.ToString('o')) want $($stamp.ToString('o'))"
     }
 
+    # ---- 11b. the LEGACY scp protocol, via scp -O.
+    #
+    # Everything in section 11 above rides SFTP, because OpenSSH 9.x's scp does. `-O` forces the
+    # original rcp-over-ssh protocol instead, which is what every other client speaks -- pscp,
+    # SSH.NET's ScpClient, JSch, paramiko, and OpenSSH before 9.0 -- and which normally requires an
+    # scp binary on the remote.
+    #
+    # These cases prove INTEROPERABILITY. They cannot by themselves prove the agent served the
+    # protocol, because both this machine and the test remote have a real scp.exe on PATH: had the
+    # command not been recognised, the exec would have fallen through to that binary and the
+    # transfer would have succeeded anyway. The `pwssh-scp:` message asserted below is the
+    # discriminator, and tests/Pwssh.Tests drives the protocol against a directly-constructed
+    # agent where no external binary can be involved at all.
+    $oScp = @('-O', '-p')
+
+    $r = Invoke-Scp ($oScp + @($localUp, "${scpTgt}:$farFwd/o-up.bin"))
+    Assert-That 'scp -O upload succeeds' (($r.ExitCode -eq 0) -and -not $r.Hung) `
+        "exit=$($r.ExitCode) err='$($r.Err -replace "`r?`n", ' | ')'"
+    Assert-That 'scp -O upload is bit-exact' ((Far-Hash "$farDir${bs}o-up.bin") -eq $wantHash) `
+        'far-side hash differs'
+
+    $oDown = Join-Path $repo "tmp/sftp-odown-$sftpTag.bin"
+    if (Test-Path -LiteralPath $oDown) { [System.IO.File]::Delete($oDown) }
+    $r = Invoke-Scp ($oScp + @("${scpTgt}:$farFwd/o-up.bin", $oDown))
+    $oh = if (Test-Path -LiteralPath $oDown) { Get-Sha ([System.IO.File]::ReadAllBytes($oDown)) } else { 'MISSING' }
+    Assert-That 'scp -O download is bit-exact' ($oh -eq $wantHash) `
+        "got $oh err='$($r.Err -replace "`r?`n", ' | ')'"
+
+    # -p on the legacy path exercises the T record, which is acknowledged on its own -- treating it
+    # and the following C record as one unit runs the whole transfer an ack behind.
+    if (Test-Path -LiteralPath $oDown) {
+        $odm = [System.IO.File]::GetLastWriteTimeUtc($oDown)
+        Assert-That 'scp -O -p preserves mtime' ([math]::Abs(($odm - $stamp).TotalSeconds) -lt 2) `
+            "got $($odm.ToString('o')) want $($stamp.ToString('o'))"
+    }
+
+    # The rename form: the target is not an existing directory, so the name in the C record is
+    # ignored and the body lands at the target path. Measured against the reference, and easy to
+    # get wrong by assuming the target is always a directory.
+    $r = Invoke-Scp ($oScp + @($localUp, "${scpTgt}:$farFwd/o-renamed.bin"))
+    Assert-That 'scp -O upload with rename lands at the target path' `
+        ((Far-Hash "$farDir${bs}o-renamed.bin") -eq $wantHash) 'far-side hash differs'
+
+    # A tree, which is the D/E nesting plus per-entry C records.
+    $mkTree = New-FarSideCommand @"
+New-Item -ItemType Directory -Path '$farDir${bs}otree${bs}inner' -Force | Out-Null
+[System.IO.File]::WriteAllText('$farDir${bs}otree${bs}top.txt', 'TOP')
+[System.IO.File]::WriteAllText('$farDir${bs}otree${bs}inner${bs}leaf.txt', 'LEAF')
+[Console]::Out.Write('ok')
+"@
+    $null = Invoke-Ssh -Command $mkTree
+    $oTreeDst = Join-Path $repo "tmp/sftp-otree-$sftpTag"
+    if ([System.IO.Directory]::Exists($oTreeDst)) { [System.IO.Directory]::Delete($oTreeDst, $true) }
+    New-Item -ItemType Directory -Path $oTreeDst -Force | Out-Null
+    $r = Invoke-Scp @('-O', '-r', "${scpTgt}:$farFwd/otree", $oTreeDst.Replace($bs, '/'))
+    $top = Join-Path $oTreeDst 'otree/top.txt'
+    $leaf = Join-Path $oTreeDst 'otree/inner/leaf.txt'
+    Assert-That 'scp -O -r brings the whole tree' `
+        ((Test-Path -LiteralPath $top) -and (Test-Path -LiteralPath $leaf) -and
+         ((Get-Content -LiteralPath $top -Raw) -eq 'TOP') -and ((Get-Content -LiteralPath $leaf -Raw) -eq 'LEAF')) `
+        "exit=$($r.ExitCode) err='$($r.Err -replace "`r?`n", ' | ')'"
+
+    # A wildcard. A real scp relies on the remote SHELL to expand this before scp ever sees it;
+    # there is no shell in that path here, so without server-side expansion it would look for a
+    # file literally named "*.txt".
+    $r = Invoke-Scp @('-O', "${scpTgt}:$farFwd/otree/$star.txt", $oTreeDst.Replace($bs, '/'))
+    Assert-That 'scp -O expands a wildcard the remote shell would have' `
+        ((Test-Path -LiteralPath (Join-Path $oTreeDst 'top.txt')) -and
+         ((Get-Content -LiteralPath (Join-Path $oTreeDst 'top.txt') -Raw) -eq 'TOP')) `
+        "exit=$($r.ExitCode) err='$($r.Err -replace "`r?`n", ' | ')'"
+
+    # A missing source, and the assertion that makes this section able to detect a fall-through:
+    # our own message prefix. A real scp.exe would say "scp: ...: No such file or directory".
+    $r = Invoke-Scp @('-O', "${scpTgt}:$farFwd/definitely-not-here.bin", (Join-Path $repo 'tmp').Replace($bs, '/'))
+    Assert-That 'scp -O reports a missing source, and it is OUR implementation reporting it' `
+        (($r.ExitCode -ne 0) -and ($r.Err -match 'pwssh-scp')) `
+        "exit=$($r.ExitCode) err='$($r.Err -replace "`r?`n", ' | ')'"
+
+    # A directory without -r is refused rather than silently producing nothing.
+    $r = Invoke-Scp @('-O', "${scpTgt}:$farFwd/otree", (Join-Path $repo 'tmp/never-dir.bin').Replace($bs, '/'))
+    Assert-That 'scp -O refuses a directory without -r' `
+        (($r.ExitCode -ne 0) -and ($r.Err -match 'not a regular file')) `
+        "exit=$($r.ExitCode) err='$($r.Err -replace "`r?`n", ' | ')'"
+
+    # Rekeying under the legacy protocol. The scp channel is an ordinary exec channel, so the
+    # existing send gate covers it -- cheap to prove, since a rekey never touches WinRM.
+    $r = Invoke-Scp @('-O', '-o', 'RekeyLimit=256K', "${scpTgt}:$farFwd/o-up.bin",
+                      (Join-Path $repo "tmp/sftp-orekey-$sftpTag.bin").Replace($bs, '/'))
+    $rkh = if (Test-Path -LiteralPath (Join-Path $repo "tmp/sftp-orekey-$sftpTag.bin")) {
+        Get-Sha ([System.IO.File]::ReadAllBytes((Join-Path $repo "tmp/sftp-orekey-$sftpTag.bin"))) } else { 'MISSING' }
+    Assert-That 'scp -O survives forced rekeys' ($rkh -eq $wantHash) `
+        "got $rkh err='$($r.Err -replace "`r?`n", ' | ')'"
+
+    if ([System.IO.Directory]::Exists($oTreeDst)) { [System.IO.Directory]::Delete($oTreeDst, $true) }
+
     # ---- 12. bulk, and the throughput number that keeps CLAUDE.md's table honest
     if (-not $SkipLarge) {
         $big = 8 * 1024 * 1024

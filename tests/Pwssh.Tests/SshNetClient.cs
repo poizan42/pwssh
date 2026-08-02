@@ -63,6 +63,19 @@ namespace Pwssh.Tests
             return c;
         }
 
+        /// <summary>
+        /// ScpClient speaks the LEGACY scp protocol, not SFTP, so this reaches an entirely
+        /// different server path from Sftp(...) above. It is also the only client available here
+        /// that sends the bundled flag form -- "scp -pf" and "scp -prf" -- and that double-quotes
+        /// the remote path, where OpenSSH sends separate flags and quotes nothing.
+        /// </summary>
+        public static ScpClient Scp(PwsshTestHost host, string user = null)
+        {
+            ScpClient c = new ScpClient(Info(host, user));
+            c.HostKeyReceived += Accept;
+            return c;
+        }
+
         private static void Accept(object sender, HostKeyEventArgs e)
         {
             e.CanTrust = true;

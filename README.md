@@ -29,14 +29,14 @@ the protocol itself.
 
 | | |
 |---|---|
-| Implemented | version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, session channels, `exec`, `shell`, `pty-req` (ConPTY), `window-change`, `signal`, port forwarding — `-L`, `-D`, `-W` and `-R`, IPv4 and IPv6 — **SFTP subsystem (and therefore `scp`)**, symlinks (`ln -s` and resolution), `df`, long paths, rekeying, exit status, separate stderr, flow control |
+| Implemented | version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, session channels, `exec`, `shell`, `pty-req` (ConPTY), `window-change`, `signal`, port forwarding — `-L`, `-D`, `-W` and `-R`, IPv4 and IPv6 — **SFTP subsystem (and therefore `scp`)**, symlinks (`ln -s` and resolution), `df`, **the legacy scp protocol** so `scp -O`, `pscp` and library clients work too, long paths, rekeying, exit status, separate stderr, flow control |
 | Not implemented | strict KEX (deliberately — Terrapin needs an attacker between `ssh.exe` and its own `ProxyCommand`) |
 
 Tested against OpenSSH 10.0p2 on Windows, with a Windows PowerShell 5.1 / .NET Framework 4.8
-remote. The test suite drives the real `ssh`, `sftp` and `scp` binaries: 99 cases over WinRM and
-89 against a loopback dev host, plus 55 xUnit cases for what no stock client can ask for.
+remote. The test suite drives the real `ssh`, `sftp` and `scp` binaries: 109 cases over WinRM and
+99 against a loopback dev host, plus 102 xUnit cases for what no stock client can ask for.
 
-Three warts worth knowing:
+Four things worth knowing — three warts and one pleasant surprise:
 
 - **`ln -s` depends on the remote account, not on pwssh.** Reading links always works. *Creating*
   one needs `SeCreateSymbolicLinkPrivilege` in a non-restricted token — which a domain admin
@@ -59,6 +59,13 @@ Three warts worth knowing:
   requests one at a time), and 0.76 MiB/s at 8 MiB, where fixed cost is most of the transfer.
   Uploads, at ~0.35 MiB/s, are already at the link's upstream ceiling. **Do not pass `sftp -B`**
   — it suppresses the buffer negotiation that keeps this from being far worse.
+
+- **For one big download, `scp -O` is the fastest thing here.** It uses the legacy scp protocol,
+  which streams the body with no per-chunk acknowledgement at all — no request ramp, nothing to
+  read ahead around. Measured interleaved over WinRM, 32 MiB, medians of three rounds:
+  **5.76 MiB/s against SFTP's 3.77, a 1.53×**. It is *not* a win for many small files, where the
+  per-file acknowledgement cannot be pipelined and it costs 2 round trips per file (3 with `-p`)
+  against SFTP's ~3 — for a tree, tar it and move one archive, exactly as with `sftp`.
 
 ## What it needs on the remote
 
