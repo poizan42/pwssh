@@ -356,15 +356,18 @@ namespace Pwssh
                 case SftpType.READDIR: DoReadDir(id, r.Text()); return;
                 case SftpType.CLOSE: DoClose(id, r.Text()); return;
 
-                // Refused on purpose, not merely absent. Creating a symlink needs
-                // SeCreateSymbolicLinkPrivilege, i.e. elevation, which this project does not
-                // use anywhere; and resolving one needs DeviceIoControl plus a reverse path
-                // mapping for no benefit, since the client skips links on a recursive get
-                // rather than following them.
-                case SftpType.SYMLINK:
-                case SftpType.READLINK:
-                    SendStatus(id, SftpStatus.OP_UNSUPPORTED, "links are not supported");
-                    return;
+                // The two paths arrive in the REVERSE of the order the draft specifies: target
+                // first, then the link. OpenSSH has done it that way since 2001 and every client
+                // and server follows it, so the draft is what misleads here, not any local
+                // convention -- hardlink@openssh.com's (existing, link) has the same shape.
+                //
+                // Getting it backwards is SILENT: the link is created with the two names swapped
+                // and nothing reports an error. Observed on the wire rather than taken from a
+                // spec -- `sftp -vvv` logs, verbatim:
+                //
+                //   Sending SSH2_FXP_SYMLINK "TARGETSTRING-aaa" to "/C:/LINKSTRING-bbb"
+                case SftpType.SYMLINK: DoSymlink(id, r.Text(), r.Text()); return;   // target, link
+                case SftpType.READLINK: DoReadLink(id, r.Text()); return;
 
                 case SftpType.SETSTAT: DoSetStat(id, r); return;
                 case SftpType.FSETSTAT: DoFSetStat(id, r); return;
@@ -634,7 +637,19 @@ namespace Pwssh
             // a directory; both need to be reported.
             Win32Fs.Info info;
             if (!Win32Fs.TryGetInfo(win, out info)) { SendStatus(id, SftpStatus.NO_SUCH_FILE, "no such file"); return; }
-            if (info.IsDirectory) { SendStatus(id, SftpStatus.FAILURE, "is a directory"); return; }
+            if (info.IsDirectory)
+            {
+                // A DIRECTORY symbolic link and a junction both carry the directory attribute, so
+                // refusing everything with that bit would mean `rm link` failing and only `rmdir
+                // link` working -- the opposite of POSIX, where rm removes any link.
+                //
+                // RemoveDirectory on a name surrogate unlinks the link and nothing else: it never
+                // touches the target and is never recursive, so the "rmdir means rmdir" guarantee
+                // one method up is untouched.
+                if (info.IsReparsePoint) { Win32Fs.RemoveDirectory(win); SendStatus(id, SftpStatus.OK, ""); return; }
+                SendStatus(id, SftpStatus.FAILURE, "is a directory");
+                return;
+            }
             Win32Fs.DeleteFile(win);
             SendStatus(id, SftpStatus.OK, "");
         }
@@ -686,6 +701,102 @@ namespace Pwssh
             SendStatus(id, SftpStatus.OK, "");
         }
 
+        // Creates a symbolic link. Both arguments are in WIRE order: target first. See the dispatch.
+        //
+        // Errors come back through the catch-all in Dispatch rather than an inline map, because
+        // Win32Fs.Error already produces the exception types StatusFor keys on -- and its message for
+        // ERROR_PRIVILEGE_NOT_HELD names the three routes to the privilege, which is the whole
+        // diagnostic a user gets.
+        private void DoSymlink(uint id, string targetPath, string linkPath)
+        {
+            // Checked before anything else, because ToWindows("") and ToWindows(".") both return the
+            // home directory: an unchecked empty target would silently create a link to the user's
+            // profile, and an empty link path would try to create one named it.
+            if (string.IsNullOrEmpty(linkPath)) { SendStatus(id, SftpStatus.BAD_MESSAGE, "empty link path"); return; }
+            if (string.IsNullOrEmpty(targetPath)) { SendStatus(id, SftpStatus.BAD_MESSAGE, "empty link target"); return; }
+
+            string link = ToWindows(linkPath);
+
+            // The target is STORED, not opened, so it does not go through ToWindows unless it is
+            // absolute. ToWindows would resolve a relative target against USERPROFILE -- not against
+            // the link's own directory, which is what relative means here -- and Normalize would
+            // upper-case the drive and trim trailing dots, so the link would not say what the client
+            // asked it to say. OpenSSH's client deliberately does not absolutize a symlink target
+            // either; only the link path is made absolute.
+            bool absolute = IsAbsoluteTarget(targetPath);
+            string target = absolute ? ToWindows(targetPath) : targetPath.Replace('/', '\\');
+
+            Win32Fs.CreateSymbolicLink(link, target, TargetLooksLikeDirectory(link, target, absolute));
+            SendStatus(id, SftpStatus.OK, "");
+        }
+
+        private static bool IsAbsoluteTarget(string p)
+        {
+            if (p.Length == 0) return false;
+            if (p[0] == '/' || p[0] == '\\') return true;
+            return p.Length >= 2 && char.IsLetter(p[0]) && p[1] == ':';
+        }
+
+        // Windows types a symlink at creation; POSIX does not, so the type has to be guessed from
+        // whatever the target names right now.
+        private static bool TargetLooksLikeDirectory(string linkWin, string targetWin, bool absolute)
+        {
+            string probe = targetWin;
+            if (!absolute)
+            {
+                // A relative target is relative to the LINK's directory, so that is what the probe
+                // resolves against -- and only the probe: the stored string stays as the client sent it.
+                int cut = linkWin.LastIndexOf('\\');
+                string parent = cut <= 2 ? linkWin.Substring(0, 2) + "\\" : linkWin.Substring(0, cut);
+                // Normalize is not optional here. TryGetInfo prefixes with \\?\, which disables the
+                // OS's own path handling, so a ".." left in the combined path is looked up as a
+                // directory literally named ".." -- the probe would then always say "absent", every
+                // relative target would fall through to the guess below, and a link to an existing
+                // DIRECTORY would be created file-typed and would not traverse.
+                try { probe = Normalize(parent + "\\" + targetWin); }
+                catch (Exception) { return EndsWithSeparator(targetWin); }
+            }
+
+            Win32Fs.Info info;
+            if (Win32Fs.TryGetInfo(probe, out info)) return info.IsDirectory;
+
+            // Dangling, which POSIX allows and Windows cannot represent without choosing. A trailing
+            // separator is the only hint the target string carries; otherwise assume a file, which is
+            // the commoner case and is recoverable -- the link can be removed and remade.
+            return EndsWithSeparator(targetWin);
+        }
+
+        private static bool EndsWithSeparator(string s)
+        {
+            return s.Length > 0 && (s[s.Length - 1] == '\\' || s[s.Length - 1] == '/');
+        }
+
+        private void DoReadLink(uint id, string path)
+        {
+            if (IsVirtualRoot(path)) { SendStatus(id, SftpStatus.FAILURE, "not a link: /"); return; }
+            string win = ToWindows(path);
+            // Cheap, and it reports an absent path as NO_SUCH_FILE for free rather than as a failure
+            // to open a handle.
+            Win32Fs.Info info = Win32Fs.GetInfo(win);
+            if (!info.IsReparsePoint) { SendStatus(id, SftpStatus.FAILURE, "not a link: " + path); return; }
+
+            bool relative;
+            string target = Win32Fs.ReadLink(win, out relative);
+            SendName(id, LinkTargetToSftp(target, relative));
+        }
+
+        // The one place ToSftp is not enough, because it prepends a slash: doing that to a relative
+        // target would turn "../a" into "/../a" and change what the link says.
+        private static string LinkTargetToSftp(string target, bool relative)
+        {
+            if (relative) return target.Replace('\\', '/');
+            if (target.Length >= 2 && char.IsLetter(target[0]) && target[1] == ':') return ToSftp(target);
+            // A volume GUID path, or UNC. Reported honestly with separators converted rather than
+            // refused or mangled: the link really does say this, and ToWindows will reject it cleanly
+            // if anyone tries to use it.
+            return target.Replace('\\', '/');
+        }
+
         // ---- namespace ----
 
         private void DoRealPath(uint id, string path)
@@ -696,12 +807,23 @@ namespace Pwssh
 
             // Deliberately does NOT require the path to exist: sftp put and every scp upload
             // realpath a destination that is not there yet, so failing here breaks all uploads.
+            //
+            // Note this stays purely lexical -- it never resolves a link. That matches the reference,
+            // and it is what keeps realpath idempotent.
+            SendName(id, canonical);
+        }
+
+        // A one-entry NAME reply, which is what both REALPATH and READLINK answer with. Shared so the
+        // two cannot drift: the reference sends name and longname identical with no attributes, and a
+        // client that got attributes here would have to parse them.
+        private void SendName(uint id, string s)
+        {
             SshLikeWriter w = new SshLikeWriter();
             w.Byte(SftpType.NAME);
             w.UInt32(id);
             w.UInt32(1);
-            w.Text(canonical);
-            w.Text(canonical);
+            w.Text(s);
+            w.Text(s);
             w.UInt32(0);                    // no attributes, matching the reference
             Reply(w);
         }
@@ -1114,12 +1236,16 @@ namespace Pwssh
         // One shape for both callers, since a Find result and a GetFileAttributesEx result now carry
         // exactly the same fields.
         //
-        // followLinks distinguishes STAT from LSTAT. With no link resolution available on 4.8 the
-        // only difference we can express is whether the link bit is reported -- and reporting it is
-        // not cosmetic: C:\Users\All Users is a junction to C:\ProgramData and AppData\Local\
-        // Application Data points at its own parent, so a client that sees them as plain
-        // directories recurses forever on a recursive get. The reference implementation gets this
-        // wrong; we deliberately do not copy it.
+        // followLinks distinguishes STAT from LSTAT, and reporting the link bit is not cosmetic:
+        // C:\Users\All Users is a directory SYMLINK to C:\ProgramData, C:\Users\Default User and
+        // C:\Documents and Settings are junctions, and AppData\Local\Application Data points at its
+        // own parent -- so a client that sees them as plain directories recurses forever on a
+        // recursive get. The reference implementation gets this wrong; we deliberately do not copy it.
+        //
+        // Both tags set FILE_ATTRIBUTE_REPARSE_POINT, so this code treats them alike -- but they are
+        // NOT the same thing and their reparse buffers have different shapes, which is why
+        // Win32Fs.ReadLink parses each by its own offsets. The distinction was verified with
+        // `fsutil reparsepoint query`, not assumed: All Users reports tag 0xA000000C.
         private static Meta FromWin32(Win32Fs.Info info, bool followLinks)
         {
             Meta m = new Meta();

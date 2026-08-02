@@ -162,6 +162,29 @@ namespace Pwssh.Tests
             return w.Framed();
         }
 
+        /// <summary>
+        /// SSH_FXP_SYMLINK, with the arguments named so the order cannot be got wrong silently.
+        /// OpenSSH sends them in the REVERSE of the draft's order — target first, then the link —
+        /// and a swapped implementation creates the link under the wrong name with no error at all.
+        /// Observed on the wire: `Sending SSH2_FXP_SYMLINK "TARGETSTRING-aaa" to "/C:/LINKSTRING-bbb"`.
+        /// </summary>
+        public static byte[] Symlink(uint id, string targetPath, string linkPath)
+        {
+            return TwoStrings(SftpTypeByte.Symlink, id, targetPath, linkPath);
+        }
+
+        /// <summary>The single name a REALPATH or READLINK reply carries.</summary>
+        public static string ParseName(byte[] msg)
+        {
+            if (msg[0] != SftpTypeByte.Name)
+                throw new InvalidDataException("expected NAME, got type " + msg[0]);
+            Reader r = new Reader(msg, 1);
+            r.UInt32();                                  // request id
+            uint count = r.UInt32();
+            if (count != 1) throw new InvalidDataException("expected exactly one name, got " + count);
+            return r.Text();
+        }
+
         public static byte[] Extended(uint id, string name)
         {
             Writer w = new Writer();
@@ -177,6 +200,25 @@ namespace Pwssh.Tests
         public static byte TypeOf(byte[] msg)
         {
             return msg[0];
+        }
+
+        /// <summary>
+        /// Whether an ATTRS reply's permission word carries S_IFLNK. Layout is
+        /// type, id, flags, [size], [uid, gid], [permissions], [atime, mtime] — the optional fields
+        /// present only when their flag bit is set, so they have to be walked rather than indexed.
+        /// </summary>
+        public static bool IsSymlinkMode(byte[] msg)
+        {
+            if (msg[0] != SftpTypeByte.Attrs)
+                throw new InvalidDataException("expected ATTRS, got type " + msg[0]);
+            Reader r = new Reader(msg, 1);
+            r.UInt32();                                  // request id
+            uint flags = r.UInt32();
+            if ((flags & 0x1) != 0) { r.UInt32(); r.UInt32(); }      // SIZE, a uint64
+            if ((flags & 0x2) != 0) { r.UInt32(); r.UInt32(); }      // UIDGID
+            if ((flags & 0x4) == 0) return false;                    // no PERMISSIONS to inspect
+            uint mode = r.UInt32();
+            return (mode & 0xF000) == 0xA000;                        // S_IFLNK
         }
 
         public sealed class Status
@@ -220,6 +262,8 @@ namespace Pwssh.Tests
             public const byte Init = 1;
             public const byte Version = 2;
             public const byte Read = 5;
+            public const byte Lstat = 7;
+            public const byte Attrs = 105;
             public const byte Realpath = 16;
             public const byte ReadLink = 19;
             public const byte Symlink = 20;

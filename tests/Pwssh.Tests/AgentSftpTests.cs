@@ -70,33 +70,6 @@ namespace Pwssh.Tests
         }
 
         [Fact]
-        public void Readlink_and_symlink_are_refused_as_unsupported()
-        {
-            // Refused on purpose rather than merely absent: symlink creation needs
-            // SeCreateSymbolicLinkPrivilege, and resolution needs DeviceIoControl plus a reverse path
-            // mapping. The status matters -- OP_UNSUPPORTED tells a client to stop asking, where
-            // FAILURE invites a retry.
-            using (AgentSftpDriver d = new AgentSftpDriver())
-            {
-                d.Send(AgentSftpDriver.Init(3));
-                d.Receive();
-
-                uint id = d.NextId();
-                d.Send(AgentSftpDriver.OneString(AgentSftpDriver.SftpTypeByte.ReadLink, id, "/C:/Windows"));
-                AgentSftpDriver.Status s = AgentSftpDriver.ParseStatus(d.Receive());
-                Assert.Equal(id, s.Id);
-                Assert.Equal(AgentSftpDriver.StatusCode.OpUnsupported, s.Code);
-
-                id = d.NextId();
-                d.Send(AgentSftpDriver.TwoStrings(AgentSftpDriver.SftpTypeByte.Symlink, id,
-                                                  "/C:/Windows/Temp/link", "/C:/Windows"));
-                s = AgentSftpDriver.ParseStatus(d.Receive());
-                Assert.Equal(id, s.Id);
-                Assert.Equal(AgentSftpDriver.StatusCode.OpUnsupported, s.Code);
-            }
-        }
-
-        [Fact]
         public void An_unknown_extension_is_refused_rather_than_ignored()
         {
             // statvfs@openssh.com is the concrete case: `sftp`'s own `df` sends it, we do not

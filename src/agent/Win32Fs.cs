@@ -32,6 +32,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using Microsoft.Win32.SafeHandles;
 
 namespace Pwssh
@@ -93,6 +94,21 @@ namespace Pwssh
 
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "GetFileAttributesExW")]
         private static extern bool GetFileAttributesExW(string path, int infoLevel, out FileAttributeData data);
+
+        // CreateSymbolicLinkW returns BOOLEAN -- a single byte -- where every other import here
+        // returns BOOL, four bytes. Default marshalling for a `bool` return is the 4-byte form, so
+        // without the explicit U1 this reads three undefined bytes alongside the real answer and the
+        // success test becomes intermittently wrong. Copying the CreateHardLinkW import next door,
+        // which really is BOOL, is exactly how that happens.
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "CreateSymbolicLinkW")]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool CreateSymbolicLinkW(string link, string target, uint flags);
+
+        [DllImport("kernel32.dll", SetLastError = true, EntryPoint = "DeviceIoControl")]
+        private static extern bool DeviceIoControl(SafeFileHandle handle, uint code,
+                                                   IntPtr inBuf, int inSize,
+                                                   byte[] outBuf, int outSize,
+                                                   out int returned, IntPtr overlapped);
 
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "SetFileAttributesW")]
         private static extern bool SetFileAttributesW(string path, uint attributes);
@@ -159,6 +175,23 @@ namespace Pwssh
         private const uint FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000;
         private const uint FILE_ATTRIBUTE_NORMAL = 0x0080;
         private const int INVALID_FILE_ATTRIBUTES = -1;
+        private const uint FILE_READ_ATTRIBUTES = 0x0080;
+        private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+        private const uint OPEN_EXISTING = 3;
+        private const uint FILE_SHARE_ALL = 0x1 | 0x2 | 0x4;      // read | write | delete
+
+        private const uint FSCTL_GET_REPARSE_POINT = 0x000900A8;
+        private const uint IO_REPARSE_TAG_SYMLINK = 0xA000000C;
+        private const uint IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003;   // junctions
+        private const uint SYMLINK_FLAG_RELATIVE = 0x1;
+        private const int MAX_REPARSE_BUFFER = 16 * 1024;             // MAXIMUM_REPARSE_DATA_BUFFER_SIZE
+
+        private const uint SYMBOLIC_LINK_FLAG_DIRECTORY = 0x1;
+        // Lets CreateSymbolicLinkW succeed without SeCreateSymbolicLinkPrivilege when Developer Mode
+        // is on, from Windows 10 build 14972. Measured, not assumed: on the machine this was written
+        // on -- filtered token, privilege absent, Developer Mode on -- the call succeeds with this
+        // flag and fails 1314 without it. Do not "simplify" it away.
+        private const uint SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE = 0x2;
 
         public const uint FILE_ATTRIBUTE_DIRECTORY = 0x0010;
         public const uint FILE_ATTRIBUTE_READONLY = 0x0001;
@@ -311,6 +344,143 @@ namespace Pwssh
             throw Error(Marshal.GetLastWin32Error(), fullPath);
         }
 
+        // ---- links ----
+
+        /// <summary>
+        /// The target a reparse point names, exactly as stored. Handles symbolic links and junctions;
+        /// any other tag throws, because the rest carry no path at all.
+        /// </summary>
+        /// <param name="relative">
+        /// True when the link stores a relative target. Only symbolic links can: a junction has no
+        /// Flags field and is always absolute.
+        /// </param>
+        public static string ReadLink(string fullPath, out bool relative)
+        {
+            relative = false;
+
+            // No access rights at all: FSCTL_GET_REPARSE_POINT is FILE_ANY_ACCESS, so this reads a
+            // link whose target -- or whose own DACL -- denies reading. OPEN_REPARSE_POINT to get the
+            // link rather than what it points at, BACKUP_SEMANTICS because most reparse points on
+            // Windows are directories and CreateFileW refuses those without it.
+            SafeFileHandle h = CreateFileW(Extended(fullPath), 0, FILE_SHARE_ALL, IntPtr.Zero,
+                                           OPEN_EXISTING,
+                                           FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                                           IntPtr.Zero);
+            if (h.IsInvalid)
+            {
+                int openErr = Marshal.GetLastWin32Error();
+                h.Dispose();
+                throw Error(openErr, fullPath);
+            }
+
+            byte[] buf = new byte[MAX_REPARSE_BUFFER];
+            int returned;
+            try
+            {
+                if (!DeviceIoControl(h, FSCTL_GET_REPARSE_POINT, IntPtr.Zero, 0, buf, buf.Length,
+                                     out returned, IntPtr.Zero))
+                    throw Error(Marshal.GetLastWin32Error(), fullPath);
+            }
+            finally { h.Dispose(); }
+
+            // Parsed by hand at explicit offsets rather than through a [StructLayout] struct. The
+            // static assertions at the top of this file exist because a layout mistake here is silent
+            // and produces plausible-looking garbage; there is no fixed-size array to marshal, so
+            // there is nothing to gain by reintroducing that hazard.
+            //
+            //   0  ReparseTag           uint32
+            //   4  ReparseDataLength    uint16   -- counts everything from offset 8
+            //   6  Reserved             uint16
+            //   8  SubstituteNameOffset uint16   -- byte offsets INTO PathBuffer, NUL not counted
+            //  10  SubstituteNameLength uint16
+            //  12  PrintNameOffset      uint16
+            //  14  PrintNameLength      uint16
+            //  16  Flags                uint32   -- SYMLINK ONLY; a junction's PathBuffer starts here
+            //  20  PathBuffer                    -- symlink
+            if (returned < 8) throw new IOException("reparse reply too short: " + fullPath);
+            uint tag = BitConverter.ToUInt32(buf, 0);
+            int dataLen = BitConverter.ToUInt16(buf, 4);
+            if (8 + dataLen > returned) throw new IOException("reparse reply truncated: " + fullPath);
+
+            int pathBase;
+            if (tag == IO_REPARSE_TAG_SYMLINK)
+            {
+                if (dataLen < 12) throw new IOException("symlink reparse data too short: " + fullPath);
+                relative = (BitConverter.ToUInt32(buf, 16) & SYMLINK_FLAG_RELATIVE) != 0;
+                pathBase = 20;
+            }
+            else if (tag == IO_REPARSE_TAG_MOUNT_POINT)
+            {
+                if (dataLen < 8) throw new IOException("junction reparse data too short: " + fullPath);
+                pathBase = 16;
+            }
+            else
+            {
+                // Every reparse point is reported as a link by LSTAT, but most tags carry no path:
+                // AppExecLink (0x8000001B) under WindowsApps, the cloud-provider tags OneDrive uses,
+                // WSL's 0xA000001D. Naming the tag is what lets someone identify it.
+                throw new IOException("not a path-bearing link (reparse tag 0x"
+                    + tag.ToString("X8", CultureInfo.InvariantCulture) + "): " + fullPath);
+            }
+
+            int subOff = BitConverter.ToUInt16(buf, 8);
+            int subLen = BitConverter.ToUInt16(buf, 10);
+            int printOff = BitConverter.ToUInt16(buf, 12);
+            int printLen = BitConverter.ToUInt16(buf, 14);
+
+            // SubstituteName is what the filesystem actually follows; PrintName is a display hint that
+            // nothing enforces, and it is empty for volume mount points. Prefer the former.
+            //
+            // The two names do NOT appear in a fixed order inside PathBuffer -- a live symlink here
+            // stores PrintName first, a live junction stores SubstituteName first -- so both must be
+            // located by their offsets and never by assuming a layout.
+            string target = ReparseName(buf, pathBase, subOff, subLen, dataLen, fullPath);
+            if (target.Length == 0)
+                target = ReparseName(buf, pathBase, printOff, printLen, dataLen, fullPath);
+            if (target.Length == 0) throw new IOException("link has no target: " + fullPath);
+
+            // "\??\C:\x" is the object-manager form the substitute name uses; Strip is belt and braces
+            // for a stored "\\?\" that came from somewhere else.
+            if (target.StartsWith(@"\??\", StringComparison.Ordinal)) target = target.Substring(4);
+            return Strip(target);
+        }
+
+        private static string ReparseName(byte[] buf, int pathBase, int off, int len, int dataLen, string path)
+        {
+            if (len <= 0) return "";
+            if ((len & 1) != 0) throw new IOException("odd reparse name length: " + path);
+            // Offsets are attacker-adjacent only in the sense that a corrupt filesystem could produce
+            // them, but slicing outside the reply would be an out-of-range throw at best.
+            if (off < 0 || pathBase + off + len > 8 + dataLen)
+                throw new IOException("reparse name outside the reply: " + path);
+            return Encoding.Unicode.GetString(buf, pathBase + off, len);
+        }
+
+        /// <summary>
+        /// Creates a symbolic link. <paramref name="target"/> is stored verbatim and must NOT be
+        /// extended-length prefixed: it is written into the link, not opened, and a "\\?\" would show
+        /// up in every ordinary tool on the remote that displays it.
+        /// </summary>
+        public static void CreateSymbolicLink(string linkFullPath, string target, bool targetIsDirectory)
+        {
+            uint flags = targetIsDirectory ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
+
+            if (CreateSymbolicLinkW(Extended(linkFullPath), target,
+                                    flags | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE))
+                return;
+            int err = Marshal.GetLastWin32Error();
+
+            // The unprivileged-create flag arrived in build 14972. Older builds -- Server 2016 and
+            // below, which is exactly the population this project targets, since newer machines
+            // already have an SSH server -- reject it in parameter validation, before touching the
+            // filesystem. So retry without it, but ONLY on that one error: a blanket retry could run
+            // a second creation attempt against a name the first attempt had already half-made.
+            if (err != 87) throw Error(err, linkFullPath);          // ERROR_INVALID_PARAMETER
+
+            if (CreateSymbolicLinkW(Extended(linkFullPath), target, flags)) return;
+            throw Error(Marshal.GetLastWin32Error(), linkFullPath);
+        }
+
         // By path rather than on an open handle, because scp -p sets times after the data handle has
         // been closed and flushed -- see the deferred-times note in Sftp.cs. BACKUP_SEMANTICS so the
         // same call works for a directory.
@@ -401,6 +571,20 @@ namespace Pwssh
                     return new IOException("not a directory: " + path);
                 case 206:                                   // ERROR_FILENAME_EXCED_RANGE
                     return new PathTooLongException("path too long even for the extended form: " + path);
+                case 1314:                                  // ERROR_PRIVILEGE_NOT_HELD
+                    // Deliberately does not say "elevation", which is the myth this replaced: an
+                    // elevated INTERACTIVE token is still filtered, and what actually matters is
+                    // which token the logon produced. Any one of the three routes below is enough.
+                    //
+                    // The trailing path is not decoration -- it names the LINK, and it is the only
+                    // thing a caller can key on when this fires before any path is validated.
+                    return new UnauthorizedAccessException(
+                        "cannot create a symbolic link: the account needs SeCreateSymbolicLinkPrivilege "
+                        + "in a non-restricted token (a remote logon normally carries it; a filtered or "
+                        + "loopback token does not), or group policy leaving that privilege in the "
+                        + "restricted token, or Developer Mode enabled on the remote: " + path);
+                case 4390:                                  // ERROR_NOT_A_REPARSE_POINT
+                    return new IOException("not a link: " + path);
                 default:
                     return new IOException("win32 error " + err.ToString(CultureInfo.InvariantCulture)
                                            + " on " + path);
