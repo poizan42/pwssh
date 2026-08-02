@@ -1188,123 +1188,21 @@ namespace Pwssh
         // realpath(dir) + "/" + a readdir name must open -- scp -r builds paths by
         // concatenating exactly that way.
 
-        private string home;
-
-        private string Home()
-        {
-            if (home == null)
-            {
-                // Not the process working directory: this runs inside wsmprovhost, whose cwd is
-                // nothing the user chose.
-                string h = Environment.GetEnvironmentVariable("USERPROFILE");
-                if (string.IsNullOrEmpty(h)) h = Environment.GetEnvironmentVariable("SystemDrive") + "\\";
-                if (string.IsNullOrEmpty(h)) h = "C:\\";
-                home = h;
-            }
-            return home;
-        }
-
-        private static bool IsVirtualRoot(string p)
-        {
-            return p == "/" || p == "\\";
-        }
-
-        // Throws on anything we deliberately do not serve, so the caller's catch turns it into
-        // a status with the reason attached.
-        private string ToWindows(string sftpPath)
-        {
-            string p = sftpPath == null ? "" : sftpPath;
-            if (p.Length == 0 || p == ".") return Home();
-
-            // UNC and the \\?\ form have no agreed mapping under this convention -- Windows'
-            // own server mangles \\?\C:\Users into /C:/?/C:/Users -- so refuse rather than
-            // half-support them.
-            if (p.StartsWith("//", StringComparison.Ordinal) || p.StartsWith("\\\\", StringComparison.Ordinal))
-                throw new NotSupportedException("UNC paths are not supported: " + sftpPath);
-
-            // "/C:/x" -> "C:/x". A leading slash before a drive letter is the wire form.
-            if (p.Length >= 3 && (p[0] == '/' || p[0] == '\\') && char.IsLetter(p[1]) && p[2] == ':')
-                p = p.Substring(1);
-
-            string win;
-            if (p.Length >= 2 && char.IsLetter(p[0]) && p[1] == ':')
-            {
-                if (p.Length == 2) win = p + "\\";                       // "C:" means the root
-                else if (p[2] == '/' || p[2] == '\\') win = p;
-                // "C:foo" is drive-relative on Windows, resolved against a per-process cwd
-                // nobody set. Treat it as rooted on that drive instead of honouring it.
-                else win = p.Substring(0, 2) + "\\" + p.Substring(2);
-            }
-            else if (p[0] == '/' || p[0] == '\\')
-            {
-                // A leading slash with no drive means the current drive's root, matching what
-                // the reference does: "/Windows" -> "C:\Windows".
-                string root = Path.GetPathRoot(Home());
-                win = root + p.Substring(1);
-            }
-            else
-            {
-                win = Path.Combine(Home(), p);
-            }
-
-            win = win.Replace('/', '\\');
-            return Normalize(win);
-        }
-
-        // What Path.GetFullPath used to do here, done by hand.
+        // The mapping itself moved to SftpPathMap at the foot of this file, so the scp
+        // implementation can share it rather than grow a second copy. A divergence between scp's
+        // and sftp's ToWindows would be invisible until someone had a file only one of the two
+        // protocols could reach, which is not a bug this codebase should be able to have.
         //
-        // It cannot stay: under legacy path handling -- the default for anything targeting below
-        // .NET Framework 4.6.2 -- GetFullPath throws for a path past MAX_PATH, which is precisely
-        // the case this layer exists to support.
-        //
-        // And it has to be COMPLETE, because the \\?\ form Win32Fs applies disables the OS's own
-        // normalisation: a ".." left in the path is not resolved, it is looked up as a directory
-        // with that literal name. Everything the OS would have done has to happen here instead.
-        //
-        // The result is deliberately NOT prefixed. Win32Fs adds \\?\ at the one place it is needed,
-        // which keeps WinPath readable in logs and lets ToSftp convert back without stripping.
-        private static string Normalize(string win)
-        {
-            if (win.Length < 2 || !char.IsLetter(win[0]) || win[1] != ':')
-                throw new NotSupportedException("path is not rooted on a drive: " + win);
+        // These wrappers exist so that the ~34 call sites in this class are untouched by the move,
+        // which is what lets the diff be read as the verbatim relocation it is -- and it means
+        // every existing SFTP test still traverses the moved code on every request.
+        private readonly SftpPathMap paths = new SftpPathMap();
 
-            string root = char.ToUpperInvariant(win[0]) + ":\\";
-            string rest = win.Length > 2 ? win.Substring(2) : "";
-
-            List<string> parts = new List<string>();
-            string[] segs = rest.Split('\\');
-            for (int i = 0; i < segs.Length; i++)
-            {
-                string s = segs[i];
-                if (s.Length == 0 || s == ".") continue;
-                if (s == "..")
-                {
-                    // Popping past the root stays at the root, as every filesystem does. This is
-                    // what stops a path of "/.." climbing out of the drive.
-                    if (parts.Count > 0) parts.RemoveAt(parts.Count - 1);
-                    continue;
-                }
-                // Windows silently strips trailing dots and spaces; \\?\ would preserve them and
-                // create files that no ordinary tool on the remote could open again. Strip them
-                // here so the prefix does not change what a name means.
-                string trimmed = s.TrimEnd(' ', '.');
-                if (trimmed.Length == 0)
-                    throw new NotSupportedException("path segment is not a usable name: " + s);
-                parts.Add(trimmed);
-            }
-
-            return parts.Count == 0 ? root : root + string.Join("\\", parts.ToArray());
-        }
-
-        private static string ToSftp(string windowsPath)
-        {
-            string s = windowsPath.Replace('\\', '/');
-            if (s.Length == 0) return "/";
-            if (s[0] != '/') s = "/" + s;
-            // "/C:/" -> "/C:" so the result is stable under a second realpath.
-            if (s.Length > 3 && s.EndsWith("/", StringComparison.Ordinal)) s = s.Substring(0, s.Length - 1);
-            return s;
-        }
+        private string Home() { return paths.Home(); }
+        private string ToWindows(string sftpPath) { return paths.ToWindows(sftpPath); }
+        private static bool IsVirtualRoot(string p) { return SftpPathMap.IsVirtualRoot(p); }
+        private static string Normalize(string win) { return SftpPathMap.Normalize(win); }
+        private static string ToSftp(string windowsPath) { return SftpPathMap.ToSftp(windowsPath); }
 
         // ---- metadata ----
 
@@ -1536,4 +1434,134 @@ namespace Pwssh
             }
         }
     }
+
+    // ------------------------------------------------------------------ path mapping
+    //
+    // Moved here verbatim from AgentSftpChannel so that AgentScpChannel can use the same mapping.
+    // Nothing in the bodies changed in the move; only the accessibility keywords did.
+    //
+    // Home() caches, which is why this is an instance class rather than a static one -- the cache
+    // was a field on the channel before and stays per-instance now. USERPROFILE cannot change
+    // under a running agent, so a second instance simply computes the same answer.
+    internal sealed class SftpPathMap
+    {
+        private string home;
+
+        public string Home()
+        {
+            if (home == null)
+            {
+                // Not the process working directory: this runs inside wsmprovhost, whose cwd is
+                // nothing the user chose.
+                string h = Environment.GetEnvironmentVariable("USERPROFILE");
+                if (string.IsNullOrEmpty(h)) h = Environment.GetEnvironmentVariable("SystemDrive") + "\\";
+                if (string.IsNullOrEmpty(h)) h = "C:\\";
+                home = h;
+            }
+            return home;
+        }
+
+        public static bool IsVirtualRoot(string p)
+        {
+            return p == "/" || p == "\\";
+        }
+
+        // Throws on anything we deliberately do not serve, so the caller's catch turns it into
+        // a status with the reason attached.
+        public string ToWindows(string sftpPath)
+        {
+            string p = sftpPath == null ? "" : sftpPath;
+            if (p.Length == 0 || p == ".") return Home();
+
+            // UNC and the \\?\ form have no agreed mapping under this convention -- Windows'
+            // own server mangles \\?\C:\Users into /C:/?/C:/Users -- so refuse rather than
+            // half-support them.
+            if (p.StartsWith("//", StringComparison.Ordinal) || p.StartsWith("\\\\", StringComparison.Ordinal))
+                throw new NotSupportedException("UNC paths are not supported: " + sftpPath);
+
+            // "/C:/x" -> "C:/x". A leading slash before a drive letter is the wire form.
+            if (p.Length >= 3 && (p[0] == '/' || p[0] == '\\') && char.IsLetter(p[1]) && p[2] == ':')
+                p = p.Substring(1);
+
+            string win;
+            if (p.Length >= 2 && char.IsLetter(p[0]) && p[1] == ':')
+            {
+                if (p.Length == 2) win = p + "\\";                       // "C:" means the root
+                else if (p[2] == '/' || p[2] == '\\') win = p;
+                // "C:foo" is drive-relative on Windows, resolved against a per-process cwd
+                // nobody set. Treat it as rooted on that drive instead of honouring it.
+                else win = p.Substring(0, 2) + "\\" + p.Substring(2);
+            }
+            else if (p[0] == '/' || p[0] == '\\')
+            {
+                // A leading slash with no drive means the current drive's root, matching what
+                // the reference does: "/Windows" -> "C:\Windows".
+                string root = Path.GetPathRoot(Home());
+                win = root + p.Substring(1);
+            }
+            else
+            {
+                win = Path.Combine(Home(), p);
+            }
+
+            win = win.Replace('/', '\\');
+            return Normalize(win);
+        }
+
+        // What Path.GetFullPath used to do here, done by hand.
+        //
+        // It cannot stay: under legacy path handling -- the default for anything targeting below
+        // .NET Framework 4.6.2 -- GetFullPath throws for a path past MAX_PATH, which is precisely
+        // the case this layer exists to support.
+        //
+        // And it has to be COMPLETE, because the \\?\ form Win32Fs applies disables the OS's own
+        // normalisation: a ".." left in the path is not resolved, it is looked up as a directory
+        // with that literal name. Everything the OS would have done has to happen here instead.
+        //
+        // The result is deliberately NOT prefixed. Win32Fs adds \\?\ at the one place it is needed,
+        // which keeps WinPath readable in logs and lets ToSftp convert back without stripping.
+        public static string Normalize(string win)
+        {
+            if (win.Length < 2 || !char.IsLetter(win[0]) || win[1] != ':')
+                throw new NotSupportedException("path is not rooted on a drive: " + win);
+
+            string root = char.ToUpperInvariant(win[0]) + ":\\";
+            string rest = win.Length > 2 ? win.Substring(2) : "";
+
+            List<string> parts = new List<string>();
+            string[] segs = rest.Split('\\');
+            for (int i = 0; i < segs.Length; i++)
+            {
+                string s = segs[i];
+                if (s.Length == 0 || s == ".") continue;
+                if (s == "..")
+                {
+                    // Popping past the root stays at the root, as every filesystem does. This is
+                    // what stops a path of "/.." climbing out of the drive.
+                    if (parts.Count > 0) parts.RemoveAt(parts.Count - 1);
+                    continue;
+                }
+                // Windows silently strips trailing dots and spaces; \\?\ would preserve them and
+                // create files that no ordinary tool on the remote could open again. Strip them
+                // here so the prefix does not change what a name means.
+                string trimmed = s.TrimEnd(' ', '.');
+                if (trimmed.Length == 0)
+                    throw new NotSupportedException("path segment is not a usable name: " + s);
+                parts.Add(trimmed);
+            }
+
+            return parts.Count == 0 ? root : root + string.Join("\\", parts.ToArray());
+        }
+
+        public static string ToSftp(string windowsPath)
+        {
+            string s = windowsPath.Replace('\\', '/');
+            if (s.Length == 0) return "/";
+            if (s[0] != '/') s = "/" + s;
+            // "/C:/" -> "/C:" so the result is stable under a second realpath.
+            if (s.Length > 3 && s.EndsWith("/", StringComparison.Ordinal)) s = s.Substring(0, s.Length - 1);
+            return s;
+        }
+    }
+
 }
