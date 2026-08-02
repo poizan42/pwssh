@@ -29,14 +29,22 @@ the protocol itself.
 
 | | |
 |---|---|
-| Implemented | version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, session channels, `exec`, `shell`, `pty-req` (ConPTY), `window-change`, `signal`, port forwarding — `-L`, `-D`, `-W` and `-R`, IPv4 and IPv6 — **SFTP subsystem (and therefore `scp`)**, exit status, separate stderr, flow control |
-| Not implemented | symlink creation (needs elevation on Windows) |
+| Implemented | version exchange, `diffie-hellman-group14-sha256` KEX, `rsa-sha2-256` host key, `aes256-ctr` + `hmac-sha2-256-etm@openssh.com`, session channels, `exec`, `shell`, `pty-req` (ConPTY), `window-change`, `signal`, port forwarding — `-L`, `-D`, `-W` and `-R`, IPv4 and IPv6 — **SFTP subsystem (and therefore `scp`)**, symlinks (`ln -s` and resolution), long paths, rekeying, exit status, separate stderr, flow control |
+| Not implemented | `statvfs@openssh.com` (`sftp`'s `df`), strict KEX (deliberately — Terrapin needs an attacker between `ssh.exe` and its own `ProxyCommand`) |
 
 Tested against OpenSSH 9.5p2 on Windows, with a Windows PowerShell 5.1 / .NET Framework 4.8
-remote. The test suite drives the real `ssh`, `sftp` and `scp` binaries: 72 cases over WinRM and
-62 against a loopback dev host.
+remote. The test suite drives the real `ssh`, `sftp` and `scp` binaries: 91 cases over WinRM and
+81 against a loopback dev host, plus 46 xUnit cases for what no stock client can ask for.
 
-Two warts worth knowing:
+Three warts worth knowing:
+
+- **`ln -s` depends on the remote account, not on pwssh.** Reading links always works. *Creating*
+  one needs `SeCreateSymbolicLinkPrivilege` in a non-restricted token — which a domain admin
+  connecting over WinRM normally does have, since remoting is not UAC-filtered the way an
+  interactive logon is — or a group policy that leaves the privilege in the restricted token, or
+  Developer Mode on the remote. pwssh asks for the unprivileged-create flag first, so Developer
+  Mode alone is enough. Where none of the three holds you get `Permission denied` naming all
+  three, and nothing else is affected.
 
 - **`-R` ports linger.** `ssh` kills its `ProxyCommand` when it exits, so pwssh gets no chance
   to tell the remote to unbind the listening port. The remote's own watchdog releases it about

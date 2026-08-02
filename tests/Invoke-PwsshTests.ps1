@@ -1165,6 +1165,138 @@ quit
         "err='$($r.Err -replace "`r?`n", ' | ')'"
     if ([System.IO.Directory]::Exists($lpRecv)) { [System.IO.Directory]::Delete($lpRecv, $true) }
 
+    # ---- 10e. symlinks, through the client that produces the real byte order.
+    #
+    # OpenSSH sends SSH_FXP_SYMLINK with the arguments REVERSED relative to the draft -- target
+    # first, link second -- and a swapped server creates the link under the wrong name with no
+    # error at all. Nothing but a real client can catch that, which is what this section is for:
+    # every capable case below asserts the LINK is the name that came into existence and the
+    # TARGET is the string stored in it, so a reversal fails loudly rather than subtly.
+    #
+    # Every target stays inside $farDir. PS 5.1's Remove-Item -Recurse traverses directory reparse
+    # points, so a link pointing outside it would make the suite's own teardown delete somebody
+    # else's files -- and the links are removed through sftp here, before that teardown runs.
+    #
+    # Far-side link inspection uses the 5.1 ETS .Target, not FileSystemInfo.LinkTarget: the far
+    # side is Windows PowerShell on .NET Framework 4.8, where that .NET 6 property is silently
+    # $null and the assertion could never pass.
+    function Far-Link([string]$farPath) {
+        return Far-Sftp @"
+`$p = '$farPath'
+if (-not (Test-Path -LiteralPath `$p)) { [Console]::Out.Write('ABSENT||') }
+else {
+    `$i = Get-Item -LiteralPath `$p -Force
+    `$isLink = ((`$i.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+    `$t = `$i.Target
+    if (`$null -ne `$t -and `$t -isnot [string]) { `$t = @(`$t)[0] }
+    [Console]::Out.Write('PRESENT|' + `$isLink + '|' + [string]`$t)
+}
+"@
+    }
+
+    # The capability probe is an ordinary attempt rather than a query, because there is no query:
+    # the three routes (an unrestricted token holding SeCreateSymbolicLinkPrivilege, group policy
+    # leaving it in the restricted one, or Developer Mode plus the unprivileged-create flag) are
+    # not all visible from user space. The two transports are expected to take different routes --
+    # this client runs filtered with Developer Mode on, the WinRM remote holds the privilege -- so
+    # both are exercised across a full run, and neither branch is a skip.
+    $r = Invoke-Sftp "ln -s $farFwd/up.bin $farFwd/abs.lnk`nquit`n" 'symlink'
+    $canLink = ($r.ExitCode -eq 0) -and -not $r.Hung
+
+    if (-not $canLink) {
+        # sftp renders the status code through its own fx2txt, not the server's message, so the
+        # actionable text naming the three routes is asserted in the xUnit suite where the STATUS
+        # string is readable. What the real client can prove is the mapping: PERMISSION_DENIED,
+        # not OP_UNSUPPORTED, which is what stops a client concluding we never do links at all.
+        Assert-That 'a machine that cannot create links says permission, not unsupported' `
+            (($r.Err -match 'Permission denied') -and ($r.Err -notmatch 'not supported|unsupported')) `
+            "err='$($r.Err -replace "`r?`n", ' | ')'"
+    }
+    else {
+        $absLink = Far-Link "$farDir${bs}abs.lnk"
+        Assert-That 'ln -s creates a link under the name the client asked for' `
+            ($absLink -eq "PRESENT|True|$farDir${bs}up.bin") "got '$absLink'"
+
+        # A link is only useful if it can be read through, and this is the STAT-follows-links path
+        # as well: the client sizes the transfer from STAT, so a link-sized answer truncates it.
+        $lnkLocal = Join-Path $repo "tmp/sftp-lnk-$sftpTag.bin"
+        $r = Invoke-Sftp @"
+get $farFwd/abs.lnk $($lnkLocal.Replace($bs,'/'))
+ls -l $farFwd
+ls -l $farFwd/abs.lnk
+quit
+"@ 'symget'
+        Assert-That 'a download through a symlink is bit-exact' `
+            ((Test-Path -LiteralPath $lnkLocal) -and ((Get-Sha ([System.IO.File]::ReadAllBytes($lnkLocal))) -eq $wantHash)) `
+            "$($r.Phase) err='$($r.Err -replace "`r?`n", ' | ')'"
+
+        # The two listings above disagree, and that disagreement IS the LSTAT/STAT distinction --
+        # the one thing in this change that a client can see. Listing the DIRECTORY goes through
+        # READDIR, which carries LSTAT semantics, so the link shows as a link; that bit is what
+        # stops a recursive get walking into a junction for ever. Naming the link DIRECTLY goes
+        # through STAT, which now follows, so it reports the target's type and the target's size.
+        # A directory row ends in the bare name, a single-path row in the full /C:/ path, which is
+        # what tells the two apart here.
+        $lsRows = $r.Out -split "`r?`n"
+        Assert-That 'a directory listing reports a symlink with a leading l' `
+            (@($lsRows | Where-Object { $_ -match '^l.*\sabs\.lnk$' }).Count -eq 1) `
+            "out='$($r.Out -replace "`r?`n", ' | ')'"
+        Assert-That 'naming the link directly follows it, reporting the target size' `
+            (@($lsRows | Where-Object { $_ -match "^-.*\s$($payload.Length)\s.*/abs\.lnk$" }).Count -eq 1) `
+            "out='$($r.Out -replace "`r?`n", ' | ')'"
+
+        # The relative target is the case ToWindows would silently mangle -- it resolves anything
+        # relative against USERPROFILE -- so the stored string must come back byte-for-byte. The
+        # link sits one directory down so the target is a real ../ rather than a bare name, and
+        # ../up.bin still lands inside $farDir.
+        $r = Invoke-Sftp @"
+mkdir $farFwd/lnkdir
+ln -s ../up.bin $farFwd/lnkdir/rel.lnk
+quit
+"@ 'symrel'
+        $relLink = Far-Link "$farDir${bs}lnkdir${bs}rel.lnk"
+        Assert-That 'a relative target is stored unmodified' `
+            ($relLink -eq "PRESENT|True|..${bs}up.bin") "got '$relLink'"
+
+        # A dangling link must still be created -- POSIX allows it, and refusing would break the
+        # ordinary case of laying down a link before its target -- and must still read as a link.
+        # Listed through the directory again, deliberately: naming it directly would go through
+        # STAT, which now fails on a dangling link, and the case would then be asserting sftp's
+        # fallback rather than ours. That STAT does fail is asserted in the xUnit suite instead.
+        $r = Invoke-Sftp "ln -s $farFwd/nothing-here.bin $farFwd/dangle.lnk`nls -l $farFwd`nquit`n" 'symdangle'
+        Assert-That 'a link to a missing target is created and reads as a link' `
+            ((($r.ExitCode -eq 0) -and -not $r.Hung) -and
+             (@(($r.Out -split "`r?`n") | Where-Object { $_ -match '^l.*\sdangle\.lnk$' }).Count -eq 1)) `
+            "$($r.Phase) out='$($r.Out -replace "`r?`n", ' | ')'"
+
+        $r = Invoke-Sftp "ln -s $farFwd/up.bin $farFwd/abs.lnk`nquit`n" 'symdup'
+        Assert-That 'creating a link over an existing name fails' ($r.ExitCode -ne 0) `
+            "exit=$($r.ExitCode) err='$($r.Err -replace "`r?`n", ' | ')'"
+
+        # rm on a DIRECTORY link. It carries FILE_ATTRIBUTE_DIRECTORY, so the old DoRemove refused
+        # it and only rmdir worked -- the opposite of POSIX, and a wart this feature would have
+        # created. RemoveDirectoryW on a name surrogate deletes the link and never the target,
+        # which is the half worth asserting: lnkdir and its contents must survive.
+        $r = Invoke-Sftp "ln -s $farFwd/lnkdir $farFwd/dirlnk`nrm $farFwd/dirlnk`nquit`n" 'symdirrm'
+        $survivor = Far-Sftp "[Console]::Out.Write((Test-Path -LiteralPath '$farDir${bs}lnkdir${bs}rel.lnk').ToString())"
+        Assert-That 'rm removes a directory link without touching its target' `
+            ((($r.ExitCode -eq 0) -and -not $r.Hung) -and
+             ((Far-Link "$farDir${bs}dirlnk") -eq 'ABSENT||') -and ($survivor -eq 'True')) `
+            "$($r.Phase) survivor=$survivor err='$($r.Err -replace "`r?`n", ' | ')'"
+
+        # Removed here rather than left to the blanket teardown, which traverses directory links.
+        $r = Invoke-Sftp @"
+rm $farFwd/abs.lnk
+rm $farFwd/dangle.lnk
+rm $farFwd/lnkdir/rel.lnk
+rmdir $farFwd/lnkdir
+quit
+"@ 'symrm'
+        Assert-That 'the links are removed again, leaving nothing behind' `
+            ((Far-Link "$farDir${bs}lnkdir") -eq 'ABSENT||') `
+            "$($r.Phase) err='$($r.Err -replace "`r?`n", ' | ')'"
+    }
+
     # ---- 11. scp, which speaks SFTP on OpenSSH 9.x and so comes free with the subsystem.
     # -p additionally exercises SETSTAT/FSETSTAT: without them scp reports failure on a file it
     # transferred perfectly well.
