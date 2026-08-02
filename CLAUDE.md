@@ -481,16 +481,27 @@ there means "skip this file", so the source genuinely cannot start sending. That
 per file, 3 with `-p`, against SFTP's ~3. Comparable, not better. The README's advice to tar a large
 tree and move one archive applies to `scp -O` exactly as it does to `sftp`.
 
-**The many-small-files figure is NOT yet measured properly**, and the first attempt is worth
-recording as a warning rather than a result. It reported medians of 50,634 ms for `scp -O -r`
-against 4,965 ms for `sftp get -r` — a ten-fold difference that would have been nonsense to
-publish, because three of its six runs transferred **zero files**: both variants in a round shared
-one destination directory, so the second landed on the first's leftovers and failed. The one
-genuinely paired round gave **52.7 s against 56.2 s**, which is the "comparable" the arithmetic
-predicts. `tools/Measure-ScpVsSftp.ps1` now uses a destination per round *and* per variant and
-counts a round only when the expected number of files arrived; re-run `-SmallFiles` to settle it.
-The lesson generalises: a timing for an incomplete transfer is not a timing, and a median will
-happily average it in.
+Measured, same shape — 40 files of 900 bytes, three rounds, medians, all 40 arriving every time:
+
+| 40 x 900 B tree | median | |
+|---|---|---|
+| `scp -O -r` | 49,187 ms | |
+| `sftp get -r` | 54,100 ms | **1.10x** |
+
+So a slight edge rather than the wash the arithmetic suggested, consistent in direction across all
+three rounds — 1.23 s per file against 1.35 s. Not a reason to restructure anything: the archive
+trick still beats both by an order of magnitude, and that advice applies to `scp -O` exactly as it
+does to `sftp`.
+
+**The first attempt at that number was nonsense, and it is worth recording why.** It reported
+medians of 50,634 ms for `scp -O -r` against 4,965 ms for `sftp get -r` — a ten-fold difference
+that would have been published as a decisive result. Three of its six runs had transferred **zero
+files**: both variants in a round shared one destination directory, so the second landed on the
+first's leftovers and failed fast, and the median duly averaged a real transfer against a failure.
+What caught it was printing the file count beside each timing; without that column the number
+looked clean. `tools/Measure-ScpVsSftp.ps1` now scopes the destination per round *and* per variant,
+and counts a round only when the expected number of files arrived. **A timing for an incomplete
+transfer is not a timing, and nothing downstream will notice on your behalf.**
 
 #### Upload filenames are the security boundary
 

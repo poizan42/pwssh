@@ -63,9 +63,9 @@ Four things worth knowing — three warts and one pleasant surprise:
 - **For one big download, `scp -O` is the fastest thing here.** It uses the legacy scp protocol,
   which streams the body with no per-chunk acknowledgement at all — no request ramp, nothing to
   read ahead around. Measured interleaved over WinRM, 32 MiB, medians of three rounds:
-  **5.76 MiB/s against SFTP's 3.77, a 1.53×**. It is *not* a win for many small files, where the
-  per-file acknowledgement cannot be pipelined and it costs 2 round trips per file (3 with `-p`)
-  against SFTP's ~3 — for a tree, tar it and move one archive, exactly as with `sftp`.
+  **5.76 MiB/s against SFTP's 3.77, a 1.53×**. For many small files it is only marginally ahead
+  — 40 files of 900 bytes measured 49 s against SFTP's 54 s — because the per-file acknowledgement
+  cannot be pipelined. For a tree, tar it and move one archive, exactly as with `sftp`.
 
 ## What it needs on the remote
 
