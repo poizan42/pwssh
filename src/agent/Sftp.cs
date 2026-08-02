@@ -390,6 +390,11 @@ namespace Pwssh
                         // that links can exist here this really does differ from SETSTAT: it stamps
                         // the link's own times and refuses to truncate through it.
                         if (name == "lsetstat@openssh.com") { DoSetStat(id, r, true); return; }
+                        // What `df` sends. The f-form takes a handle instead of a path; no CLI
+                        // command produces it, but the pair is documented together and answering
+                        // only half of it would be an odd thing to advertise.
+                        if (name == "statvfs@openssh.com") { DoStatVfs(id, r.Text()); return; }
+                        if (name == "fstatvfs@openssh.com") { DoFStatVfs(id, r.Text()); return; }
                         SendStatus(id, SftpStatus.OP_UNSUPPORTED, "unsupported extension: " + name);
                         return;
                     }
@@ -882,6 +887,90 @@ namespace Pwssh
             Reply(w);
         }
 
+        // ---- volumes ----
+
+        /// <summary>
+        /// statvfs@openssh.com, i.e. what `df` asks for.
+        /// </summary>
+        private void DoStatVfs(uint id, string path)
+        {
+            if (IsVirtualRoot(path))
+            {
+                // "/" here is not a filesystem, it is a listing of drive letters we make up, so
+                // there is no honest set of numbers to report for it. Refusing is a choice rather
+                // than a necessity -- the client guards its own division, so a reply of zeroes
+                // would print "ERR" instead of crashing -- but a reply of zeroes looks like a bug
+                // where a status can say what is actually going on.
+                SendStatus(id, SftpStatus.FAILURE,
+                           "/ is not a filesystem: it lists the drives, so ask about one of them instead");
+                return;
+            }
+            string win = ToWindows(path);
+            // Existence is checked here and not left to the volume lookup, which does not check it:
+            // GetVolumePathNameW succeeds on a path that is not there and hands back the root, so
+            // without this a `df` on a typo would confidently describe the volume.
+            Win32Fs.GetInfo(win);
+            SendStatVfs(id, Win32Fs.GetVolumeInfo(win));
+        }
+
+        /// <summary>
+        /// fstatvfs@openssh.com. No client command sends this; it is reachable from a library and
+        /// from the frame-level tests.
+        /// </summary>
+        private void DoFStatVfs(uint id, string handleId)
+        {
+            SftpHandle h = GetHandle(handleId);
+            // Deliberately NOT the usual "h == null || h.File == null" preamble that every other
+            // handle-taking request uses. A directory handle is a perfectly good thing to ask this
+            // about, and rejecting one would be a bug inherited by copying the line next door.
+            if (h == null) { SendStatus(id, SftpStatus.FAILURE, "unknown handle"); return; }
+            if (h.WinPath == null)
+            {
+                // The handle from opening "/" -- same non-answer as the path form above.
+                SendStatus(id, SftpStatus.FAILURE,
+                           "/ is not a filesystem: it lists the drives, so ask about one of them instead");
+                return;
+            }
+            SendStatVfs(id, Win32Fs.GetVolumeInfo(h.WinPath));
+        }
+
+        private void SendStatVfs(uint id, Win32Fs.VolumeInfo v)
+        {
+            ulong frsize = v.ClusterBytes;              // never zero; GetVolumeInfo guarantees it
+
+            // TotalBytes is what the CALLER may use and so is quota-limited; FreeBytes is the whole
+            // disk and is not. Left alone, a small quota on a mostly-empty volume gives f_bfree
+            // above f_blocks, and the client computes Used as f_blocks - f_bfree in unsigned 64-bit
+            // -- which underflows into an astronomical number rather than erroring. Quotas turn up
+            // on managed domain machines, which is exactly this project's population.
+            ulong totalBytes = v.TotalBytes;
+            ulong freeBytes = v.FreeBytes < totalBytes ? v.FreeBytes : totalBytes;
+            ulong availBytes = v.AvailableBytes < freeBytes ? v.AvailableBytes : freeBytes;
+
+            SshLikeWriter w = new SshLikeWriter();
+            w.Byte(SftpType.EXTENDED_REPLY);
+            w.UInt32(id);
+            w.UInt64(frsize);                           // f_bsize
+            w.UInt64(frsize);                           // f_frsize -- the only one the client uses
+            w.UInt64(totalBytes / frsize);              // f_blocks
+            w.UInt64(freeBytes / frsize);               // f_bfree  -- df's "(root)" column
+            w.UInt64(availBytes / frsize);              // f_bavail -- df's "Avail" column
+            // Windows has no inode count to report. POSIX already uses zero for "unknown" and real
+            // filesystems do the same -- Linux btrfs reports zero here -- so any client that copes
+            // with an ordinary btrfs server copes with this. `df -i` prints ERR for the capacity.
+            // The only counter Windows has is the MFT record count, which is NTFS-only and needs a
+            // raw volume handle, i.e. admin on the remote, which this project does not use.
+            w.UInt64(0);                                // f_files
+            w.UInt64(0);                                // f_ffree
+            w.UInt64(0);                                // f_favail
+            w.UInt64(v.Serial);                         // f_fsid
+            w.UInt64(v.ReadOnly ? ST_RDONLY | ST_NOSUID : ST_NOSUID);
+            // 255 on NTFS, and not a contradiction of the long-path work: LongPathsEnabled and the
+            // \\?\ prefix raise the limit on a whole PATH, never on one component of it.
+            w.UInt64(v.MaxComponentLength);             // f_namemax
+            Reply(w);
+        }
+
         // ---- directories ----
 
         private void DoOpenDir(uint id, string path)
@@ -994,6 +1083,10 @@ namespace Pwssh
             w.Text("hardlink@openssh.com"); w.Text("1");
             w.Text("lsetstat@openssh.com"); w.Text("1");
             w.Text("limits@openssh.com"); w.Text("1");
+            // "2" and not "1": the client compares the value against "2" exactly before it will
+            // use either of these, so advertising "1" reads to it as not supported at all.
+            w.Text("statvfs@openssh.com"); w.Text("2");
+            w.Text("fstatvfs@openssh.com"); w.Text("2");
             Reply(w);
             host.Log("sftp channel " + channel + " ready (version 3)");
         }
@@ -1374,6 +1467,11 @@ namespace Pwssh
             public bool HasTimes;
             public uint Atime, Mtime;
         }
+
+        // f_flag bits from PROTOCOL. ST_NOSUID is set unconditionally because it is simply true
+        // here -- Windows has no setuid -- and no client displays f_flag anyway.
+        private const ulong ST_RDONLY = 0x1;
+        private const ulong ST_NOSUID = 0x2;
 
         private const int MAX_HANDLES = 256;
         private readonly Dictionary<string, SftpHandle> handles = new Dictionary<string, SftpHandle>();

@@ -137,6 +137,32 @@ namespace Pwssh
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool FindClose(IntPtr handle);
 
+        // The four volume queries, for statvfs@openssh.com. All return a 4-byte BOOL, so none of
+        // them needs the U1 attribute the symlink import above does.
+        //
+        // They all accept a \\?\-prefixed path, which is why nothing here strips one: probed
+        // directly, C:\ against \\?\C:\, on this client and on the net48 remote, and every pair
+        // came back byte-identical. Worth having measured rather than reasoned -- it is what lets
+        // this file keep a single path convention.
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "GetVolumePathNameW")]
+        private static extern bool GetVolumePathNameW(string path, StringBuilder root, int rootChars);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "GetDiskFreeSpaceExW")]
+        private static extern bool GetDiskFreeSpaceExW(string directory, out ulong availableToCaller,
+                                                       out ulong totalBytes, out ulong totalFreeBytes);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "GetDiskFreeSpaceW")]
+        private static extern bool GetDiskFreeSpaceW(string root, out uint sectorsPerCluster,
+                                                     out uint bytesPerSector, out uint freeClusters,
+                                                     out uint totalClusters);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "GetVolumeInformationW")]
+        private static extern bool GetVolumeInformationW(string root, StringBuilder name, int nameChars,
+                                                         out uint serial, out uint maxComponentLength,
+                                                         out uint flags, StringBuilder fileSystem,
+                                                         int fileSystemChars);
+
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool SetFileTime(SafeFileHandle handle, IntPtr creation,
                                                ref long lastAccess, ref long lastWrite);
@@ -221,6 +247,9 @@ namespace Pwssh
         public const uint FILE_ATTRIBUTE_READONLY = 0x0001;
         public const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x0400;
 
+        // From GetVolumeInformationW's flags, and the only one of them statvfs has a bit for.
+        public const uint FILE_READ_ONLY_VOLUME = 0x00080000;
+
         // ---- what callers use ----
 
         public struct Info
@@ -239,6 +268,22 @@ namespace Pwssh
         {
             public string Name;
             public Info Info;
+        }
+
+        /// <summary>
+        /// What a volume can tell us, shaped for statvfs. Plain fields and no marshalling, so
+        /// unlike FindData and its neighbours this needs no entry in the size assertions above.
+        /// </summary>
+        public struct VolumeInfo
+        {
+            public ulong ClusterBytes;          // f_bsize and f_frsize
+            public ulong TotalBytes;            // quota-limited to the caller, see the note below
+            public ulong FreeBytes;             // whole-disk free, NOT quota-limited
+            public ulong AvailableBytes;        // free and within the caller's quota
+            public uint Serial;                 // f_fsid
+            public uint MaxComponentLength;     // f_namemax -- 255 on NTFS
+            public uint FileSystemFlags;
+            public bool ReadOnly;
         }
 
         public static bool TryGetInfo(string fullPath, out Info info)
@@ -262,6 +307,74 @@ namespace Pwssh
         {
             Info ignored;
             return TryGetInfo(fullPath, out ignored);
+        }
+
+        /// <summary>
+        /// Capacity and identity for the volume holding a path. The path is resolved to its mount
+        /// root first, so a volume mounted at C:\data reports itself rather than C:.
+        /// </summary>
+        /// <remarks>
+        /// This does NOT check that the path exists, and must not be relied on to: GetVolumePathNameW
+        /// succeeds on a path that does not, handing back the root -- measured on the remote,
+        /// \\?\C:\no-such-dir-xyz\deeper came back as \\?\C:\. Callers wanting POSIX statvfs
+        /// semantics stat the path first.
+        /// </remarks>
+        public static VolumeInfo GetVolumeInfo(string fullPath)
+        {
+            string extended = Extended(fullPath);
+
+            // Sized from the input rather than fixed at MAX_PATH, because a mount root can be as
+            // long as the path that named it. The buffer length is also a documented trap: exactly
+            // one character short and the call SUCCEEDS but drops the trailing backslash, which
+            // GetVolumeInformationW below then rejects; anything shorter fails outright. The
+            // assertion after the call is what makes that non-silent.
+            StringBuilder rootBuf = new StringBuilder(extended.Length + 2);
+            if (!GetVolumePathNameW(extended, rootBuf, rootBuf.Capacity))
+                throw Error(Marshal.GetLastWin32Error(), fullPath);
+
+            string root = rootBuf.ToString();
+            if (!root.EndsWith("\\", StringComparison.Ordinal)) root += "\\";
+
+            VolumeInfo v = new VolumeInfo();
+
+            ulong availableToCaller, totalBytes, totalFreeBytes;
+            if (!GetDiskFreeSpaceExW(root, out availableToCaller, out totalBytes, out totalFreeBytes))
+                throw Error(Marshal.GetLastWin32Error(), fullPath);
+            v.TotalBytes = totalBytes;
+            v.FreeBytes = totalFreeBytes;
+            v.AvailableBytes = availableToCaller;
+
+            // GEOMETRY ONLY. This call also reports cluster COUNTS, and they must not be used: they
+            // are DWORDs, so they overflow on a large enough volume, and they are quota-adjusted as
+            // well. Sectors-per-cluster times bytes-per-sector is immune to both. Every byte figure
+            // above comes from the Ex form instead.
+            uint sectorsPerCluster, bytesPerSector, freeClusters, totalClusters;
+            if (GetDiskFreeSpaceW(root, out sectorsPerCluster, out bytesPerSector,
+                                  out freeClusters, out totalClusters))
+            {
+                v.ClusterBytes = (ulong)sectorsPerCluster * bytesPerSector;
+            }
+
+            // A judgement call, and the alternatives are worse. Reporting a block size of one byte
+            // makes the capacity figures exact while claiming nothing about how the filesystem
+            // actually allocates; a hardcoded 4096 would be fabrication, and failing outright would
+            // throw away working numbers over the one field nothing depends on. It also means the
+            // division below can never be by zero.
+            if (v.ClusterBytes == 0) v.ClusterBytes = 1;
+
+            StringBuilder name = new StringBuilder(261);
+            StringBuilder fileSystem = new StringBuilder(261);
+            uint serial, maxComponentLength, flags;
+            if (!GetVolumeInformationW(root, name, name.Capacity, out serial,
+                                       out maxComponentLength, out flags,
+                                       fileSystem, fileSystem.Capacity))
+                throw Error(Marshal.GetLastWin32Error(), fullPath);
+
+            v.Serial = serial;
+            v.MaxComponentLength = maxComponentLength;
+            v.FileSystemFlags = flags;
+            v.ReadOnly = (flags & FILE_READ_ONLY_VOLUME) != 0;
+            return v;
         }
 
         public static bool DirectoryExists(string fullPath)

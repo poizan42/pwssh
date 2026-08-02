@@ -194,6 +194,42 @@ namespace Pwssh.Tests
             return w.Framed();
         }
 
+        /// <summary>SSH_FXP_OPEN with no attributes. pflags 0x1 is READ.</summary>
+        public static byte[] Open(uint id, string path, uint pflags)
+        {
+            Writer w = new Writer();
+            w.Byte(SftpTypeByte.Open);
+            w.UInt32(id);
+            w.Text(path);
+            w.UInt32(pflags);
+            w.UInt32(0);                                 // attrs: no flags set
+            return w.Framed();
+        }
+
+        /// <summary>The handle string a HANDLE reply carries.</summary>
+        public static string ParseHandle(byte[] msg)
+        {
+            if (msg[0] != SftpTypeByte.Handle)
+                throw new InvalidDataException("expected HANDLE, got type " + msg[0]);
+            Reader r = new Reader(msg, 1);
+            r.UInt32();                                  // request id
+            return r.Text();
+        }
+
+        /// <summary>
+        /// An extension request carrying one string argument. Covers statvfs@openssh.com (a path)
+        /// and fstatvfs@openssh.com (a handle), which are shaped identically on the wire.
+        /// </summary>
+        public static byte[] ExtendedOneString(uint id, string name, string arg)
+        {
+            Writer w = new Writer();
+            w.Byte(SftpTypeByte.Extended);
+            w.UInt32(id);
+            w.Text(name);
+            w.Text(arg);
+            return w.Framed();
+        }
+
         // ------------------------------------------------------------------ reply parsing
 
         /// <summary>The message type byte of a reply body.</summary>
@@ -212,6 +248,38 @@ namespace Pwssh.Tests
             uint flags = r.UInt32();
             if ((flags & 0x1) == 0) return -1;
             return ((long)r.UInt32() << 32) | r.UInt32();
+        }
+
+        /// <summary>The eleven fields a statvfs@openssh.com reply carries, in wire order.</summary>
+        public sealed class StatVfs
+        {
+            public uint Id;
+            public ulong BSize, FrSize, Blocks, BFree, BAvail;
+            public ulong Files, FFree, FAvail;
+            public ulong Fsid, Flag, NameMax;
+        }
+
+        /// <summary>
+        /// Parses an EXTENDED_REPLY as statvfs, and insists on exactly eleven fields with nothing
+        /// after them. That strictness is deliberate and asymmetric: OpenSSH's client calls
+        /// fatal_fr() on a field it cannot read — killing the user's sftp process outright rather
+        /// than reporting an error — while silently ignoring anything trailing. So a reply one
+        /// field short is the worst thing this server could emit, and one field long is invisible.
+        /// </summary>
+        public static StatVfs ParseStatVfs(byte[] msg)
+        {
+            if (msg[0] != SftpTypeByte.ExtendedReply)
+                throw new InvalidDataException("expected EXTENDED_REPLY, got type " + msg[0]);
+            Reader r = new Reader(msg, 1);
+            StatVfs s = new StatVfs();
+            s.Id = r.UInt32();
+            s.BSize = r.UInt64(); s.FrSize = r.UInt64(); s.Blocks = r.UInt64();
+            s.BFree = r.UInt64(); s.BAvail = r.UInt64();
+            s.Files = r.UInt64(); s.FFree = r.UInt64(); s.FAvail = r.UInt64();
+            s.Fsid = r.UInt64(); s.Flag = r.UInt64(); s.NameMax = r.UInt64();
+            if (r.Remaining != 0)
+                throw new InvalidDataException("statvfs reply has " + r.Remaining + " trailing bytes");
+            return s;
         }
 
         /// <summary>
@@ -273,7 +341,10 @@ namespace Pwssh.Tests
         {
             public const byte Init = 1;
             public const byte Version = 2;
+            public const byte Open = 3;
+            public const byte Close = 4;
             public const byte Read = 5;
+            public const byte Opendir = 11;
             public const byte Stat = 17;
             public const byte Lstat = 7;
             public const byte Attrs = 105;
@@ -352,6 +423,11 @@ namespace Pwssh.Tests
                 uint v = (uint)((b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]);
                 i += 4;
                 return v;
+            }
+
+            public ulong UInt64()
+            {
+                return ((ulong)UInt32() << 32) | UInt32();
             }
 
             public string Text()

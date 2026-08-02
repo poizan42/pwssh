@@ -643,6 +643,13 @@ namespace Pwssh
                     break;
 
                 // Everything else, known or not: assume it changed something.
+                //
+                // That includes EXTENDED, so a `df` mid-session throws away held metadata even
+                // though statvfs changes nothing. Left alone deliberately: EXTENDED also carries
+                // posix-rename and fsync, which genuinely do change things, so the type cannot be
+                // exempted wholesale -- it would have to be exempted by NAME, which means parsing
+                // the name here, in the path every bulk transfer goes through, to save a couple of
+                // round trips on a command a user types once.
                 default:
                     InvalidateSpeculation();
                     break;

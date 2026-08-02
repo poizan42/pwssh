@@ -41,13 +41,22 @@ namespace Pwssh.Tests
                 Assert.Equal(
                     new[]
                     {
+                        "fstatvfs@openssh.com",
                         "fsync@openssh.com",
                         "hardlink@openssh.com",
                         "limits@openssh.com",
                         "lsetstat@openssh.com",
                         "posix-rename@openssh.com",
+                        "statvfs@openssh.com",
                     },
                     Sorted(ext.Keys));
+
+                // The two statvfs entries must advertise "2" and not "1". The client compares the
+                // value against "2" exactly before it will use either, so "1" reads to it as no
+                // support at all -- and the symptom is `df` printing "Server does not support
+                // statvfs@openssh.com extension" against a server that implements it perfectly.
+                Assert.Equal("2", ext["statvfs@openssh.com"]);
+                Assert.Equal("2", ext["fstatvfs@openssh.com"]);
             }
         }
 
@@ -72,21 +81,28 @@ namespace Pwssh.Tests
         [Fact]
         public void An_unknown_extension_is_refused_rather_than_ignored()
         {
-            // statvfs@openssh.com is the concrete case: `sftp`'s own `df` sends it, we do not
-            // implement it, and it lands on the unknown-extension fallthrough. A dropped reply here
-            // would hang the client until its own timeout, which on this transport is
-            // indistinguishable from ordinary slowness.
+            // users-groups-by-id@openssh.com is the concrete case: the client sends it to put owner
+            // names on `ls -l`, we do not implement it, and it lands on the unknown-extension
+            // fallthrough. A dropped reply here would hang the client until its own timeout, which
+            // on this transport is indistinguishable from ordinary slowness.
+            //
+            // This case used to use statvfs@openssh.com, which is now implemented. The replacement
+            // is picked to stay valid: Windows has no uid or gid, every file here reports 0 for
+            // both, and mapping that to a single name for the whole filesystem would be worse than
+            // the numeral -- so this one is not coming. expand-path@openssh.com is the other name
+            // the client knows and we do not answer, and it deliberately is NOT used here, because
+            // tilde expansion is something we might reasonably want one day.
             using (AgentSftpDriver d = new AgentSftpDriver())
             {
                 d.Send(AgentSftpDriver.Init(3));
                 d.Receive();
 
                 uint id = d.NextId();
-                d.Send(AgentSftpDriver.Extended(id, "statvfs@openssh.com"));
+                d.Send(AgentSftpDriver.Extended(id, "users-groups-by-id@openssh.com"));
                 AgentSftpDriver.Status s = AgentSftpDriver.ParseStatus(d.Receive());
                 Assert.Equal(id, s.Id);
                 Assert.Equal(AgentSftpDriver.StatusCode.OpUnsupported, s.Code);
-                Assert.Contains("statvfs", s.Message);
+                Assert.Contains("users-groups-by-id", s.Message);
             }
         }
 
