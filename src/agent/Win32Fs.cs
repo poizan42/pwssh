@@ -484,11 +484,17 @@ namespace Pwssh
         // By path rather than on an open handle, because scp -p sets times after the data handle has
         // been closed and flushed -- see the deferred-times note in Sftp.cs. BACKUP_SEMANTICS so the
         // same call works for a directory.
-        public static void SetTimesUtc(string fullPath, DateTime accessUtc, DateTime writeUtc)
+        /// <param name="noFollow">
+        /// Stamp the link itself rather than what it points at. That is what lsetstat means, and
+        /// without it the two differ only in name.
+        /// </param>
+        public static void SetTimesUtc(string fullPath, DateTime accessUtc, DateTime writeUtc, bool noFollow)
         {
+            uint flags = FILE_FLAG_BACKUP_SEMANTICS;
+            if (noFollow) flags |= FILE_FLAG_OPEN_REPARSE_POINT;
             SafeFileHandle h = CreateFileW(Extended(fullPath), FILE_WRITE_ATTRIBUTES,
                                            1 | 2 | 4, IntPtr.Zero, 3,
-                                           FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero);
+                                           flags, IntPtr.Zero);
             if (h.IsInvalid)
             {
                 int err = Marshal.GetLastWin32Error();

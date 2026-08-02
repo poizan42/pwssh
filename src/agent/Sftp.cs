@@ -369,7 +369,7 @@ namespace Pwssh
                 case SftpType.SYMLINK: DoSymlink(id, r.Text(), r.Text()); return;   // target, link
                 case SftpType.READLINK: DoReadLink(id, r.Text()); return;
 
-                case SftpType.SETSTAT: DoSetStat(id, r); return;
+                case SftpType.SETSTAT: DoSetStat(id, r, false); return;
                 case SftpType.FSETSTAT: DoFSetStat(id, r); return;
                 case SftpType.MKDIR: DoMkDir(id, r); return;
                 case SftpType.RMDIR: DoRmDir(id, r.Text()); return;
@@ -386,9 +386,10 @@ namespace Pwssh
                         if (name == "posix-rename@openssh.com") { DoRename(id, r.Text(), r.Text(), true); return; }
                         if (name == "fsync@openssh.com") { DoFsync(id, r.Text()); return; }
                         if (name == "hardlink@openssh.com") { DoHardLink(id, r.Text(), r.Text()); return; }
-                        // Setting attributes without following a link. With no link resolution
-                        // here in the first place, it is the same operation as SETSTAT.
-                        if (name == "lsetstat@openssh.com") { DoSetStat(id, r); return; }
+                        // Setting attributes on a link itself rather than on its target. Now
+                        // that links can exist here this really does differ from SETSTAT: it stamps
+                        // the link's own times and refuses to truncate through it.
+                        if (name == "lsetstat@openssh.com") { DoSetStat(id, r, true); return; }
                         SendStatus(id, SftpStatus.OP_UNSUPPORTED, "unsupported extension: " + name);
                         return;
                     }
@@ -542,9 +543,21 @@ namespace Pwssh
         // here would be wrong: the client sends the local file's mode in OPEN on *every* put,
         // and scp -p sends SETSTAT, so a failure breaks a transfer that otherwise worked
         // perfectly -- for a reason no user would guess.
-        private void ApplyAttrs(string win, AttrsIn a)
+        /// <param name="noFollow">
+        /// lsetstat@openssh.com: act on a link itself rather than on its target. It used to be
+        /// treated as plain SETSTAT on the grounds that there was no link resolution to differ from,
+        /// which stopped being true the moment links could be created -- and was already only
+        /// three-quarters true, since the read-only bit never followed a link even then.
+        /// </param>
+        private void ApplyAttrs(string win, AttrsIn a, bool noFollow)
         {
-            if (a.HasSize)
+            // Whether this path is a link at all, asked once. Only reparse points pay for it.
+            Win32Fs.Info probe;
+            bool isLink = noFollow && Win32Fs.TryGetInfo(win, out probe) && probe.IsReparsePoint;
+
+            // A size on a symbolic link is meaningless -- the link is a name, not a byte stream --
+            // and truncating whatever it points at is the one thing lsetstat exists to avoid.
+            if (a.HasSize && !isLink)
             {
                 using (FileStream fs = Win32Fs.Open(win, FileMode.Open, FileAccess.Write,
                                                     FileShare.None, false, 4096))
@@ -554,7 +567,7 @@ namespace Pwssh
             }
             if (a.HasTimes)
             {
-                Win32Fs.SetTimesUtc(win, FromUnix(a.Atime), FromUnix(a.Mtime));
+                Win32Fs.SetTimesUtc(win, FromUnix(a.Atime), FromUnix(a.Mtime), isLink);
             }
             if (a.HasPerms)
             {
@@ -569,10 +582,10 @@ namespace Pwssh
             }
         }
 
-        private void DoSetStat(uint id, SshLikeReader r)
+        private void DoSetStat(uint id, SshLikeReader r, bool noFollow)
         {
             string win = ToWindows(r.Text());
-            ApplyAttrs(win, ReadAttrs(r));
+            ApplyAttrs(win, ReadAttrs(r), noFollow);
             SendStatus(id, SftpStatus.OK, "");
         }
 
@@ -594,7 +607,7 @@ namespace Pwssh
                     AttrsIn permsOnly = new AttrsIn();
                     permsOnly.Flags = SftpAttr.PERMISSIONS;
                     permsOnly.Permissions = a.Permissions;
-                    ApplyAttrs(h.WinPath, permsOnly);
+                    ApplyAttrs(h.WinPath, permsOnly, false);
                 }
                 catch (Exception) { }
             }
@@ -1380,7 +1393,7 @@ namespace Pwssh
             if (!h.HasTimes || h.WinPath == null) return;
             try
             {
-                Win32Fs.SetTimesUtc(h.WinPath, FromUnix(h.Atime), FromUnix(h.Mtime));
+                Win32Fs.SetTimesUtc(h.WinPath, FromUnix(h.Atime), FromUnix(h.Mtime), false);
             }
             catch (Exception ex) { host.Log("could not set times on " + h.WinPath + ": " + ex.Message); }
         }
