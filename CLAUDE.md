@@ -161,39 +161,69 @@ Measured: four concurrent forwarded connections complete in the time of about on
   What actually releases them is the **agent's own inactivity watchdog**, and that is why it now runs at 120 s with the client sending a `PING` frame every 30 s (`PwsshAgentProxy.StartKeepAlive`). The keepalive is what makes silence *mean* something: before it, silence was indistinguishable from an idle interactive session, so the timeout had to be generous — and at 300 s the watchdog would have killed a session where the user simply stopped typing for five minutes. The session's WinRM `IdleTimeout` then reclaims the shell afterwards, shortened from 180 s to 60 s for the same reason; a live client always has a WSMan receive outstanding, so it is never idle and a real session is untouched.
 
   Two practical consequences. Reconnecting with the same `-R` port inside that window still fails — the clean-shutdown paths (`ssh -N` killed locally, `DISCONNECT`, an engine error) release immediately, which is what the dev-host test asserts, but the ordinary `ssh host cmd` exit cannot. And **clear orphaned shells before testing `-R`**, or a leak from a previous run looks like a bug in the current one: that cost a debugging cycle when the "released on exit" probe hung for its full 180 s timeout against a listener with nothing behind it and the failure was reported as "ssh timed out". The probe now bounds every wait and reports `STILLBOUND` instead.
-- **The remote cannot be told the client has gone, and this was measured rather than assumed.** The
-  obvious idea is to ask WinRM: a session *can* introspect its own shell, with
-  `Get-WSManInstance -ResourceURI shell -Enumerate` run on the remote as a loopback call that
-  creates no second shell, and it can identify its own row unambiguously because the shell's
-  `ProcessId` equals the agent's own PID. That yields `ShellId`, `Owner`, `ClientIP`, `State`,
-  `ShellInactivity`, `ShellRunTime` and `IdleTimeOut`; `$PSSenderInfo` adds `ConnectedUser`,
-  `RunAsUser` and the client's `ConnectionString`. **None of it detects an abruptly dead client.**
-  Probed directly by killing the client process 20 s into a session while a remote pipeline polled
-  its own shell every 2 s: `State` stayed `Connected` for the whole 88 s that followed, and
-  `ShellInactivity` climbed at the same rate before and after the kill — it measures "no new shell
-  operation", not client presence, and was already growing while the client was demonstrably alive
-  and holding a Receive open. `Disconnected` appears to require an explicit `Disconnect-PSSession`,
-  i.e. the one case where the client is alive enough to say so, which is not the case that needs
-  solving. Note also that the `IdleTimeOut` reported there is the service default (`PT7200.000S`),
-  not the 60 s the client asks for through session options. So the `PING` and the watchdog are not
-  a workaround for an API nobody exploited — the API exists and answers a different question,
-  because WS-Man deliberately keeps a shell reconnectable across a dropped connection.
+- **The remote cannot be told the client has gone, and this is architectural rather than an
+  unturned stone.** The TCP death is known instantly — but only to HTTP.sys and the WinRM service,
+  which live in other processes. Since WS-Man protocol 2.1 a shell must *survive* connection loss so
+  that Disconnect/Reconnect can work, so the service deliberately absorbs the abort: the shell stays
+  `Connected`, the plugin's receive operation stays open, and further output is buffered
+  (`OutputBufferingMode` `Block`). The only signal the service ever sends into `wsmprovhost` is the
+  per-operation `shutdownNotificationHandle`, and it signals that at shell **deletion** — i.e. at the
+  idle timeout the watchdog already beats. Established three ways:
 
-  **`WSManServerChannelEvents` is the other thing to reach for, and it is reachable but silent.**
-  `System.Management.Automation.Remoting.WSMan.WSManServerChannelEvents` is public and static, with
-  two events -- `ShuttingDown` (`EventHandler`) and `ActiveSessionsChanged`
-  (`EventHandler<ActiveSessionsChangedEventArgs>`) -- and handlers attach happily from inside a
-  session. Probed the same way: client killed 25 s in, **neither event fired in the following 60 s**.
-  The args type gives away why, having exactly one member, `Int32 ActiveSessionsCount`: these
-  describe how many sessions the HOST is serving, which matters to a process embedding the remoting
-  stack and not to `wsmprovhost`, which is per-shell and serves one. `ShuttingDown` most likely does
-  fire at eventual teardown, but that cannot be earlier than the watchdog, because WinRM will not
-  reap a shell whose pipeline is still running -- the same ordering that makes `IdleTimeout` no help.
-  Two caveats on the probe: the handlers were attached inside the pipeline, so a creation-time count
-  event would have been missed, and teardown itself was not waited out. Compile the handler rather
-  than using a scriptblock if repeating this -- these events are raised on arbitrary threads, and a
-  scriptblock off a runspace thread throws "There is no Runspace available to run scripts in this
-  thread."
+  - **Measured.** Client killed 20 s into a session; the shell's own row via
+    `Get-WSManInstance -ResourceURI shell -Enumerate` (a loopback call from inside the session, which
+    creates no second shell and can identify itself because the shell's `ProcessId` equals the
+    agent's `$PID`) still read `State=Connected` 88 s later. `ShellInactivity` climbed at the same
+    rate before and after the kill, so it means "no new shell operation", not client presence.
+    `IdleTimeOut` there reports the service default `PT7200.000S`, not the 60 s the client requests.
+  - **Decompiled.** `System.Management.Automation.Remoting.WSMan.WSManServerChannelEvents` is public
+    and static with `ShuttingDown` and `ActiveSessionsChanged`, and handlers attach fine from inside a
+    session — but an IL scan of 5.1's own SMA finds **exactly three** raiser call sites, matching
+    PS Core master with no divergence: shell *added*, shell *deleted* (and only when
+    `!context.isReceiveOperation`), and plugin *unloaded* by the service. **None can fire on client
+    death.** A probe confirmed neither fired in the 60 s after a kill; the decompile proves that was
+    not a timing artefact. `ActiveSessionsChangedEventArgs` has one member, `Int32
+    ActiveSessionsCount` — it counts sessions the *host* serves, which is 1 in a per-shell
+    `wsmprovhost`.
+  - **In the open source.** `pwrshplugin` (github.com/PowerShell/PowerShell-Native) is pure
+    marshaling; the WSMan plugin ABI has no disconnect or client-connectivity callback at all, only
+    that per-operation shutdown handle.
+
+  **Write-side detection does not work either, and this explains the pump-blocked symptom above.**
+  The output path is synchronous from the emitting thread through `SendDataToClient` into native
+  `WSManPluginReceiveResult`. With the client gone the service *buffers* rather than failing, so
+  writes **succeed** until the buffer fills and then block the thread inside native code — no
+  exception, no event, and no bounded managed queue to overflow observably. An error *would* be loud
+  (`WSManTransportErrorOccured` → session teardown); it just never comes.
+
+  Dead ends not worth re-walking: correlating the shell's `ClientIP` against the remote's TCP table
+  (measured — 2 shells, 3 connections all from one address, and the connections are owned by PID 4,
+  System/HTTP.sys, so there is neither a per-shell address nor a per-shell owning process; pwssh's own
+  `-Streams` also opens several sessions from one client); `$PSSenderInfo`, which is static; and ETW,
+  which needs admin to enable or consume. If repeating the event probes, compile the handler — these
+  fire on arbitrary threads, and a scriptblock off a runspace thread throws "There is no Runspace
+  available to run scripts in this thread."
+
+- **The fix is on the client, where the death *is* instantly observable — see `src/Start-PwsshSentinel.ps1`.**
+  `ssh_kill_proxy_command` TerminateProcesses its **direct child only**, so a grandchild survives. The
+  sentinel is that grandchild: it waits on a handle to the ProxyCommand (a kernel wait, not a poll,
+  so it costs nothing while idle) and on release deletes the shell with `Remove-WSManInstance` — the
+  same cleanup this file already documents, just performed two minutes earlier. The service reacts to
+  the delete by signalling the shell operation's shutdown handle, which tears the session down
+  properly, so job objects reap the children and the `-R` sockets and NTFS locks go with them.
+  **Measured: shell gone 1.3 s after the kill against the watchdog's 120 s** — parent exit observed
+  at +0 ms, delete issued 33 ms later, completed after one 726 ms WinRM round trip.
+
+  It needs the shell id, and the client already has it: **`PSSession.InstanceId` IS the WSMan
+  `ShellId`** (verified by comparing it against what the remote reports for its own shell), so there
+  is no round trip and no agent change. Two limits: it needs a credential it can load itself, so it
+  only works with `-CredentialPath` and not an inline `-Credential`; and it cannot help when the
+  client machine dies outright, which is why the watchdog stays as the backstop.
+
+  **Do not name a parameter `-ShellId`.** `$ShellId` is a global **read-only** automatic variable
+  holding `"Microsoft.PowerShell"`, so `param([string]$ShellId)` cannot bind at all — every
+  invocation dies with *"Cannot overwrite variable ShellId because it is read-only or constant"*
+  before a line of the body runs. Hence `-RemoteShell`.
 - **`cancel-tcpip-forward` is answered immediately**, not after a round trip: a failure to unbind is not something the client can act on.
 - **Global request replies are order-matched, not tagged.** RFC 4254 pairs them with requests in order, so `pendingForwards` is a FIFO and a result that arrives for a request behind the head waits its turn. ssh normally keeps one outstanding, but replying out of order would desynchronise every reply after it.
 - **Windows has no privileged-port concept.** A normal user can bind port 80 if it is free, so low ports are not a failure case to design around; real bind failures are "already in use" or an excluded range (`netsh interface ipv4 show excludedportrange` — Hyper-V reserves large parts of the dynamic range). This makes loopback-by-default *more* valuable, not less: `-R 80:...` from an unprivileged remote account can genuinely succeed.
