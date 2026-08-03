@@ -161,6 +161,23 @@ Measured: four concurrent forwarded connections complete in the time of about on
   What actually releases them is the **agent's own inactivity watchdog**, and that is why it now runs at 120 s with the client sending a `PING` frame every 30 s (`PwsshAgentProxy.StartKeepAlive`). The keepalive is what makes silence *mean* something: before it, silence was indistinguishable from an idle interactive session, so the timeout had to be generous — and at 300 s the watchdog would have killed a session where the user simply stopped typing for five minutes. The session's WinRM `IdleTimeout` then reclaims the shell afterwards, shortened from 180 s to 60 s for the same reason; a live client always has a WSMan receive outstanding, so it is never idle and a real session is untouched.
 
   Two practical consequences. Reconnecting with the same `-R` port inside that window still fails — the clean-shutdown paths (`ssh -N` killed locally, `DISCONNECT`, an engine error) release immediately, which is what the dev-host test asserts, but the ordinary `ssh host cmd` exit cannot. And **clear orphaned shells before testing `-R`**, or a leak from a previous run looks like a bug in the current one: that cost a debugging cycle when the "released on exit" probe hung for its full 180 s timeout against a listener with nothing behind it and the failure was reported as "ssh timed out". The probe now bounds every wait and reports `STILLBOUND` instead.
+- **The remote cannot be told the client has gone, and this was measured rather than assumed.** The
+  obvious idea is to ask WinRM: a session *can* introspect its own shell, with
+  `Get-WSManInstance -ResourceURI shell -Enumerate` run on the remote as a loopback call that
+  creates no second shell, and it can identify its own row unambiguously because the shell's
+  `ProcessId` equals the agent's own PID. That yields `ShellId`, `Owner`, `ClientIP`, `State`,
+  `ShellInactivity`, `ShellRunTime` and `IdleTimeOut`; `$PSSenderInfo` adds `ConnectedUser`,
+  `RunAsUser` and the client's `ConnectionString`. **None of it detects an abruptly dead client.**
+  Probed directly by killing the client process 20 s into a session while a remote pipeline polled
+  its own shell every 2 s: `State` stayed `Connected` for the whole 88 s that followed, and
+  `ShellInactivity` climbed at the same rate before and after the kill — it measures "no new shell
+  operation", not client presence, and was already growing while the client was demonstrably alive
+  and holding a Receive open. `Disconnected` appears to require an explicit `Disconnect-PSSession`,
+  i.e. the one case where the client is alive enough to say so, which is not the case that needs
+  solving. Note also that the `IdleTimeOut` reported there is the service default (`PT7200.000S`),
+  not the 60 s the client asks for through session options. So the `PING` and the watchdog are not
+  a workaround for an API nobody exploited — the API exists and answers a different question,
+  because WS-Man deliberately keeps a shell reconnectable across a dropped connection.
 - **`cancel-tcpip-forward` is answered immediately**, not after a round trip: a failure to unbind is not something the client can act on.
 - **Global request replies are order-matched, not tagged.** RFC 4254 pairs them with requests in order, so `pendingForwards` is a FIFO and a result that arrives for a request behind the head waits its turn. ssh normally keeps one outstanding, but replying out of order would desynchronise every reply after it.
 - **Windows has no privileged-port concept.** A normal user can bind port 80 if it is free, so low ports are not a failure case to design around; real bind failures are "already in use" or an excluded range (`netsh interface ipv4 show excludedportrange` — Hyper-V reserves large parts of the dynamic range). This makes loopback-by-default *more* valuable, not less: `-R 80:...` from an unprivileged remote account can genuinely succeed.
