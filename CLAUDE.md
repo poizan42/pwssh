@@ -178,6 +178,22 @@ Measured: four concurrent forwarded connections complete in the time of about on
   not the 60 s the client asks for through session options. So the `PING` and the watchdog are not
   a workaround for an API nobody exploited — the API exists and answers a different question,
   because WS-Man deliberately keeps a shell reconnectable across a dropped connection.
+
+  **`WSManServerChannelEvents` is the other thing to reach for, and it is reachable but silent.**
+  `System.Management.Automation.Remoting.WSMan.WSManServerChannelEvents` is public and static, with
+  two events -- `ShuttingDown` (`EventHandler`) and `ActiveSessionsChanged`
+  (`EventHandler<ActiveSessionsChangedEventArgs>`) -- and handlers attach happily from inside a
+  session. Probed the same way: client killed 25 s in, **neither event fired in the following 60 s**.
+  The args type gives away why, having exactly one member, `Int32 ActiveSessionsCount`: these
+  describe how many sessions the HOST is serving, which matters to a process embedding the remoting
+  stack and not to `wsmprovhost`, which is per-shell and serves one. `ShuttingDown` most likely does
+  fire at eventual teardown, but that cannot be earlier than the watchdog, because WinRM will not
+  reap a shell whose pipeline is still running -- the same ordering that makes `IdleTimeout` no help.
+  Two caveats on the probe: the handlers were attached inside the pipeline, so a creation-time count
+  event would have been missed, and teardown itself was not waited out. Compile the handler rather
+  than using a scriptblock if repeating this -- these events are raised on arbitrary threads, and a
+  scriptblock off a runspace thread throws "There is no Runspace available to run scripts in this
+  thread."
 - **`cancel-tcpip-forward` is answered immediately**, not after a round trip: a failure to unbind is not something the client can act on.
 - **Global request replies are order-matched, not tagged.** RFC 4254 pairs them with requests in order, so `pendingForwards` is a FIFO and a result that arrives for a request behind the head waits its turn. ssh normally keeps one outstanding, but replying out of order would desynchronise every reply after it.
 - **Windows has no privileged-port concept.** A normal user can bind port 80 if it is free, so low ports are not a failure case to design around; real bind failures are "already in use" or an excluded range (`netsh interface ipv4 show excludedportrange` — Hyper-V reserves large parts of the dynamic range). This makes loopback-by-default *more* valuable, not less: `-R 80:...` from an unprivileged remote account can genuinely succeed.
