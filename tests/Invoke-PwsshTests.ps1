@@ -636,19 +636,19 @@ try {
     # The listener must go away when the SSH connection ends. A leak is invisible without this
     # check and keeps a port bound on the far side.
     #
-    # Only assertable against the dev host. Over WinRM ssh TerminateProcesses its ProxyCommand
-    # on exit, so the engine's UNLISTEN never reaches the remote and the port stays bound until
-    # WinRM reclaims the orphaned shell (IdleTimeout, 60 s). Waiting that out here would add a
-    # minute to the run to test WinRM's reclamation rather than any of our code.
-    if ($Port -gt 0) {
-        $r = Invoke-Ssh -Command (New-ReverseProbe $ReversePort)
-        $so = [System.Text.Encoding]::ASCII.GetString($r.Stdout)
-        Assert-That 'reverse forward is released on exit' ($so -match 'REFUSED|NOCONNECT') `
-            "port $ReversePort still answers: '$($so -replace '\s+', ' ')'"
-    }
-    else {
-        Write-Host '  SKIP  reverse forward is released on exit (WinRM: ssh kills the ProxyCommand; see CLAUDE.md)' -ForegroundColor DarkGray
-    }
+    # This used to SKIP over WinRM, because ssh TerminateProcesses its ProxyCommand on exit so the
+    # engine's UNLISTEN never arrived and the port stayed bound for the agent's watchdog. The
+    # cleanup sentinel closes that gap -- it is a grandchild of ssh, which TerminateProcess does not
+    # reach, so it survives to delete the shell and the remote tears down in about a second. So the
+    # case is now asserted on BOTH transports, and it is the end-to-end proof that the sentinel
+    # works: without it, this fails over WinRM.
+    #
+    # A couple of seconds of slack, because the sentinel's own path is a WinRM round trip.
+    Start-Sleep -Seconds 3
+    $r = Invoke-Ssh -Command (New-ReverseProbe $ReversePort)
+    $so = [System.Text.Encoding]::ASCII.GetString($r.Stdout)
+    Assert-That 'reverse forward is released on exit' ($so -match 'REFUSED|NOCONNECT') `
+        "port $ReversePort still answers: '$($so -replace '\s+', ' ')'"
 
     # Port 0 asks the far side to choose, and the chosen port comes back in the reply.
     $r = Invoke-Ssh -Command 'echo dyn' -Extra @('-v', '-R', '0:127.0.0.1:9')

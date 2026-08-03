@@ -34,7 +34,9 @@ param(
     # dies with "Cannot overwrite variable ShellId because it is read-only or constant", before a
     # line of the body runs. A plain assignment anywhere in a script fails the same way, which is
     # how this was found.
-    [string]$RemoteShell,
+    #
+    # Plural because -Streams opens a shell per mule, and every one of them lingers the same way.
+    [string[]]$RemoteShell,
 
     [string]$ComputerName,
     [string]$CredentialPath,
@@ -55,9 +57,9 @@ function Note([string]$m) {
     }
 }
 
-Note "sentinel up: watching pid $ParentPid for shell $RemoteShell on $ComputerName"
+Note "sentinel up: watching pid $ParentPid for shell(s) $($RemoteShell -join ', ') on $ComputerName"
 
-if ($ParentPid -le 0 -or [string]::IsNullOrEmpty($RemoteShell) -or [string]::IsNullOrEmpty($ComputerName)) {
+if ($ParentPid -le 0 -or -not $RemoteShell -or [string]::IsNullOrEmpty($ComputerName)) {
     Note 'missing required arguments; nothing to do'
     return
 }
@@ -77,32 +79,42 @@ catch {
 }
 
 # From here everything is bounded and best-effort. A sentinel that throws is invisible.
-try {
-    $scheme = if ($UseSSL) { 'https' } else { 'http' }
-    $p = if ($Port -gt 0) { $Port } elseif ($UseSSL) { 5986 } else { 5985 }
-    $uri = "${scheme}://${ComputerName}:${p}/wsman"
+$scheme = if ($UseSSL) { 'https' } else { 'http' }
+$p = if ($Port -gt 0) { $Port } elseif ($UseSSL) { 5986 } else { 5985 }
+$uri = "${scheme}://${ComputerName}:${p}/wsman"
 
-    # Not $args, which is the automatic arguments array -- writable, unlike $ShellId, so it would
-    # have worked, but shadowing an automatic in a script that also uses splatting is asking for a
-    # confusing afternoon.
-    $removeArgs = @{
-        ConnectionURI  = $uri
-        ResourceURI    = 'shell'
-        SelectorSet    = @{ ShellId = $RemoteShell }
-        Authentication = $Authentication
-        ErrorAction    = 'Stop'
-    }
-    if ($CredentialPath -and (Test-Path -LiteralPath $CredentialPath)) {
-        $removeArgs['Credential'] = Import-CliXml -Path $CredentialPath
-    }
+$cred = $null
+if ($CredentialPath -and (Test-Path -LiteralPath $CredentialPath)) {
+    try { $cred = Import-CliXml -Path $CredentialPath }
+    catch { Note "could not load the credential: $($_.Exception.Message.Split([char]10)[0])" }
+}
+# No credential is a perfectly good case rather than a failure: with Negotiate against a machine the
+# user can already reach as themselves, Remove-WSManInstance authenticates implicitly, which is
+# exactly the situation of someone running pwssh with no -Credential at all.
 
-    Note "removing shell via $uri"
-    Remove-WSManInstance @removeArgs
-    Note 'shell removed'
+foreach ($shell in $RemoteShell) {
+    if ([string]::IsNullOrWhiteSpace($shell)) { continue }
+    try {
+        # Not $args, which is the automatic arguments array -- writable, unlike $ShellId, so it
+        # would have worked, but shadowing an automatic in a script that also splats is asking for
+        # a confusing afternoon.
+        $removeArgs = @{
+            ConnectionURI  = $uri
+            ResourceURI    = 'shell'
+            SelectorSet    = @{ ShellId = $shell }
+            Authentication = $Authentication
+            ErrorAction    = 'Stop'
+        }
+        if ($cred) { $removeArgs['Credential'] = $cred }
+
+        Remove-WSManInstance @removeArgs
+        Note "removed $shell"
+    }
+    catch {
+        # The common and harmless case: pwssh-connect exited cleanly, tore its own session down, and
+        # the shell is already gone. Each shell is attempted independently so one stale id cannot
+        # strand the others.
+        Note "could not remove $shell (usually already gone): $($_.Exception.Message.Split([char]10)[0])"
+    }
 }
-catch {
-    # The common and harmless case: pwssh-connect exited cleanly, tore the session down itself, and
-    # the shell is already gone. Also covers a credential passed inline rather than by path, where
-    # the sentinel has nothing to authenticate with.
-    Note "cleanup failed or unnecessary: $($_.Exception.Message.Split([char]10)[0])"
-}
+Note 'done'

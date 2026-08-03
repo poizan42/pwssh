@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns the remote's `DOMAIN\user`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite runs 99–109 cases per transport, and both are green: **WinRM 109/109, loopback 99/99**. A second suite, `tests/Pwssh.Tests`, adds **102 xUnit cases** for what the stock client cannot ask for — a mid-transfer backwards seek, raw SFTP packets, every symlink case, and the first automated coverage of pty, `window-change` and `signal`; see *The SSH.NET test project*. Loopback needs the dev host started with its own console, or the pty case fails on a harness artifact rather than a pwssh bug — see *Running and testing*. The two runs differ in composition rather than count — WinRM has the graceful-degradation and IPv6 cases plus the gateway-ports check; loopback has the wrong-username check that the WinRM alias takes from `ssh_config`, along with the reverse-forward release and bind-failure cases that need the far side to be this machine.
+**`exec` and `shell` both work end to end over WinRM.** `ssh pwssh-test whoami` returns the remote's `DOMAIN\user`, and `ssh pwssh-test` gives a cmd.exe session — with a real terminal when the client asks for one. The suite runs 99–110 cases per transport, and both are green: **WinRM 110/110, loopback 99/99**. The WinRM run now has **no SKIPs at all**, the reverse-forward release case having become assertable there once the cleanup sentinel existed; loopback still skips five, which are the dev host’s own limitations rather than anything unproven. A second suite, `tests/Pwssh.Tests`, adds **102 xUnit cases** for what the stock client cannot ask for — a mid-transfer backwards seek, raw SFTP packets, every symlink case, and the first automated coverage of pty, `window-change` and `signal`; see *The SSH.NET test project*. Loopback needs the dev host started with its own console, or the pty case fails on a harness artifact rather than a pwssh bug — see *Running and testing*. The two runs differ in composition rather than count — WinRM has the graceful-degradation and IPv6 cases plus the gateway-ports check; loopback has the wrong-username check that the WinRM alias takes from `ssh_config`, along with the reverse-forward release and bind-failure cases that need the far side to be this machine.
 
 **A run that fails one case with `exit=255` is usually a flake, not a regression.** 255 is ssh's own error code for a connection that never came up, and it turns up after the remote has been hammered with dozens of sessions in a row. Re-run the case before believing it: the final WinRM run here failed "shell exit status propagates" that way and passed 3/3 immediately afterwards.
 
@@ -160,6 +160,8 @@ Measured: four concurrent forwarded connections complete in the time of about on
 
   What actually releases them is the **agent's own inactivity watchdog**, and that is why it now runs at 120 s with the client sending a `PING` frame every 30 s (`PwsshAgentProxy.StartKeepAlive`). The keepalive is what makes silence *mean* something: before it, silence was indistinguishable from an idle interactive session, so the timeout had to be generous — and at 300 s the watchdog would have killed a session where the user simply stopped typing for five minutes. The session's WinRM `IdleTimeout` then reclaims the shell afterwards, shortened from 180 s to 60 s for the same reason; a live client always has a WSMan receive outstanding, so it is never idle and a real session is untouched.
 
+  **The sentinel below now closes this**, so the paragraph above describes what happens with `-NoSentinel` or when the client machine dies outright rather than the normal case: a `-R` port is released in **0.4 s** measured, not 120 s. The watchdog and the shortened `IdleTimeout` stay as the backstop for the cases the sentinel cannot cover.
+
   Two practical consequences. Reconnecting with the same `-R` port inside that window still fails — the clean-shutdown paths (`ssh -N` killed locally, `DISCONNECT`, an engine error) release immediately, which is what the dev-host test asserts, but the ordinary `ssh host cmd` exit cannot. And **clear orphaned shells before testing `-R`**, or a leak from a previous run looks like a bug in the current one: that cost a debugging cycle when the "released on exit" probe hung for its full 180 s timeout against a listener with nothing behind it and the failure was reported as "ssh timed out". The probe now bounds every wait and reports `STILLBOUND` instead.
 - **The remote cannot be told the client has gone, and this is architectural rather than an
   unturned stone.** The TCP death is known instantly — but only to HTTP.sys and the WinRM service,
@@ -204,7 +206,7 @@ Measured: four concurrent forwarded connections complete in the time of about on
   fire on arbitrary threads, and a scriptblock off a runspace thread throws "There is no Runspace
   available to run scripts in this thread."
 
-- **The fix is on the client, where the death *is* instantly observable — see `src/Start-PwsshSentinel.ps1`.**
+- **The fix is on the client, where the death *is* instantly observable — `src/Start-PwsshSentinel.ps1`, on by default, `-NoSentinel` to disable.**
   `ssh_kill_proxy_command` TerminateProcesses its **direct child only**, so a grandchild survives. The
   sentinel is that grandchild: it waits on a handle to the ProxyCommand (a kernel wait, not a poll,
   so it costs nothing while idle) and on release deletes the shell with `Remove-WSManInstance` — the
@@ -219,6 +221,15 @@ Measured: four concurrent forwarded connections complete in the time of about on
   is no round trip and no agent change. Two limits: it needs a credential it can load itself, so it
   only works with `-CredentialPath` and not an inline `-Credential`; and it cannot help when the
   client machine dies outright, which is why the watchdog stays as the backstop.
+
+  Wired into `pwssh-connect.ps1` after the mules are created, so it takes every shell id at once —
+  striping opens one per mule and they linger identically. **Every stream of the child is redirected,
+  and that is not tidiness:** this process's stdout IS the SSH transport, so a child inheriting it
+  would hold the pipe open after we exit and ssh waiting for EOF on a clean exit would hang.
+
+  End-to-end proof is the suite's own `reverse forward is released on exit` case, which **used to
+  SKIP over WinRM for exactly this reason and now runs on both transports** — it fails without the
+  sentinel. Measured release: 0.4 s.
 
   **Do not name a parameter `-ShellId`.** `$ShellId` is a global **read-only** automatic variable
   holding `"Microsoft.PowerShell"`, so `param([string]$ShellId)` cannot bind at all — every

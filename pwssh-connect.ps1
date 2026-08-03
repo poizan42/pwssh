@@ -66,6 +66,15 @@ param(
     # Honour a client-specified bind address for -R. Off by default, so a reverse forward
     # binds loopback on the remote rather than exposing it to the remote's network.
     [switch]$GatewayPorts,
+    # Skip the cleanup sentinel. It is on by default because it fixes a real wart at the cost of one
+    # idle process: ssh TerminateProcesses this script on exit, so nothing here can tell the remote
+    # to let go, and its resources sit for the agent's 120 s watchdog. The sentinel is a grandchild
+    # of ssh -- which TerminateProcess does not reach -- so it survives to delete the shell, and the
+    # remote tears down in about a second instead. See src/Start-PwsshSentinel.ps1.
+    #
+    # Turn it off if one extra pwsh per connection matters more than prompt cleanup, or to get the
+    # old behaviour back while diagnosing something.
+    [switch]$NoSentinel,
     [string]$LogFile,
     # Progress messages on stderr. Off by default: ssh shows the ProxyCommand's stderr
     # directly in the user's terminal, so it would be noise on every connection.
@@ -269,6 +278,60 @@ try {
         }
     }
     if ($stripes -gt 0) { Write-Diag "streams: 1 primary + $($mules.Count) mule(s)" }
+
+    # --- the cleanup sentinel ------------------------------------------------
+    # Spawned after the mules so it can take every shell id at once. It waits on a handle to THIS
+    # process and deletes those shells when it is signalled -- which happens the instant ssh
+    # TerminateProcesses us, because TerminateProcess reaches the direct child only and a grandchild
+    # survives it. Measured: the remote lets go in ~1.3 s rather than the watchdog's 120 s.
+    #
+    # PSSession.InstanceId IS the WSMan ShellId, verified against what the remote reports for its own
+    # shell, so no round trip and no agent involvement are needed to learn what to delete.
+    if (-not $NoSentinel) {
+        try {
+            if ($Credential -and -not $CredentialPath) {
+                # An inline credential cannot be handed to a child without writing it somewhere, and
+                # writing a credential to disk to tidy up faster is a bad trade.
+                Write-Diag 'sentinel skipped: -Credential was given inline, so there is nothing the sentinel can authenticate with'
+            }
+            else {
+                $shellIds = @($session.InstanceId.ToString())
+                foreach ($m in $mules) { $shellIds += $m.Session.InstanceId.ToString() }
+
+                $spi = New-Object System.Diagnostics.ProcessStartInfo
+                $spi.FileName = (Get-Process -Id $PID).Path
+                $sentinelArgs = @(
+                    '-NoProfile', '-NonInteractive', '-File', "$PSScriptRoot\src\Start-PwsshSentinel.ps1",
+                    '-ParentPid', $PID.ToString(),
+                    '-ComputerName', $ComputerName,
+                    '-Authentication', $Authentication,
+                    '-RemoteShell'
+                ) + $shellIds
+                if ($CredentialPath) { $sentinelArgs += @('-CredentialPath', $CredentialPath) }
+                if ($Port) { $sentinelArgs += @('-Port', $Port.ToString()) }
+                if ($UseSSL) { $sentinelArgs += '-UseSSL' }
+                if ($LogFile) { $sentinelArgs += @('-LogFile', "$LogFile.sentinel") }
+                foreach ($a in $sentinelArgs) { $spi.ArgumentList.Add($a) }
+
+                # Every stream is redirected, and that is not tidiness. This process's stdout IS the
+                # SSH transport: a child inheriting it would keep the pipe open after we exit, and
+                # ssh waiting for EOF on a clean exit would hang. Fresh pipes it never uses instead.
+                $spi.UseShellExecute = $false
+                $spi.CreateNoWindow = $true
+                $spi.RedirectStandardInput = $true
+                $spi.RedirectStandardOutput = $true
+                $spi.RedirectStandardError = $true
+
+                $sentinel = [System.Diagnostics.Process]::Start($spi)
+                Write-Diag "sentinel started (pid $($sentinel.Id)) for $($shellIds.Count) shell(s)"
+            }
+        }
+        catch {
+            # Never fatal. Without it the remote falls back to the watchdog, which is exactly the
+            # behaviour that shipped before this existed.
+            Write-Diag "sentinel could not be started: $($_.Exception.Message)"
+        }
+    }
 
     $reseq = New-Object Pwssh.FrameResequencer
 
