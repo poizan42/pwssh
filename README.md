@@ -2,10 +2,11 @@
 
 An SSH server that speaks only PowerShell Remoting over WinRM.
 
-The point is to let ordinary SSH tooling reach Windows machines that have **no SSH server
-installed** and that you have no rights to change — as long as you can already open a
-PowerShell remoting session to them. `ssh`, and anything built on it, then works against a
-host that has never heard of SSH.
+The point is to let ordinary SSH tooling reach Windows machines that you have PowerShell
+remoting access to but that have **no SSH server installed** and that you cannot make
+configuration changes on/install software on (or is otherwise only accessible through
+PowerShell remoting).
+`ssh`, and anything built on it, then works against a host that has never heard of SSH.
 
 ```
 ssh client
