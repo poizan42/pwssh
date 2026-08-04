@@ -150,7 +150,7 @@ Useful options on `pwssh-connect.ps1`:
 | `-InactivityTimeoutSeconds` | give up if the ssh client stops speaking for this long, default 300, so a proxy that outlives its client cannot hold a WinRM shell open. pwssh sends its own keepalive toward the client, so an **idle** interactive session is never dropped by this and needs no `ServerAliveInterval` |
 | `-Diagnostics` | progress to stderr. Off by default, since ssh shows a ProxyCommand's stderr on every connection |
 
-## Performance, honestly
+## Performance
 
 The transport is high-latency and asymmetric, and that shapes everything.
 
