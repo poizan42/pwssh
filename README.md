@@ -36,7 +36,7 @@ Tested against OpenSSH 10.0p2 on Windows, with a Windows PowerShell 5.1 / .NET F
 remote. The test suite drives the real `ssh`, `sftp` and `scp` binaries: 110 cases over WinRM and
 99 against a loopback dev host, plus 102 xUnit cases for what no stock client can ask for.
 
-Three things worth knowing — two warts, one fixed, and one pleasant surprise:
+Four things worth knowing before you rely on it:
 
 - **`ln -s` depends on the remote account, not on pwssh.** Reading links always works. *Creating*
   one needs `SeCreateSymbolicLinkPrivilege` in a non-restricted token — which a domain admin
@@ -46,23 +46,20 @@ Three things worth knowing — two warts, one fixed, and one pleasant surprise:
   Mode alone is enough. Where none of the three holds you get `Permission denied` naming all
   three, and nothing else is affected.
 
-- ~~**`-R` ports linger.**~~ **Fixed.** `ssh` kills its `ProxyCommand` when it exits, so pwssh
-  could not tell the remote to let go, and a `-R` port stayed bound for about two minutes. A
-  cleanup sentinel now handles it: `TerminateProcess` reaches only ssh's direct child, so a
-  grandchild survives to delete the WinRM shell, and the remote tears down properly. Measured at
-  **0.4 s** to release the port, against 120 s+ before. Costs one idle process per connection;
-  `-NoSentinel` turns it off. It cannot help if the client machine dies outright — the remote's
-  watchdog stays as the backstop for that.
+- **Each connection leaves a small helper process behind for a moment.** `ssh` kills its
+  `ProxyCommand` outright when it exits, giving pwssh no chance to tell the remote to let go, so a
+  sentinel process survives to do it — otherwise a `-R` port would stay bound and remote child
+  processes would linger for about two minutes. It releases in **~0.4 s** and then exits.
+  `-NoSentinel` turns it off, at the cost of falling back to that timeout. If the client machine
+  dies outright the timeout is the backstop either way.
+
 - **SFTP pays round trips per file, and that dominates anything but one large file.** The client
   stats, opens and closes each file separately, so on a link where a round trip is most of a
-  second a small file costs a couple of seconds however few bytes it holds: 40 files of 900 bytes
-  measured **~150 s**, now **~94 s** — pwssh answers the second of the client's two metadata
-  requests from a parallel fetch of its own and acknowledges a read-only close without waiting.
-  Roughly three round trips per file remain. One large file is fine: pwssh reads ahead on a
-  private channel and downloads measured 3.29 MiB/s at 32 MiB (1.42× over forwarding the client's
-  requests one at a time), and 0.76 MiB/s at 8 MiB, where fixed cost is most of the transfer.
-  Uploads, at ~0.35 MiB/s, are already at the link's upstream ceiling. **Do not pass `sftp -B`**
-  — it suppresses the buffer negotiation that keeps this from being far worse.
+  second a small file costs a couple of seconds however few bytes it holds — 40 files of 900 bytes
+  measured **~94 s**. One large file is fine: pwssh reads ahead on a private channel, and
+  downloads measured **3.29 MiB/s at 32 MiB** and 0.76 MiB/s at 8 MiB, where fixed cost is most
+  of the transfer. Uploads, at ~0.35 MiB/s, are already at the link's upstream ceiling. **Do not
+  pass `sftp -B`** — it suppresses the buffer negotiation that keeps this from being far worse.
 
 - **For one big download, `scp -O` is the fastest thing here.** It uses the legacy scp protocol,
   which streams the body with no per-chunk acknowledgement at all — no request ramp, nothing to
@@ -145,7 +142,7 @@ Useful options on `pwssh-connect.ps1`:
 |---|---|
 | `-Authentication` | WinRM auth mode, default `Negotiate` |
 | `-AgentDllPath` | where to find `PwsshAgent.dll`. Defaults to the build output, then to a copy beside the script |
-| `-CreditMiB` | bulk transfer window, default 32. Larger means fewer round trips on big transfers, at the cost of how much the agent may buffer client-side. Values below 2 are raised to 2: a channel announces credit only once 2 MiB has accrued, so a smaller window deadlocks rather than throttling |
+| `-CreditMiB` | bulk transfer window, default 32. Larger means fewer round trips on big transfers, at the cost of how much the agent may buffer client-side. Values below 2 are raised to 2 |
 | `-NoSentinel` | skip the cleanup sentinel, so the remote falls back to its 120 s watchdog after ssh exits |
 | `-Streams N` | extra receive sessions for bulk **incompressible** transfers (see below), default 1 |
 | `-SftpReadAheadChunks` | how far ahead an SFTP download is fetched, in 255 KiB chunks, default 64 (≈16 MiB held client-side). `0` turns read-ahead off and restores byte-for-byte forwarding |
@@ -174,10 +171,10 @@ parallel receive threads, so once compression has already relieved that bottlene
 sessions merely cost setup time. It measured **2.8× on incompressible** data and **0.83×
 — slower — on compressible** data, hence opt-in.
 
-And SFTP is still slower than `exec` for the same bytes because it is a request/response
-protocol whose pacing the *client* controls. Read-ahead removes the client's slow request ramp
-but not its four round trips per file — see the wart above. If you are moving a directory tree,
-archiving it on the far side and transferring one file will beat `scp -r` by a wide margin:
+And SFTP is slower than `exec` for the same bytes because it is a request/response protocol whose
+pacing the *client* controls — pwssh reads ahead to hide that, but cannot remove the round trips
+the client spends per file. If you are moving a directory tree, archiving it on the far side and
+transferring one file will beat `scp -r` by a wide margin:
 
 ```bash
 ssh myremote "powershell -c Compress-Archive -Path C:/data -DestinationPath C:/data.zip"
