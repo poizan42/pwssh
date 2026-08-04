@@ -51,9 +51,8 @@ Three things worth knowing — two warts, one fixed, and one pleasant surprise:
   cleanup sentinel now handles it: `TerminateProcess` reaches only ssh's direct child, so a
   grandchild survives to delete the WinRM shell, and the remote tears down properly. Measured at
   **0.4 s** to release the port, against 120 s+ before. Costs one idle process per connection;
-  `-NoSentinel` turns it off. It needs `-CredentialPath` rather than an inline `-Credential`, since
-  it must load the credential itself, and it cannot help if the client machine dies outright — the
-  remote's watchdog stays as the backstop for that.
+  `-NoSentinel` turns it off. It cannot help if the client machine dies outright — the remote's
+  watchdog stays as the backstop for that.
 - **SFTP pays round trips per file, and that dominates anything but one large file.** The client
   stats, opens and closes each file separately, so on a link where a round trip is most of a
   second a small file costs a couple of seconds however few bytes it holds: 40 files of 900 bytes

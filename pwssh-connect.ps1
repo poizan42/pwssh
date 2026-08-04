@@ -289,42 +289,46 @@ try {
     # shell, so no round trip and no agent involvement are needed to learn what to delete.
     if (-not $NoSentinel) {
         try {
-            if ($Credential -and -not $CredentialPath) {
-                # An inline credential cannot be handed to a child without writing it somewhere, and
-                # writing a credential to disk to tidy up faster is a bad trade.
-                Write-Diag 'sentinel skipped: -Credential was given inline, so there is nothing the sentinel can authenticate with'
+            $shellIds = @($session.InstanceId.ToString())
+            foreach ($m in $mules) { $shellIds += $m.Session.InstanceId.ToString() }
+
+            $spi = New-Object System.Diagnostics.ProcessStartInfo
+            $spi.FileName = (Get-Process -Id $PID).Path
+            $sentinelArgs = @(
+                '-NoProfile', '-NonInteractive', '-File', "$PSScriptRoot\src\Start-PwsshSentinel.ps1",
+                '-ParentPid', $PID.ToString(),
+                '-ComputerName', $ComputerName,
+                '-Authentication', $Authentication,
+                '-RemoteShell'
+            ) + $shellIds
+            # The credential goes over stdin as CLIXML, which works for an inline -Credential just
+            # as well as for a -CredentialPath and writes nothing to disk. Not an argument or an
+            # environment variable: both are readable by any process of this user and both tend to
+            # get logged.
+            if ($Credential) { $sentinelArgs += '-CredentialOnStdin' }
+            if ($Port) { $sentinelArgs += @('-Port', $Port.ToString()) }
+            if ($UseSSL) { $sentinelArgs += '-UseSSL' }
+            if ($LogFile) { $sentinelArgs += @('-LogFile', "$LogFile.sentinel") }
+            foreach ($a in $sentinelArgs) { $spi.ArgumentList.Add($a) }
+
+            # Every stream is redirected, and that is not tidiness. This process's stdout IS the
+            # SSH transport: a child inheriting it would keep the pipe open after we exit, and
+            # ssh waiting for EOF on a clean exit would hang. Fresh pipes it never uses instead.
+            $spi.UseShellExecute = $false
+            $spi.CreateNoWindow = $true
+            $spi.RedirectStandardInput = $true
+            $spi.RedirectStandardOutput = $true
+            $spi.RedirectStandardError = $true
+
+            $sentinel = [System.Diagnostics.Process]::Start($spi)
+            if ($Credential) {
+                $spi = $null
+                $sentinel.StandardInput.Write([System.Management.Automation.PSSerializer]::Serialize($Credential, 3))
             }
-            else {
-                $shellIds = @($session.InstanceId.ToString())
-                foreach ($m in $mules) { $shellIds += $m.Session.InstanceId.ToString() }
-
-                $spi = New-Object System.Diagnostics.ProcessStartInfo
-                $spi.FileName = (Get-Process -Id $PID).Path
-                $sentinelArgs = @(
-                    '-NoProfile', '-NonInteractive', '-File', "$PSScriptRoot\src\Start-PwsshSentinel.ps1",
-                    '-ParentPid', $PID.ToString(),
-                    '-ComputerName', $ComputerName,
-                    '-Authentication', $Authentication,
-                    '-RemoteShell'
-                ) + $shellIds
-                if ($CredentialPath) { $sentinelArgs += @('-CredentialPath', $CredentialPath) }
-                if ($Port) { $sentinelArgs += @('-Port', $Port.ToString()) }
-                if ($UseSSL) { $sentinelArgs += '-UseSSL' }
-                if ($LogFile) { $sentinelArgs += @('-LogFile', "$LogFile.sentinel") }
-                foreach ($a in $sentinelArgs) { $spi.ArgumentList.Add($a) }
-
-                # Every stream is redirected, and that is not tidiness. This process's stdout IS the
-                # SSH transport: a child inheriting it would keep the pipe open after we exit, and
-                # ssh waiting for EOF on a clean exit would hang. Fresh pipes it never uses instead.
-                $spi.UseShellExecute = $false
-                $spi.CreateNoWindow = $true
-                $spi.RedirectStandardInput = $true
-                $spi.RedirectStandardOutput = $true
-                $spi.RedirectStandardError = $true
-
-                $sentinel = [System.Diagnostics.Process]::Start($spi)
-                Write-Diag "sentinel started (pid $($sentinel.Id)) for $($shellIds.Count) shell(s)"
-            }
+            # Always closed, with or without a credential: the sentinel reads to EOF, so leaving
+            # this open would park it before it ever got to wait on us.
+            $sentinel.StandardInput.Close()
+            Write-Diag "sentinel started (pid $($sentinel.Id)) for $($shellIds.Count) shell(s)"
         }
         catch {
             # Never fatal. Without it the remote falls back to the watchdog, which is exactly the

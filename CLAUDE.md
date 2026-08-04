@@ -218,9 +218,14 @@ Measured: four concurrent forwarded connections complete in the time of about on
 
   It needs the shell id, and the client already has it: **`PSSession.InstanceId` IS the WSMan
   `ShellId`** (verified by comparing it against what the remote reports for its own shell), so there
-  is no round trip and no agent change. Two limits: it needs a credential it can load itself, so it
-  only works with `-CredentialPath` and not an inline `-Credential`; and it cannot help when the
-  client machine dies outright, which is why the watchdog stays as the backstop.
+  is no round trip and no agent change. The credential reaches it as CLIXML **on stdin**, so an inline
+  `-Credential` works exactly as well as a `-CredentialPath` and nothing is written to disk — the
+  password rides in the DPAPI-encrypted `<SS>` element, and parent and child are the same user on
+  the same machine, so it round-trips. Not an argument or an environment variable: both are
+  readable by any process of this user and both tend to get logged. It is read *before* the wait,
+  so the parent’s write cannot block on a full pipe and the handle is not held for what may be
+  days of session. The one real limit is that it cannot help when the client machine dies
+  outright, which is why the watchdog stays as the backstop.
 
   Wired into `pwssh-connect.ps1` after the mules are created, so it takes every shell id at once —
   striping opens one per mule and they linger identically. **Every stream of the child is redirected,
